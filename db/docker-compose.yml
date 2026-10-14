@@ -1,0 +1,33 @@
+name: frp-monitor-db
+
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: frp-monitor-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: "0328af43fce34a7613dc5a6ee5428b8a"
+      MYSQL_DATABASE: frp_monitor
+      MYSQL_USER: frp_monitor
+      MYSQL_PASSWORD: "1f251745d9222190b9164b31d85295da"
+    command:
+      - --performance-schema=OFF
+      - --innodb-buffer-pool-size=64M
+      - --max-connections=40
+      - --default-time-zone=+08:00
+    ports:
+      - "127.0.0.1:3307:3306"   # 仅宿主机回环，frp-monitor(systemd) 使用，不暴露公网
+    volumes:
+      - frp_monitor_mysql:/var/lib/mysql
+      - ./init:/docker-entrypoint-initdb.d:ro
+      - ./conf/client-charset.cnf:/etc/mysql/conf.d/client-charset.cnf:ro
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+volumes:
+  frp_monitor_mysql:
