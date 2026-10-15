@@ -62,3 +62,17 @@ CREATE TABLE IF NOT EXISTS refresh_batches (
   error       VARCHAR(255) NOT NULL DEFAULT '',
   KEY idx_ts (ts)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 5) 设备采集时长：每天 19:00/21:00（服务器本地时间）各拉一次当时在线设备的当日
+--    累计采集时长；同日以 (hostname, stat_date) 唯一，后一次成功覆盖前一次，
+--    失败只记 error 不动已有成功值（启动时也会幂等建表，见 Store._migrate）
+CREATE TABLE IF NOT EXISTS collect_duration (
+  hostname     VARCHAR(64)  NOT NULL,               -- ep-000162（frps 代理名，小写）
+  stat_date    DATE         NOT NULL,               -- 统计日（服务器本地时区）
+  duration_sec INT          NULL,                   -- 当日累计采集时长（秒；NULL = 尚无成功值）
+  sessions     INT          NOT NULL DEFAULT 0,     -- 当日采集段数（设备 total_session_count）
+  run_tag      VARCHAR(16)  NOT NULL DEFAULT '',    -- 最近一次成功写入的批次：19:00 / 21:00 / manual
+  error        VARCHAR(255) NOT NULL DEFAULT '',    -- 最近一次拉取失败原因（成功时清空）
+  pulled_at    DATETIME     NULL,                   -- 最近一次成功写入时间
+  UNIQUE KEY uq_host_date (hostname, stat_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

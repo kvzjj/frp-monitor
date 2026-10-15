@@ -48,6 +48,12 @@ PANEL_PASSWORD = os.getenv("FRP_MONITOR_PANEL_PASSWORD", "")
 SSH_JUMP = os.getenv("FRP_MONITOR_SSH_JUMP", "ubuntu@124.222.147.63")
 SSH_DEVICE_USER = os.getenv("FRP_MONITOR_SSH_DEVICE_USER", "orangepi")
 
+# --- 设备采集时长（collect duration）-----------------------------------------
+# 每天这些服务器本地时间点各拉一次在线设备的当日采集时长；参数化便于自测，
+# 例如 FRP_MONITOR_COLLECT_TIMES=19:00,21:00（逗号分隔 HH:MM，非法项忽略）。
+COLLECT_TIMES = os.getenv("FRP_MONITOR_COLLECT_TIMES", "19:00,21:00")
+COLLECT_DURATION_TIMEOUT = float(os.getenv("FRP_MONITOR_COLLECT_DURATION_TIMEOUT", "8"))
+
 V0_HOSTS = {
     "ep-000101", "ep-000102", "ep-000103", "ep-000104", "ep-000105",
     "ep-000107", "ep-000110", "ep-000111", "ep-000112", "ep-000113",
@@ -325,6 +331,33 @@ def _about_probe(base):
     return info
 
 
+def _duration_summary_probe(base, from_ms, to_ms):
+    """采集时长数据源：/api/auth/guest 换 token 后查 /api/tasks/duration-summary。
+
+    与设备门户「今日总计」用的是同一接口；窗口边界为 epoch 毫秒，
+    返回 total_duration_ms（毫秒）/ total_session_count（段数）。
+    """
+    access = _json_request(
+        base + "/api/auth/guest",
+        method="POST",
+        data=b"{}",
+        headers={"Content-Type": "application/json"},
+        timeout=4,
+    )
+    access_token = str(access.get("access_token") or "")
+    if not access_token:
+        raise ValueError("device did not return a guest access token")
+    summary = _json_request(
+        base + f"/api/tasks/duration-summary?from={from_ms}&to={to_ms}",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=COLLECT_DURATION_TIMEOUT,
+    )
+    ms = summary.get("total_duration_ms")
+    if not isinstance(ms, (int, float)) or ms < 0:
+        raise ValueError("duration-summary has no total_duration_ms")
+    return int(ms), int(summary.get("total_session_count") or 0)
+
+
 def get_device_version(port, want_hw=False):
     """Read device information through the FRP web proxy.
 
@@ -575,7 +608,19 @@ class Store:
                         return None
 
     def _migrate(self):
-        """给老库补上自动探测用的列(幂等)。"""
+        """给老库补上自动探测用的列与新表（幂等）。"""
+        # 设备采集时长：每天 19:00/21:00 拉在线设备当日累计采集时长入库
+        self._execute(
+            "CREATE TABLE IF NOT EXISTS collect_duration ("
+            "hostname VARCHAR(64) NOT NULL, "
+            "stat_date DATE NOT NULL, "
+            "duration_sec INT NULL, "
+            "sessions INT NOT NULL DEFAULT 0, "
+            "run_tag VARCHAR(16) NOT NULL DEFAULT '', "
+            "error VARCHAR(255) NOT NULL DEFAULT '', "
+            "pulled_at DATETIME NULL, "
+            "UNIQUE KEY uq_host_date (hostname, stat_date)"
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4")
         rows = self._execute(
             "SELECT column_name FROM information_schema.columns "
             "WHERE table_schema=DATABASE() AND table_name='devices'", fetch="all")
@@ -746,6 +791,55 @@ class Store:
                 "first_seen", "last_seen")
         return dict(zip(keys, rows[0])) if rows else None
 
+    def record_collect_duration(self, hostname, stat_date, duration_sec, sessions, run_tag, error, pulled_at):
+        """采集时长覆盖语义：成功则覆盖同日早前值（21:00 覆盖 19:00）；
+        失败只更新 error，不动已有成功值（duration_sec/run_tag/pulled_at 保留）。"""
+        if not self.enabled:
+            return
+        if error:
+            self._execute(
+                "INSERT INTO collect_duration "
+                "(hostname, stat_date, duration_sec, sessions, run_tag, error, pulled_at) "
+                "VALUES (%s, %s, NULL, 0, '', %s, NULL) "
+                "ON DUPLICATE KEY UPDATE error=VALUES(error)",
+                (hostname, stat_date, error[:250]))
+        else:
+            self._execute(
+                "INSERT INTO collect_duration "
+                "(hostname, stat_date, duration_sec, sessions, run_tag, error, pulled_at) "
+                "VALUES (%s, %s, %s, %s, %s, '', %s) "
+                "ON DUPLICATE KEY UPDATE duration_sec=VALUES(duration_sec), "
+                "sessions=VALUES(sessions), run_tag=VALUES(run_tag), "
+                "error='', pulled_at=VALUES(pulled_at)",
+                (hostname, stat_date, duration_sec, sessions, run_tag, pulled_at))
+
+    def collect_duration_view(self, days):
+        """查询视图：items[{hostname, today_minutes, history[{date, minutes}]}]。
+
+        minutes = round(duration_sec/60)；无记录的日期/设备为 None（前端显示 —）。
+        history 按日期从近到远，不含今天；设备集合 = devices 登记表 ∪ 已有记录。"""
+        today = datetime.now().date()
+        dates = [today - timedelta(days=i) for i in range(days)]  # dates[0] = 今天
+        rows = self._execute(
+            "SELECT hostname, stat_date, duration_sec FROM collect_duration "
+            "WHERE stat_date BETWEEN %s AND %s", (dates[-1], today), fetch="all")
+        by_host = {}
+        for hostname, stat_date, duration_sec in rows or []:
+            by_host.setdefault(hostname, {})[str(stat_date)] = duration_sec
+        hostnames = {d["hostname"] for d in self.devices_view()} | set(by_host)
+        items = []
+        for hostname in sorted(hostnames, key=natural_key):
+            rec = by_host.get(hostname) or {}
+            today_sec = rec.get(str(today))
+            items.append({
+                "hostname": hostname,
+                "today_minutes": None if today_sec is None else round(today_sec / 60),
+                "history": [{"date": str(day),
+                             "minutes": None if rec.get(str(day)) is None else round(rec[str(day)] / 60)}
+                            for day in dates[1:]],
+            })
+        return items
+
     def events(self, hours, limit):
         rows = self._execute(
             "SELECT hostname, DATE_FORMAT(ts, '%%Y-%%m-%%d %%H:%%i:%%s'), event_type, "
@@ -780,6 +874,94 @@ def _refresh_loop():
         except Exception:
             pass
         time.sleep(REFRESH_INTERVAL)
+
+
+# --- 设备采集时长：拉取与定时调度 ---------------------------------------------
+def _parse_collect_times(spec):
+    """解析 FRP_MONITOR_COLLECT_TIMES（"19:00,21:00"）为排序去重的时间点。"""
+    slots = set()
+    for part in (spec or "").split(","):
+        hh, sep, mm = part.strip().partition(":")
+        if not sep:
+            continue
+        try:
+            slot = (int(hh), int(mm))
+        except ValueError:
+            continue
+        if 0 <= slot[0] <= 23 and 0 <= slot[1] <= 59:
+            slots.add(slot)
+    return sorted(slots) or [(19, 0), (21, 0)]
+
+
+COLLECT_SLOTS = _parse_collect_times(COLLECT_TIMES)
+_collect_run_lock = threading.Lock()  # 手动触发与定时调度串行，避免同日并发写
+
+
+def _next_collect_slot(now=None):
+    """下一个调度时刻（服务器本地时间）及其 run_tag。
+
+    每轮都从墙上时钟重新推算，进程重启后自然对齐下一次 19:00/21:00，
+    不依赖内存计数器，因此重启不会丢失或重复调度。"""
+    now = now or datetime.now()
+    for hh, mm in COLLECT_SLOTS:
+        cand = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if cand > now:
+            return cand, f"{hh:02d}:{mm:02d}"
+    hh, mm = COLLECT_SLOTS[0]
+    return (now + timedelta(days=1)).replace(hour=hh, minute=mm, second=0, microsecond=0), f"{hh:02d}:{mm:02d}"
+
+
+def run_collect_duration(tag):
+    """拉取当时在线设备的当日采集时长并入库。
+
+    窗口为服务器本地时间的当日 0 点到次日 0 点（epoch 毫秒）；
+    单台失败只记 error 并继续，返回汇总结果。"""
+    with _collect_run_lock:
+        hosts, _ = get_snapshot()
+        now = datetime.now()
+        day0 = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        from_ms = int(day0.timestamp() * 1000)
+        to_ms = from_ms + 86400000
+        stat_date, pulled_at = now.date(), now
+        targets = [h for h in hosts if h.get("web_port")]
+
+        def pull(item):
+            hostname = item["hostname"]
+            try:
+                ms, sessions = _duration_summary_probe(
+                    f"http://127.0.0.1:{int(item['web_port'])}", from_ms, to_ms)
+            except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
+                store.record_collect_duration(hostname, stat_date, None, 0, "", str(exc), None)
+                return {"hostname": hostname, "ok": False, "error": str(exc)}
+            store.record_collect_duration(hostname, stat_date, ms // 1000, sessions, tag, "", pulled_at)
+            return {"hostname": hostname, "ok": True, "duration_sec": ms // 1000, "sessions": sessions}
+
+        results = []
+        if targets:
+            with ThreadPoolExecutor(max_workers=min(16, len(targets))) as pool:
+                for job in [pool.submit(pull, item) for item in targets]:
+                    results.append(job.result())
+        ok = [r for r in results if r["ok"]]
+        return {"enabled": store.enabled, "tag": tag, "stat_date": str(stat_date),
+                "online": len(hosts), "pulled": len(targets), "ok": len(ok),
+                "failed": len(results) - len(ok),
+                "errors": [r for r in results if not r["ok"]][:10]}
+
+
+def _collect_duration_loop():
+    while True:
+        deadline, tag = _next_collect_slot()
+        while True:  # 分段睡眠到点，兼顾长时间休眠与时钟漂移
+            remaining = (deadline - datetime.now()).total_seconds()
+            if remaining <= 0:
+                break
+            time.sleep(min(30.0, remaining))
+        try:
+            summary = run_collect_duration(tag)
+            print(f"frp-monitor: collect-duration {tag} run: "
+                  f"{summary['ok']}/{summary['pulled']} ok", flush=True)
+        except Exception as exc:
+            print(f"frp-monitor: collect-duration {tag} run failed: {exc}", flush=True)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -949,6 +1131,15 @@ class Handler(BaseHTTPRequestHandler):
             except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
                 self.send_json(502, {"error": str(exc), "hostname": hostname})
             return
+        if path == "/api/collect-duration":
+            qs = parse_qs(urlsplit(self.path).query)
+            try:
+                days = min(max(int(qs.get("days", ["7"])[0]), 1), 90)
+            except (TypeError, ValueError):
+                days = 7
+            self.send_json(200, {"enabled": store.enabled, "days": days,
+                                 "items": store.collect_duration_view(days) if store.enabled else []})
+            return
         if path == "/api/events":
             qs = parse_qs(urlsplit(self.path).query)
             try:
@@ -980,7 +1171,24 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_error(404)
 
+    def do_POST(self):
+        if not self._authorized():
+            self.send_unauthorized()
+            return
+        path = urlsplit(self.path).path
+        if path == "/api/collect-duration/run":
+            # 手动触发一次拉取（自测/验证用，不必等到 19:00）
+            try:
+                result = run_collect_duration("manual")
+            except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
+                self.send_json(502, {"enabled": store.enabled, "error": str(exc)})
+                return
+            self.send_json(200, result)
+            return
+        self.send_error(404)
+
 
 if __name__ == "__main__":
     threading.Thread(target=_refresh_loop, name="snapshot-refresher", daemon=True).start()
+    threading.Thread(target=_collect_duration_loop, name="collect-duration-puller", daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), Handler).serve_forever()
