@@ -76,3 +76,34 @@ CREATE TABLE IF NOT EXISTS collect_duration (
   pulled_at    DATETIME     NULL,                   -- 最近一次成功写入时间
   UNIQUE KEY uq_host_date (hostname, stat_date)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 6) 批量升级：一次批量操作一行；kind ∈ precheck/download/prepare/install/
+--    verify/cleanup/upgrade（全流程）；每日维护线程按 30 天保留窗口清理
+CREATE TABLE IF NOT EXISTS upgrade_jobs (
+  id          INT          NOT NULL PRIMARY KEY,    -- 面板分配（内存计数器）
+  kind        VARCHAR(16)  NOT NULL,
+  version     VARCHAR(32)  NOT NULL DEFAULT '',     -- 目标版本（precheck/verify 可为空）
+  params      TEXT         NULL,                    -- 创建参数快照（不含凭据）
+  status      VARCHAR(16)  NOT NULL DEFAULT 'running',  -- running / completed
+  total       INT          NOT NULL DEFAULT 0,      -- 子任务（设备）数
+  created_at  DATETIME     NOT NULL,
+  finished_at DATETIME     NULL,
+  KEY idx_created (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 7) 批量升级逐台子任务：阶段机 precheck→download→prepare→install→verify→
+--    cleanup；任一阶段失败即停该设备，不影响其他设备；blocked = 护栏拦截
+CREATE TABLE IF NOT EXISTS upgrade_tasks (
+  id          INT          NOT NULL PRIMARY KEY,
+  job_id      INT          NOT NULL,
+  hostname    VARCHAR(64)  NOT NULL,
+  ssh_port    INT          NULL,                    -- 以面板设备记录为准（SOP 坑 #8）
+  stage       VARCHAR(16)  NOT NULL DEFAULT '',     -- 当前/最后阶段
+  status      VARCHAR(16)  NOT NULL DEFAULT 'queued', -- queued/running/success/failed/blocked
+  error       VARCHAR(500) NOT NULL DEFAULT '',
+  log         LONGTEXT     NULL,                    -- 逐台完整日志（含 install.log 增量回传）
+  started_at  DATETIME     NULL,
+  finished_at DATETIME     NULL,
+  KEY idx_job (job_id),
+  KEY idx_host (hostname)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

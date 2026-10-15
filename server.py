@@ -12,10 +12,15 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from urllib.request import Request, urlopen
 from datetime import datetime, timedelta
 import base64
+import hashlib
 import hmac
 import json
 import os
+import queue
 import re
+import shlex
+import shutil
+import subprocess
 import threading
 import time
 
@@ -38,8 +43,9 @@ DB_USER = os.getenv("FRP_MONITOR_DB_USER", "frp_monitor")
 DB_NAME = os.getenv("FRP_MONITOR_DB_NAME", "frp_monitor")
 DB_PASSWORD = os.getenv("FRP_MONITOR_DB_PASSWORD", "")
 SNAPSHOT_EVERY = float(os.getenv("FRP_MONITOR_SNAPSHOT_EVERY", "300"))
-STATUS_RETENTION_DAYS = int(os.getenv("FRP_MONITOR_STATUS_RETENTION_DAYS", "90"))
-BATCH_RETENTION_DAYS = int(os.getenv("FRP_MONITOR_BATCH_RETENTION_DAYS", "14"))
+# 历史数据保留统一由 RETENTION_DAYS（默认 30 天，每日维护线程清理）控制：
+# host_status / refresh_batches / host_events / upgrade_jobs+upgrade_tasks；
+# devices 与 collect_duration 永不清理。
 
 # --- optional HTTP Basic Auth for the whole panel (page + APIs) ---------------
 # Both must be set to enable; empty = open access (legacy behavior).
@@ -53,6 +59,26 @@ SSH_DEVICE_USER = os.getenv("FRP_MONITOR_SSH_DEVICE_USER", "orangepi")
 # 例如 FRP_MONITOR_COLLECT_TIMES=19:00,21:00（逗号分隔 HH:MM，非法项忽略）。
 COLLECT_TIMES = os.getenv("FRP_MONITOR_COLLECT_TIMES", "19:00,21:00")
 COLLECT_DURATION_TIMEOUT = float(os.getenv("FRP_MONITOR_COLLECT_DURATION_TIMEOUT", "8"))
+
+# --- 批量升级：安装包托管 / 升级编排引擎 / 数据保留与每日备份 -----------------
+# 包目录：自动发现 *.tar.gz；ops 可直接 scp 放入，也可经面板上传。
+PKG_DIR = os.getenv("PKG_DIR", "/opt/frp-monitor/packages")
+# 设备登录/sudo 密码：来自 /etc/frp-monitor.env（systemd EnvironmentFile 注入），
+# 日志与 API 输出全程脱敏，严禁落盘/入库。
+DEPLOY_PW = os.getenv("DEPLOY_PW", "")
+# 并行升级设备数（SOP：预检/安装可更高，默认 6 为保守值）
+UPGRADE_MAX_PARALLEL = max(1, int(os.getenv("UPGRADE_MAX_PARALLEL", "6")))
+# 设备下载安装包用的对外地址：默认取 SSH_JUMP 里的网关 IP（frp-monitor 与 frps 同机）
+PUBLIC_IP = os.getenv("FRP_MONITOR_PUBLIC_IP", "") or (SSH_JUMP.split("@")[-1].strip() if SSH_JUMP else "")
+# SSH 目标：设备代理绑定本机 127.0.0.1:<ssh_port>（端口以面板设备记录为准，不按公式推算）
+SSH_KNOWN_HOSTS = os.getenv("FRP_MONITOR_SSH_KNOWN_HOSTS", "/opt/frp-monitor/.known-hosts")
+INSTALL_TIMEOUT = int(os.getenv("FRP_MONITOR_INSTALL_TIMEOUT", "2400"))  # 单台安装跟踪上限（秒）
+# 数据保留：host_status / refresh_batches / host_events / upgrade_* 统一保留天数
+RETENTION_DAYS = max(1, int(os.getenv("FRP_MONITOR_RETENTION_DAYS", "30")))
+# 每日备份：mysqldump frp_monitor → BACKUP_DIR，保留最近 BACKUP_KEEP 份
+BACKUP_DIR = os.getenv("FRP_MONITOR_BACKUP_DIR", "/opt/frp-monitor/backups")
+BACKUP_KEEP = max(1, int(os.getenv("FRP_MONITOR_BACKUP_KEEP", "7")))
+MAINTENANCE_TIME = os.getenv("FRP_MONITOR_MAINTENANCE_TIME", "03:30")
 
 V0_HOSTS = {
     "ep-000101", "ep-000102", "ep-000103", "ep-000104", "ep-000105",
@@ -621,6 +647,35 @@ class Store:
             "pulled_at DATETIME NULL, "
             "UNIQUE KEY uq_host_date (hostname, stat_date)"
             ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4")
+        # 批量升级：任务（一次批量操作）与逐台子任务；日志随子任务入库，
+        # 重启后仍可回看；每日维护线程按保留窗口清理。
+        self._execute(
+            "CREATE TABLE IF NOT EXISTS upgrade_jobs ("
+            "id INT NOT NULL PRIMARY KEY, "
+            "kind VARCHAR(16) NOT NULL, "               # precheck/download/prepare/install/verify/cleanup/upgrade
+            "version VARCHAR(32) NOT NULL DEFAULT '', "
+            "params TEXT NULL, "                        # 创建参数快照（不含凭据）
+            "status VARCHAR(16) NOT NULL DEFAULT 'running', "  # running/completed
+            "total INT NOT NULL DEFAULT 0, "
+            "created_at DATETIME NOT NULL, "
+            "finished_at DATETIME NULL, "
+            "KEY idx_created (created_at)"
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4")
+        self._execute(
+            "CREATE TABLE IF NOT EXISTS upgrade_tasks ("
+            "id INT NOT NULL PRIMARY KEY, "
+            "job_id INT NOT NULL, "
+            "hostname VARCHAR(64) NOT NULL, "
+            "ssh_port INT NULL, "
+            "stage VARCHAR(16) NOT NULL DEFAULT '', "   # 当前/最后阶段
+            "status VARCHAR(16) NOT NULL DEFAULT 'queued', "  # queued/running/success/failed/blocked
+            "error VARCHAR(500) NOT NULL DEFAULT '', "
+            "log LONGTEXT NULL, "
+            "started_at DATETIME NULL, "
+            "finished_at DATETIME NULL, "
+            "KEY idx_job (job_id), "
+            "KEY idx_host (hostname)"
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4")
         rows = self._execute(
             "SELECT column_name FROM information_schema.columns "
             "WHERE table_schema=DATABASE() AND table_name='devices'", fetch="all")
@@ -633,10 +688,10 @@ class Store:
     def _load_roster(self):
         rows = self._execute(
             "SELECT hostname, IFNULL(site,''), IFNULL(owner,''), IFNULL(hardware,''), retired, "
-            "IFNULL(hw_model,''), IFNULL(ip,'') FROM devices",
+            "IFNULL(hw_model,''), IFNULL(ip,''), ssh_port FROM devices",
             fetch="all")
         self.roster = {r[0]: {"site": r[1], "owner": r[2], "hardware": r[3], "retired": bool(r[4]),
-                              "hw_model": r[5], "ip": r[6]}
+                              "hw_model": r[5], "ip": r[6], "ssh_port": r[7]}
                        for r in rows or []}
 
     def _load_state(self):
@@ -727,11 +782,9 @@ class Store:
                         "connections, frpc_started_at, release_version, version_error, device_id, device_name) "
                         "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", row)
             if time.time() - self._last_retention_at >= 3600:
+                # 每小时只刷新一次登记表快照（拾取人工在库里改的 site/owner 等）；
+                # 历史数据的删除统一交给每日维护线程（run_maintenance）。
                 self._last_retention_at = time.time()
-                self._execute("DELETE FROM host_status WHERE ts < NOW() - INTERVAL %s DAY",
-                              (STATUS_RETENTION_DAYS,))
-                self._execute("DELETE FROM refresh_batches WHERE ts < NOW() - INTERVAL %s DAY",
-                              (BATCH_RETENTION_DAYS,))
                 self._load_roster()
 
     def _uptime(self, hostname, hours):
@@ -839,6 +892,130 @@ class Store:
                             for day in dates[1:]],
             })
         return items
+
+    # --- 批量升级任务持久化 -------------------------------------------------
+    def create_upgrade_job(self, job_id, kind, version, params_json, total, created_at):
+        self._execute(
+            "INSERT INTO upgrade_jobs (id, kind, version, params, status, total, created_at) "
+            "VALUES (%s, %s, %s, %s, 'running', %s, %s)",
+            (job_id, kind, version, params_json, total, created_at))
+
+    def create_upgrade_task(self, task_id, job_id, hostname, ssh_port):
+        self._execute(
+            "INSERT INTO upgrade_tasks (id, job_id, hostname, ssh_port, stage, status) "
+            "VALUES (%s, %s, %s, %s, '', 'queued')",
+            (task_id, job_id, hostname, ssh_port))
+
+    def create_upgrade_task_blocked(self, task_id, job_id, hostname, ssh_port, error, now):
+        """创建即 blocked（无 SSH 端口/机型未知/已有任务在跑等）。"""
+        self._execute(
+            "INSERT INTO upgrade_tasks (id, job_id, hostname, ssh_port, stage, status, error, started_at, finished_at) "
+            "VALUES (%s, %s, %s, %s, '', 'blocked', %s, %s, %s)",
+            (task_id, job_id, hostname, ssh_port, error[:500], now, now))
+
+    def update_upgrade_task(self, task_id, stage=None, status=None, error=None,
+                            log=None, started_at=None, finished_at=None):
+        sets, args = [], []
+        if stage is not None:
+            sets.append("stage=%s"); args.append(stage)
+        if status is not None:
+            sets.append("status=%s"); args.append(status)
+        if error is not None:
+            sets.append("error=%s"); args.append(error[:500])
+        if log is not None:
+            sets.append("log=%s"); args.append(log)
+        if started_at is not None:
+            sets.append("started_at=%s"); args.append(started_at)
+        if finished_at is not None:
+            sets.append("finished_at=%s"); args.append(finished_at)
+        if not sets:
+            return
+        args.append(task_id)
+        self._execute(f"UPDATE upgrade_tasks SET {', '.join(sets)} WHERE id=%s", args)
+
+    def finish_upgrade_job(self, job_id, finished_at):
+        self._execute("UPDATE upgrade_jobs SET status='completed', finished_at=%s WHERE id=%s",
+                      (finished_at, job_id))
+
+    def upgrade_job_view(self, job_id):
+        """单任务视图（含逐台状态）；不存在返回 None。"""
+        row = self._execute(
+            "SELECT id, kind, version, status, total, params, "
+            "UNIX_TIMESTAMP(created_at), IFNULL(UNIX_TIMESTAMP(finished_at), 0) "
+            "FROM upgrade_jobs WHERE id=%s", (job_id,), fetch="one")
+        if not row:
+            return None
+        job = {"id": row[0], "kind": row[1], "version": row[2] or "", "status": row[3],
+               "total": row[4], "params": json.loads(row[5]) if row[5] else {},
+               "created_at": row[6], "finished_at": row[7] or None, "tasks": self.upgrade_tasks_view(job_id)}
+        job["counts"] = _task_counts(job["tasks"])
+        return job
+
+    def upgrade_tasks_view(self, job_id):
+        rows = self._execute(
+            "SELECT t.id, t.hostname, t.stage, t.status, t.error, "
+            "IFNULL(UNIX_TIMESTAMP(t.started_at), 0), IFNULL(UNIX_TIMESTAMP(t.finished_at), 0), "
+            "IFNULL(LENGTH(t.log), 0) "
+            "FROM upgrade_tasks t WHERE t.job_id=%s ORDER BY t.id", (job_id,), fetch="all")
+        out = []
+        for tid, hostname, stage, status, error, started, finished, chars in rows or []:
+            out.append({"id": tid, "hostname": hostname, "stage": stage or "",
+                        "stage_cn": STAGE_CN.get(stage or "", stage or ""), "status": status,
+                        "error": error or "", "started_at": started or None,
+                        "finished_at": finished or None, "chars": int(chars or 0)})
+        return out
+
+    def upgrade_jobs_list(self, limit=50):
+        rows = self._execute(
+            "SELECT j.id, j.kind, j.version, j.status, j.total, "
+            "UNIX_TIMESTAMP(j.created_at), IFNULL(UNIX_TIMESTAMP(j.finished_at), 0), "
+            "IFNULL(SUM(t.status='success'), 0), IFNULL(SUM(t.status='failed'), 0), "
+            "IFNULL(SUM(t.status='blocked'), 0) "
+            "FROM upgrade_jobs j LEFT JOIN upgrade_tasks t ON t.job_id=j.id "
+            "GROUP BY j.id ORDER BY j.id DESC LIMIT %s", (limit,), fetch="all")
+        return [{"id": r[0], "kind": r[1], "version": r[2] or "", "status": r[3], "total": r[4],
+                 "created_at": r[5], "finished_at": r[6] or None,
+                 "counts": {"success": int(r[7]), "failed": int(r[8]), "blocked": int(r[9])}}
+                for r in rows or []]
+
+    def upgrade_task_log(self, job_id, task_id=None, hostname=None):
+        """取库内日志（进程重启后的回看亮底）；返回 (log, status) 或 None。"""
+        if task_id is not None:
+            row = self._execute(
+                "SELECT log, status FROM upgrade_tasks WHERE id=%s AND job_id=%s",
+                (task_id, job_id), fetch="one")
+        else:
+            row = self._execute(
+                "SELECT log, status FROM upgrade_tasks WHERE job_id=%s AND hostname=%s "
+                "ORDER BY id DESC LIMIT 1", (job_id, hostname or ""), fetch="one")
+        if not row:
+            return None
+        return row[0] or "", row[1] or ""
+
+    def max_upgrade_id(self):
+        """upgrade_jobs/upgrade_tasks 共用的最大 id（新进程续号，防重启后主键冲突）。"""
+        row = self._execute(
+            "SELECT GREATEST(IFNULL((SELECT MAX(id) FROM upgrade_jobs), 0), "
+            "IFNULL((SELECT MAX(id) FROM upgrade_tasks), 0))", fetch="one")
+        return int(row[0] or 0) if row else 0
+
+    def reconcile_upgrade_jobs(self):
+        """进程重启后把遗留 queued/running 的子任务标记为 failed（设备端安装
+        可能仍在后台进行，日志里说明用「验证」补查），并结束对应任务。"""
+        rows = self._execute(
+            "SELECT id, job_id, hostname FROM upgrade_tasks "
+            "WHERE status IN ('queued', 'running')", fetch="all")
+        if not rows:
+            return 0
+        now = datetime.now()
+        for tid, job_id, hostname in rows:
+            self.update_upgrade_task(
+                tid, status="failed", error="面板进程重启，任务中断（安装可能仍在设备后台进行，可用「验证」补查）",
+                finished_at=now)
+        jobs = {r[1] for r in rows}
+        for job_id in jobs:
+            self.finish_upgrade_job(job_id, now)
+        return len(rows)
 
     def events(self, hours, limit):
         rows = self._execute(
@@ -964,9 +1141,1084 @@ def _collect_duration_loop():
             print(f"frp-monitor: collect-duration {tag} run failed: {exc}", flush=True)
 
 
+# ============================================================================
+# 批量升级：设备端阶段脚本（以字符串常量内嵌，随服务分发）
+# 来源：update/scripts/*.sh（同步日期 2026-10-15，含 SOP 15 条坑位护栏）。
+# 与源文件的差异：
+#   precheck.sh  —— 增加 NOW_EPOCH 时钟偏差检查（SOP 坑 #10：>5min 预检告警）；
+#                   OSS_URL 连通性探测改为 PKG_URL（面板托管包地址）
+#   download.sh  —— OSS_URL 换为 PKG_URL（面板托管包）；其余（重试/续传/哈希输出）不变
+#   prepare.sh   —— PKG_SRC 默认改为 $BASE/pkg.tar.gz（下载阶段落点）；其余不变
+#   run-install.sh / verify.sh / cleanup.sh —— 原样内嵌，无改动
+# 所有脚本仍以 stdin 推送 + bash -s 执行，参数走远程命令行环境变量。
+# ============================================================================
+SCRIPT_PRECHECK = r'''#!/usr/bin/env bash
+# [内嵌自 update/scripts/precheck.sh · 2026-10-15]
+# 设备端升级前预检（经 FRP SSH 推送执行）。可选环境变量：
+#   PKG_URL（面板托管包连通性探测）、NOW_EPOCH（面板 epoch，时钟偏差告警）
+set -u
+echo "### host=$(hostname) arch=$(uname -m) date=$(date -u +%FT%TZ)"
+pw=${DEPLOY_PW:-}
+s() { printf '%s\n' "$pw" | sudo -S -p '' "$@" 2>/dev/null; }
+echo "### version: $(s sed -n 's/^EGO_PORTAL_RELEASE_VERSION=//p' /etc/ego-portal/device.env)"
+s grep -E '^(DEVICE_ID|DEVICE_NAME|DEVICE_HOSTNAME|PUBLIC_URL)=' /etc/ego-portal/device.env
+echo "### service: $(systemctl is-active ego-portal.service 2>/dev/null) | frpc=$(systemctl is-active frpc 2>/dev/null)"
+echo "### disk: $(df -BM / | awk 'NR==2{print $4"M free"}')"
+echo "### camera-containers: $(s docker ps --format '{{.Names}}' 2>/dev/null | grep -c decxin || true)"
+echo "### active sessions (非空=禁止升级):"
+s python3 -c "import sqlite3;c=sqlite3.connect('file:/data/collector/db/collector.sqlite?mode=ro',uri=True);print(c.execute(\"select id,status from collection_sessions where status in ('RECORDING','STOPPING','VALIDATING')\").fetchall())" || echo "check-skipped"
+if [ -n "${NOW_EPOCH:-}" ]; then
+  drift=$(( $(date +%s) - NOW_EPOCH ))
+  echo "### clock-drift: ${drift}s"
+fi
+echo "### pkg:"
+for p in "${PKG_SRC:-}" /home/orangepi/ego-portal-*-rk3588-arm64.tar.gz /var/tmp/ego-*/pkg.tar.gz; do
+  [ -f "$p" ] && echo "found: $p size=$(stat -c %s "$p")"
+done 2>/dev/null | sort -u
+[ -n "${PKG_URL:-}" ] && { echo -n "### pkg-url: "; curl -s -o /dev/null -w 'http=%{http_code}\n' --max-time 20 -r 0-0 "$PKG_URL" || echo FAIL; }
+echo "### done"
+'''
+
+SCRIPT_DOWNLOAD = r'''#!/usr/bin/env bash
+# [内嵌自 update/scripts/download.sh · 2026-10-15；OSS_URL → PKG_URL 面板托管包]
+# 设备端从面板下载安装包（断点续传，/tmp 是 tmpfs 一律放 /var/tmp）。
+# 必需环境变量：PKG_URL；可选：PKG_VERSION、DEST
+set -euo pipefail
+: "${PKG_URL:?need PKG_URL}"
+PKG_VERSION="${PKG_VERSION:?need PKG_VERSION, e.g. v0.4.6}"
+DEST="${DEST:-/var/tmp/ego-${PKG_VERSION}}"
+mkdir -p "$DEST" && cd "$DEST"
+echo "==> downloading to $DEST/pkg.tar.gz"
+curl -fL --retry 4 --retry-delay 2 --connect-timeout 15 -C - -o pkg.tar.gz "$PKG_URL"
+rc=$?
+echo "curl_exit=$rc"
+if [ $rc -eq 0 ]; then
+  echo "size=$(stat -c %s pkg.tar.gz)"
+  echo "sha256=$(sha256sum pkg.tar.gz | awk '{print $1}')"
+  echo "DOWNLOAD_OK   # 与面板基准 sha256 比对，一致才可安装"
+fi
+'''
+
+SCRIPT_PREPARE = r'''#!/usr/bin/env bash
+# [内嵌自 update/scripts/prepare.sh · 2026-10-15；PKG_SRC 默认改为 $BASE/pkg.tar.gz]
+# 设备端：sha256 校验 → 解压 → --prepare-only 生成安装 bundle（继承设备身份）。
+# 必需：PKG_VERSION、SHA256；可选：PKG_SRC、BASE、PKG_ARCH（默认 rk3588-arm64，amd64 机型传 amd64）
+set -euo pipefail
+PKG_VERSION="${PKG_VERSION:?need PKG_VERSION, e.g. v0.4.6}"
+SHA256="${SHA256:?need SHA256 of the official tarball}"
+BASE="${BASE:-/var/tmp/ego-${PKG_VERSION}}"
+PKG_ARCH="${PKG_ARCH:-rk3588-arm64}"
+PKG_TGZ="${PKG_SRC:-${BASE}/pkg.tar.gz}"
+PKGDIR="${BASE}/ego-portal-${PKG_VERSION}-${PKG_ARCH}"
+BUNDLE="${BASE}/bundle"
+pw="${DEPLOY_PW:?need DEPLOY_PW}"
+[ -f "$PKG_TGZ" ] || { echo "pkg missing: $PKG_TGZ"; exit 1; }
+echo "==> verify sha256"
+printf '%s  %s\n' "$SHA256" "$PKG_TGZ" | sha256sum -c - || exit 1
+if [ ! -f "$PKGDIR/install-ego-portal.sh" ]; then
+  echo "==> extracting package"
+  mkdir -p "$BASE"
+  tar -xzf "$PKG_TGZ" -C "$BASE"
+fi
+chmod +x "$PKGDIR/install-ego-portal.sh" "$PKGDIR/lib/"*.sh
+printf '%s\n' "$pw" | sudo -S -p '' -v
+sudo -n cat /etc/ego-portal/device.env > "$BASE/device.env.work"
+chmod 600 "$BASE/device.env.work"
+rm -rf "$BUNDLE"
+cd "$PKGDIR"
+echo "==> prepare-only"
+./install-ego-portal.sh --prepare-only "$BUNDLE" --device-env "$BASE/device.env.work" --reuse-device-env >/dev/null
+grep -E '^(DEVICE_ID|DEVICE_NAME|RELEASE_VERSION)=' "$BUNDLE/deployment.conf"
+echo "PREPARE_OK"
+'''
+
+SCRIPT_RUN_INSTALL = r'''#!/usr/bin/env bash
+# [内嵌自 update/scripts/run-install.sh · 2026-10-15，无改动]
+# 设备端安装执行器：写入 $BASE/run-install.sh 后以
+#   nohup setsid bash $BASE/run-install.sh > $BASE/install.log 2>&1 < /dev/null &
+# 启动（nohup+setsid 保证 SSH/FRP 断连不影响安装）。
+set -u
+pw="${DEPLOY_PW:?need DEPLOY_PW}"
+BASE="${BASE:-/var/tmp/ego-${PKG_VERSION:-}}"
+[ -n "$BASE" ] || { echo "need BASE or PKG_VERSION"; exit 1; }
+exec 9>"$BASE/install.lock"
+flock -n 9 || { echo "another install is running"; exit 42; }   # 防双安装器
+printf '%s\n' "$pw" | sudo -S -p '' -v || exit 1
+( while sudo -n true 2>/dev/null; do sleep 45; done ) &           # sudo 时间戳保活
+keeper=$!
+trap 'kill $keeper 2>/dev/null || true' EXIT INT TERM
+sudo -n bash "$BASE/bundle/install-remote.sh"
+rc=$?
+echo "INSTALL_EXIT=$rc"
+exit $rc
+'''
+
+SCRIPT_VERIFY = r'''#!/usr/bin/env bash
+# [内嵌自 update/scripts/verify.sh · 2026-10-15，无改动]
+# 设备端升级后验证。成功标准：version=新版本 / service=active / http=200 /
+# api 含新版本 / 4 常驻容器新镜像 / frpc=active（由面板侧比对判分）
+set -u
+pw=${DEPLOY_PW:-}
+s() { printf '%s\n' "$pw" | sudo -S -p '' "$@" 2>/dev/null; }
+echo "host=$(hostname)"
+echo "version=$(s sed -n 's/^EGO_PORTAL_RELEASE_VERSION=//p' /etc/ego-portal/device.env)"
+echo "device=$(s grep -E '^DEVICE_NAME=' /etc/ego-portal/device.env)"
+echo "service=$(systemctl is-active ego-portal.service 2>/dev/null)"
+echo "http=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 http://127.0.0.1/)"
+echo "api=$(curl -s --max-time 8 http://127.0.0.1/api/setup/status | head -c 200)"
+echo "frpc=$(systemctl is-active frpc 2>/dev/null)"
+echo "containers:"
+s docker ps --format '{{.Names}} | {{.Image}} | {{.Status}}'
+echo "current=$(readlink -f /opt/ego-portal/current 2>/dev/null)"
+echo "disk: $(df -h / | awk 'NR==2{print $4" free"}')"
+'''
+
+SCRIPT_CLEANUP = r'''#!/usr/bin/env bash
+# [内嵌自 update/scripts/cleanup.sh · 2026-10-15，无改动]
+# 设备端清理：staging 目录 + （可选）被终止部署遗留的 Created 状态旧容器。
+# 可选：BASE、OLD_TAG（仅删 Created 且镜像含该 tag 的容器）
+set -u
+BASE="${BASE:-/var/tmp/ego-${PKG_VERSION:-}}"
+pw=${DEPLOY_PW:-}
+s() { printf '%s\n' "$pw" | sudo -S -p '' "$@" 2>/dev/null; }
+echo "### $(hostname)"
+if [ -n "${OLD_TAG:-}" ]; then
+  ids=$(s docker ps -a --format '{{.ID}} {{.Image}} {{.Status}}' | awk -v t="$OLD_TAG" '$3=="Created" && $2 ~ t {print $1}')
+  if [ -n "$ids" ]; then
+    # shellcheck disable=SC2086
+    s docker rm $ids >/dev/null && echo "removed created-old containers: $ids"
+  else
+    echo "no created-old containers"
+  fi
+fi
+[ -n "$BASE" ] && [ -d "$BASE" ] && { du -sh "$BASE" 2>/dev/null; rm -rf "$BASE"; echo "staging cleaned"; }
+echo "health: portal=$(systemctl is-active ego-portal.service 2>/dev/null) frpc=$(systemctl is-active frpc 2>/dev/null) api=$(curl -s --max-time 5 http://127.0.0.1/api/setup/status | grep -oP '"release_version":"[^"]*"' | head -1)"
+echo "disk: $(df -h / | awk 'NR==2{print $4" free"}')"
+echo "### done"
+'''
+
+
+# ----------------------------------------------------------------------------
+# 事件总线（SSE）：任务状态变更 / 逐台阶段流转 / 日志块增量
+# ----------------------------------------------------------------------------
+class Bus:
+    def __init__(self):
+        self.subs = []
+        self.lock = threading.Lock()
+
+    def subscribe(self):
+        q = queue.Queue(maxsize=4000)
+        with self.lock:
+            self.subs.append(q)
+        return q
+
+    def unsubscribe(self, q):
+        with self.lock:
+            if q in self.subs:
+                self.subs.remove(q)
+
+    def publish(self, event):
+        with self.lock:
+            for q in list(self.subs):
+                try:
+                    q.put_nowait(event)
+                except queue.Full:
+                    pass
+
+
+BUS = Bus()
+
+
+# ----------------------------------------------------------------------------
+# 安装包托管：PKG_DIR 自动发现 *.tar.gz，sha256 后台预算 + 缓存
+# ----------------------------------------------------------------------------
+PKG_NAME_RE = re.compile(r"^ego-portal-(v[0-9][0-9A-Za-z.\-]+?)-(rk3588-arm64|amd64)\.tar\.gz$")
+SAFE_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.tar\.gz$")
+_PKG_CACHE = {}          # 绝对路径 -> {mtime, size, sha256}
+_PKG_LOCK = threading.Lock()
+
+
+def _hash_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 22), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _hash_pkg_async(path):
+    try:
+        digest = _hash_file(path)
+    except OSError:
+        digest = ""
+    finally:
+        with _PKG_LOCK:
+            ent = _PKG_CACHE.get(str(path))
+            if ent is not None:
+                ent["hashing"] = False
+                if digest:
+                    ent["sha256"] = digest
+
+
+def scan_packages():
+    """扫描 PKG_DIR 下的 *.tar.gz；新文件/变更文件后台预算 sha256（约 1G 需数秒）。"""
+    found = []
+    try:
+        entries = sorted(os.listdir(PKG_DIR))
+    except OSError:
+        entries = []
+    for name in entries:
+        if not name.endswith(".tar.gz") or name.startswith("."):
+            continue
+        path = os.path.join(PKG_DIR, name)
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        if not (st.st_mode & 0o100000):  # 不是普通文件（目录等）
+            continue
+        with _PKG_LOCK:
+            ent = _PKG_CACHE.get(path)
+            if not ent or ent["mtime"] != st.st_mtime or ent["size"] != st.st_size:
+                ent = {"mtime": st.st_mtime, "size": st.st_size, "sha256": "", "hashing": False}
+                _PKG_CACHE[path] = ent
+                need_hash = True
+            else:
+                need_hash = not ent["sha256"] and not ent.get("hashing")
+                if need_hash:
+                    ent["hashing"] = True
+        if need_hash:
+            threading.Thread(target=_hash_pkg_async, args=(path,), daemon=True).start()
+        m = PKG_NAME_RE.match(name)
+        found.append({
+            "version": m.group(1) if m else "",
+            "arch": m.group(2) if m else "",
+            "file": name, "size": st.st_size,
+            "sha256": ent["sha256"], "hash_status": "ok" if ent["sha256"] else "computing",
+            "mtime": int(st.st_mtime),
+        })
+    return found
+
+
+def _vkey(version):
+    m = re.match(r"v?(\d+)\.(\d+)\.(\d+)(?:[-.](.*))?$", version or "")
+    if not m:
+        return [0, 0, 0, version or ""]
+    return [int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4) or ""]
+
+
+def packages_view():
+    pkgs = scan_packages()
+    pkgs.sort(key=lambda p: (_vkey(p.get("version") or ""), p.get("arch") or ""))
+    return pkgs
+
+
+def all_packages_for_version(version):
+    return {p["arch"]: p for p in packages_view() if p.get("version") == version}
+
+
+def _pkg_scan_loop():
+    """周期重扫：ops 直接 scp 放入目录后面板自动可见。"""
+    while True:
+        try:
+            scan_packages()
+        except Exception:
+            pass
+        time.sleep(60)
+
+
+# ----------------------------------------------------------------------------
+# 升级编排引擎：逐台阶段机 precheck→download→prepare→install→verify→cleanup
+# ----------------------------------------------------------------------------
+UPGRADE_STAGES = ["precheck", "download", "prepare", "install", "verify", "cleanup"]
+STAGE_CN = {"precheck": "预检", "download": "下载", "prepare": "准备", "install": "安装",
+            "verify": "验证", "cleanup": "清理", "": "—"}
+UPGRADE_KINDS = set(UPGRADE_STAGES) | {"upgrade"}
+ARCH_BY_HW = {"V1": "rk3588-arm64", "rk3588": "rk3588-arm64", "rk3588-arm64": "rk3588-arm64",
+              "V0": "amd64", "amd64": "amd64"}
+TASK_LOG_CAP = 1_000_000        # 单台日志内存/入库上限（超出截头保留尾部）
+
+
+def _sanitize(text):
+    """凭据脱敏：DEPLOY_PW 出现在任何日志/错误文本中一律替换。"""
+    if DEPLOY_PW and DEPLOY_PW in text:
+        return text.replace(DEPLOY_PW, "***")
+    return text
+
+
+def _task_counts(tasks):
+    counts = {"queued": 0, "running": 0, "success": 0, "failed": 0, "blocked": 0}
+    for t in tasks:
+        counts[t.get("status") or "queued"] = counts.get(t.get("status") or "queued", 0) + 1
+    return counts
+
+
+class UpgradeTask:
+    """一台设备在一个升级任务中的运行态（内存态权威，阶段流转/日志增量落库）。"""
+
+    def __init__(self, task_id, job, hostname, ssh_port, ctx):
+        self.id = task_id
+        self.job = job
+        self.hostname = hostname
+        self.ssh_port = ssh_port
+        self.ctx = ctx
+        self.status = "queued"
+        self.stage = ""
+        self.error = ""
+        self.started_at = 0.0
+        self.finished_at = 0.0
+        self.text = ""
+        self._flushed = 0
+        self.lock = threading.Lock()
+
+    def log(self, line):
+        chunk = _sanitize(str(line)) + "\n"
+        with self.lock:
+            self.text += chunk
+            if len(self.text) > TASK_LOG_CAP:  # 截头保留尾部，防内存/库无限增长
+                cut = self.text.find("\n", len(self.text) - int(TASK_LOG_CAP * 0.8))
+                self.text = "…（前文截断）…\n" + self.text[cut + 1:]
+            total = len(self.text)
+            flush = total - self._flushed >= 65536
+        BUS.publish({"type": "log", "job_id": self.job.id, "task_id": self.id,
+                     "chunk": chunk, "total": total})
+        if flush:
+            self.persist(log=True)
+
+    def set_stage(self, stage):
+        with self.lock:
+            self.stage = stage
+        self.persist(stage=stage, log=True)
+        BUS.publish({"type": "task", "job_id": self.job.id, "task": self.to_dict()})
+
+    def set_status(self, status, error=None):
+        with self.lock:
+            self.status = status
+            if error is not None:
+                self.error = _sanitize(str(error))[:500]
+        BUS.publish({"type": "task", "job_id": self.job.id, "task": self.to_dict()})
+
+    def persist(self, stage=None, status=None, error=None, log=False,
+                started=False, finished=False):
+        kwargs = {}
+        if stage is not None:
+            kwargs["stage"] = stage
+        if status is not None:
+            kwargs["status"] = status
+        if error is not None:
+            kwargs["error"] = error
+        if log:
+            with self.lock:
+                kwargs["log"] = self.text
+                self._flushed = len(self.text)
+        if started:
+            kwargs["started_at"] = datetime.now()
+        if finished:
+            kwargs["finished_at"] = datetime.now()
+        if kwargs:
+            store.update_upgrade_task(self.id, **kwargs)
+
+    def to_dict(self):
+        with self.lock:
+            return {"id": self.id, "hostname": self.hostname,
+                    "site": (store.roster.get(self.hostname) or {}).get("site", ""),
+                    "stage": self.stage, "stage_cn": STAGE_CN.get(self.stage, self.stage),
+                    "status": self.status, "error": self.error,
+                    "started_at": self.started_at or None,
+                    "finished_at": self.finished_at or None,
+                    "chars": len(self.text)}
+
+
+class UpgradeJob:
+    def __init__(self, job_id, kind, version, params):
+        self.id = job_id
+        self.kind = kind
+        self.version = version
+        self.params = params
+        self.status = "running"
+        self.created_at = time.time()
+        self.finished_at = None
+        self.tasks = []
+        self.lock = threading.Lock()
+
+    def to_dict(self, with_tasks=True):
+        with self.lock:
+            tasks = [t.to_dict() for t in self.tasks]
+            out = {"id": self.id, "kind": self.kind, "version": self.version,
+                   "status": self.status, "total": len(tasks),
+                   "params": self.params, "created_at": self.created_at,
+                   "finished_at": self.finished_at, "counts": _task_counts(tasks)}
+            if with_tasks:
+                out["tasks"] = tasks
+            return out
+
+    def check_done(self):
+        """全部子任务终态 → 任务收口（内存 + DB + SSE）。"""
+        with self.lock:
+            if self.status != "running":
+                return
+            if any(t.status in ("queued", "running") for t in self.tasks):
+                return
+            self.status = "completed"
+            self.finished_at = time.time()
+        store.finish_upgrade_job(self.id, datetime.now())
+        BUS.publish({"type": "job", "job": self.to_dict()})
+
+
+UPGRADES = {}            # job_id -> UpgradeJob（内存态；历史任务从 DB 回看）
+UPGRADES_LOCK = threading.Lock()
+_UPGRADE_SEQ = store.max_upgrade_id() if store.enabled else 0  # 重启后从 DB 续号，防主键冲突
+UPGRADE_POOL = ThreadPoolExecutor(max_workers=UPGRADE_MAX_PARALLEL,
+                                  thread_name_prefix="upgrade")
+
+
+def _next_upgrade_ids(n):
+    global _UPGRADE_SEQ
+    with UPGRADES_LOCK:
+        base = _UPGRADE_SEQ
+        _UPGRADE_SEQ += n
+    return base + 1, base + n
+
+
+def device_busy(hostname):
+    """该设备是否已有 queued/running 子任务（跨任务查重，并发护栏）。"""
+    with UPGRADES_LOCK:
+        for job in UPGRADES.values():
+            with job.lock:
+                for t in job.tasks:
+                    if t.hostname == hostname and t.status in ("queued", "running"):
+                        return job.id
+    return None
+
+
+def _ssh_argv(port, remote_cmd):
+    """frp-monitor 与 frps 同机：设备代理绑定本机 127.0.0.1:<port>，直连不走跳板。"""
+    return ["sshpass", "-e", "ssh",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", f"UserKnownHostsFile={SSH_KNOWN_HOSTS}",
+            "-o", "ConnectTimeout=15",
+            "-o", "ServerAliveInterval=15",
+            "-o", "NumberOfPasswordPrompts=1",
+            "-p", str(int(port)), f"{SSH_DEVICE_USER}@127.0.0.1", remote_cmd]
+
+
+def run_remote(task, remote_cmd, timeout=60, stdin_data=None, retries=2, log=True):
+    """在设备上执行命令；stdout 逐行进入任务日志并推 SSE。返回 (rc, 全部输出)。
+
+    对 FRP 瞬断（Connection refused/reset、banner 超时）自动重试；设备端
+    后台任务有 flock 护栏，重试安全。remote_cmd 不落日志（可能含凭据）。"""
+    env = dict(os.environ, SSHPASS=DEPLOY_PW)
+    last = ""
+    for attempt in range(retries + 1):
+        try:
+            proc = subprocess.Popen(
+                _ssh_argv(task.ssh_port, remote_cmd), env=env,
+                stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                errors="replace")
+        except OSError as exc:
+            task.log(f"[panel] 无法启动 ssh: {exc}")
+            return 127, ""
+        if stdin_data is not None:
+            try:
+                proc.stdin.write(stdin_data)
+                proc.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+        out = []
+
+        def pump():
+            for line in proc.stdout:
+                out.append(line)
+                if log:
+                    task.log(line.rstrip("\n"))
+
+        t = threading.Thread(target=pump, daemon=True)
+        t.start()
+        try:
+            rc = proc.wait(timeout=timeout)
+            t.join(5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            t.join(5)
+            task.log(f"[panel] 命令超时({timeout}s)，已终止")
+            return 124, "".join(out)
+        last = "".join(out)
+        conn_err = (rc == 255 and any(s in last for s in (
+            "Connection refused", "Connection reset", "Connection timed out",
+            "kex_exchange_identification", "closed by remote host", "No route to host")))
+        if rc == 0 or not conn_err or attempt >= retries:
+            return rc, last
+        task.log(f"[panel] FRP 隧道瞬断，10s 后重试({attempt + 1}/{retries})…")
+        time.sleep(10)
+    return 255, last
+
+
+def push_script(task, script, envs, timeout):
+    """阶段脚本经 stdin 推送到设备 bash -s 执行（不上传、不留痕）。"""
+    all_envs = {"DEPLOY_PW": DEPLOY_PW, **envs}
+    prefix = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in all_envs.items() if v != "")
+    return run_remote(task, f"{prefix} bash -s", timeout=timeout, stdin_data=script)
+
+
+def _base_dir(version):
+    return f"/var/tmp/ego-{version}" if version else ""
+
+
+def _pkg_url(file):
+    return f"http://{PUBLIC_IP}:{HTTP_PORT}/packages/{file}"
+
+
+def stage_precheck(task, ctx):
+    envs = {"NOW_EPOCH": str(int(time.time()))}
+    if ctx.get("file"):
+        envs["PKG_URL"] = _pkg_url(ctx["file"])
+    rc, out = push_script(task, SCRIPT_PRECHECK, envs, timeout=180)
+    if rc != 0:
+        task.set_status("failed", "预检 SSH 失败（设备不可达或凭据失效）")
+        return False
+    clock_warn = None
+    for line in out.splitlines():
+        if line.startswith("### clock-drift:"):
+            try:
+                drift = int(line.rsplit(":", 1)[1].rstrip("s").strip())
+            except ValueError:
+                continue
+            if abs(drift) > 300:
+                clock_warn = drift
+                task.log(f"[panel] 预检告警：设备时钟偏差 {drift}s（>5min），"
+                         f"apt 可能失败，建议先修复时间同步再升级（SOP 坑 #10）")
+        elif line.startswith("### pkg-url:") and "http=206" not in line and "http=200" not in line:
+            task.log(f"[panel] 预检告警：设备无法连通面板包地址（{line.strip()}），下载阶段可能失败")
+    if clock_warn is None:
+        task.log("[panel] 时钟偏差正常（≤5min）")
+    # 活跃采集会话（非 [] = 禁止升级）；check-skipped = 采集库不可读，放行
+    sess = [l for l in out.splitlines()
+            if any(x in l for x in ("('", "[(", "RECORDING")) and "check-skipped" not in l and "[]" not in l]
+    if sess:
+        task.set_status("blocked", "存在活跃采集会话，先停止采集再升级")
+        return False
+    for line in out.splitlines():
+        if line.startswith("### camera-containers:"):
+            try:
+                n = int(line.rsplit(":", 1)[1].strip() or 0)
+            except ValueError:
+                n = 0
+            if n > 0:
+                task.set_status("blocked", f"检测到 {n} 个运行中的 decxin 相机容器，需先移除（确认无活跃会话后）")
+                return False
+    return True
+
+
+def stage_download(task, ctx):
+    if not ctx.get("file") or not ctx.get("sha256"):
+        task.set_status("failed", "缺少安装包或 sha256 基准，无法下载")
+        return False
+    envs = {"PKG_URL": _pkg_url(ctx["file"]), "PKG_VERSION": ctx["version"]}
+    rc, out = push_script(task, SCRIPT_DOWNLOAD, envs, timeout=3600)
+    if rc != 0 or "DOWNLOAD_OK" not in out:
+        task.set_status("failed", "下载失败（curl 未完成，详见日志）")
+        return False
+    got = next((l.split("=", 1)[1].strip() for l in out.splitlines()
+                if l.startswith("sha256=")), "")
+    if got != ctx["sha256"]:
+        task.set_status("failed", f"sha256 不一致：设备端 {got[:16]}… ≠ 面板基准 {ctx['sha256'][:16]}…，已终止")
+        return False
+    task.log("[panel] 下载完成且 sha256 与面板基准一致")
+    return True
+
+
+def stage_prepare(task, ctx):
+    if not ctx.get("sha256"):
+        task.set_status("failed", "缺少 sha256 基准，无法校验")
+        return False
+    envs = {"PKG_VERSION": ctx["version"], "SHA256": ctx["sha256"],
+            "PKG_ARCH": ctx.get("arch") or "rk3588-arm64"}
+    if ctx.get("pkg_src"):
+        envs["PKG_SRC"] = ctx["pkg_src"]
+    rc, out = push_script(task, SCRIPT_PREPARE, envs, timeout=1200)
+    if rc != 0 or "PREPARE_OK" not in out:
+        task.set_status("failed", "prepare 失败（sha 校验/解压/prepare-only，详见日志）")
+        return False
+    for line in out.splitlines():
+        if line.startswith(("DEVICE_ID=", "DEVICE_NAME=", "RELEASE_VERSION=")):
+            task.log(f"[panel] bundle 自检 {line}")
+    return True
+
+
+def stage_install(task, ctx):
+    base = _base_dir(ctx["version"])
+    if not base:
+        task.set_status("failed", "缺少目标版本，无法安装")
+        return False
+    # 1) 防双安装器：检查与启动分两条 SSH 命令，pattern 用 [i] 写法防 pgrep 自匹配
+    rc, out = run_remote(task, 'pgrep -c -f "[i]nstall-remote.sh" || true', timeout=40, log=False)
+    n = next((l.strip() for l in out.splitlines() if l.strip().isdigit()), "1")
+    if n != "0":
+        task.set_status("blocked", f"设备上已有安装进程在运行 (n={n})，禁止重复启动")
+        return False
+    # 2) 上传安装执行器（flock 防重入 + sudo 保活 + INSTALL_EXIT 判据）
+    rc, _ = run_remote(
+        task,
+        f"mkdir -p {shlex.quote(base)} && cat > {shlex.quote(base + '/run-install.sh')} "
+        f"&& chmod 700 {shlex.quote(base + '/run-install.sh')}",
+        timeout=60, stdin_data=SCRIPT_RUN_INSTALL)
+    if rc != 0:
+        task.set_status("failed", "上传 run-install.sh 失败")
+        return False
+    # 3) nohup+setsid 后台启动：SSH/面板断连不影响安装（凭据只出现在命令行瞬间，不落日志）
+    launch = (f"DEPLOY_PW={shlex.quote(DEPLOY_PW)} PKG_VERSION={shlex.quote(ctx['version'])} "
+              f"nohup setsid bash {shlex.quote(base + '/run-install.sh')} "
+              f"> {shlex.quote(base + '/install.log')} 2>&1 < /dev/null & sleep 2; echo LAUNCHED")
+    rc, out = run_remote(task, launch, timeout=40, log=False)
+    if rc != 0 or "LAUNCHED" not in out:
+        task.set_status("failed", "启动安装器失败")
+        return False
+    task.log("[panel] 安装器已在设备后台启动（nohup+setsid），开始跟踪 install.log …")
+    # 4) 增量跟踪 install.log；成功判据 = 成功横幅 + INSTALL_EXIT=0
+    offset, collected = 0, ""
+    deadline = time.time() + int(ctx.get("install_timeout") or INSTALL_TIMEOUT)
+    drop = 0
+    while time.time() < deadline:
+        time.sleep(8)
+        rc, out = run_remote(
+            task,
+            f"wc -c < {shlex.quote(base + '/install.log')} 2>/dev/null; "
+            f"tail -c +{offset + 1} {shlex.quote(base + '/install.log')} 2>/dev/null",
+            timeout=40, log=False)
+        if rc != 0:
+            drop += 1
+            task.log(f"[panel] 轮询 SSH 失败({drop}/5)，设备端安装不受影响，继续…")
+            if drop >= 5:
+                task.set_status("failed", "连续多次无法连接设备；安装可能仍在后台进行，稍后用「验证」补查")
+                return False
+            continue
+        drop = 0
+        lines = out.splitlines()
+        try:
+            size = int(lines[0].strip() or 0)
+        except (ValueError, IndexError):
+            size = 0
+        if size > offset:
+            delta = "\n".join(lines[1:])
+            if delta:
+                for l in delta.splitlines():
+                    task.log(l)
+                collected += delta + "\n"
+            offset = size
+        if "INSTALL_EXIT=" in collected:
+            ok = "INSTALL_EXIT=0" in collected and "is running." in collected
+            exit_val = collected.rsplit("INSTALL_EXIT=", 1)[-1].splitlines()[0][:8]
+            task.log(f"[panel] 安装器退出 INSTALL_EXIT={exit_val}；"
+                     f"成功判据（横幅 + INSTALL_EXIT=0）{'满足' if ok else '未满足'}")
+            if not ok:
+                task.set_status("failed", f"安装未同时满足成功判据（横幅 + INSTALL_EXIT=0），安装器已自动回滚")
+            return ok
+    task.set_status("failed", f"安装跟踪超时（>{int(ctx.get('install_timeout') or INSTALL_TIMEOUT)}s，"
+                              f"安装可能仍在设备后台进行，稍后用「验证」补查）")
+    return False
+
+
+def stage_verify(task, ctx):
+    rc, out = push_script(task, SCRIPT_VERIFY, {}, timeout=180)
+    if rc != 0:
+        task.set_status("failed", "验证 SSH 失败")
+        return False
+    s = {}
+    for line in out.splitlines():
+        for key in ("version", "service", "http", "frpc", "api"):
+            if line.startswith(key + "="):
+                s[key] = line.split("=", 1)[1][:160]
+    want = ctx.get("version") or ""
+    new_containers = sum(1 for l in out.splitlines() if want and want in l and "|" in l)
+    ok = (s.get("service") == "active" and s.get("http") == "200"
+          and s.get("frpc") == "active"
+          and (not want or s.get("version") == want)
+          and (not want or new_containers >= 4))
+    task.log(f"[panel] 验证结果 version={s.get('version')} service={s.get('service')} "
+             f"http={s.get('http')} frpc={s.get('frpc')} 新版容器={new_containers}")
+    if not ok:
+        task.set_status("failed", "验证未全部通过（版本/service/HTTP/frpc/4 容器镜像）")
+    return ok
+
+
+def stage_cleanup(task, ctx):
+    envs = {}
+    if ctx.get("version"):
+        envs["PKG_VERSION"] = ctx["version"]
+    if ctx.get("old_tag"):
+        envs["OLD_TAG"] = ctx["old_tag"]
+    rc, _ = push_script(task, SCRIPT_CLEANUP, envs, timeout=180)
+    if rc != 0:
+        task.set_status("failed", "清理失败（详见日志）")
+        return False
+    return True
+
+
+STAGE_FN = {"precheck": stage_precheck, "download": stage_download, "prepare": stage_prepare,
+            "install": stage_install, "verify": stage_verify, "cleanup": stage_cleanup}
+
+
+def _run_upgrade_task(task):
+    stages = UPGRADE_STAGES if task.job.kind == "upgrade" else [task.job.kind]
+    task.set_status("running")
+    task.started_at = time.time()
+    task.persist(status="running", started=True)
+    try:
+        for stage in stages:
+            task.set_stage(stage)
+            ok = STAGE_FN[stage](task, task.ctx)
+            if not ok:
+                if task.status != "blocked":
+                    task.set_status("failed", task.error or f"{stage} 阶段失败")
+                break
+        else:
+            task.set_status("success")
+    except Exception as exc:  # noqa: BLE001
+        task.log(f"[panel] 任务异常: {exc!r}")
+        task.set_status("failed", f"任务异常: {exc!r}")
+    finally:
+        task.finished_at = time.time()
+        task.persist(status=task.status, error=task.error or None, log=True, finished=True)
+        BUS.publish({"type": "task", "job_id": task.job.id, "task": task.to_dict()})
+        task.job.check_done()
+
+
+def _resolve_device(hostname):
+    """以面板设备记录为准解析 ssh_port 与机型；返回 (ssh_port, arch, error)。"""
+    snap = {}
+    try:
+        hosts, _ = get_snapshot()
+        snap = next((h for h in hosts if h["hostname"] == hostname), {}) or {}
+    except Exception:  # noqa: BLE001
+        pass
+    roster = store.roster.get(hostname) or {}
+    ssh_port = snap.get("port") or roster.get("ssh_port")
+    if isinstance(ssh_port, str) and ssh_port.isdigit():
+        ssh_port = int(ssh_port)
+    hw = (roster.get("hardware") or "").strip() or _hardware_category(roster.get("hw_model") or "")
+    arch = ARCH_BY_HW.get((hw or "").strip()) or ARCH_BY_HW.get(hw.casefold() if hw else "")
+    error = None
+    if not ssh_port:
+        error = "无 SSH 端口记录（以面板设备记录为准，请等设备上线后再试）"
+    elif not arch:
+        error = "无法确定机型（V0/amd64 或 V1/rk3588），请先在设备登记表维护 hardware"
+    return ssh_port, arch, error
+
+
+def create_upgrade_job(kind, devices, params):
+    """创建升级任务；返回 {ok, job_id, total, skipped:[{hostname, reason}]} 或 {ok:False, error}。"""
+    if kind not in UPGRADE_KINDS:
+        return {"ok": False, "error": f"未知操作类型: {kind}（可选 {sorted(UPGRADE_KINDS)}）"}
+    if not DEPLOY_PW:
+        return {"ok": False, "error": "服务端未设置 DEPLOY_PW 环境变量（/etc/frp-monitor.env）"}
+    devices = [str(h).strip().casefold() for h in devices or [] if str(h).strip()]
+    seen = set()
+    devices = [h for h in devices if not (h in seen or seen.add(h))]
+    if not devices:
+        return {"ok": False, "error": "未指定设备"}
+    version = str((params or {}).get("version") or "").strip()
+    needs_pkg = kind in ("download", "prepare", "install", "upgrade")
+    if needs_pkg and not version:
+        return {"ok": False, "error": f"{kind} 需要目标版本 version"}
+    pkgs = all_packages_for_version(version) if version else {}
+    if needs_pkg and not pkgs:
+        return {"ok": False, "error": f"版本 {version} 的安装包不存在（先上传或 scp 到 {PKG_DIR}）"}
+    if needs_pkg and any(p["hash_status"] != "ok" for p in pkgs.values()):
+        return {"ok": False, "error": f"版本 {version} 的安装包 sha256 尚未就绪，稍后重试"}
+    # 解析每台设备（端口/机型/占用），逐台给出跳过原因
+    try:
+        hosts, _ = get_snapshot()
+        snapshot_names = {h["hostname"] for h in hosts}
+    except Exception:  # noqa: BLE001  # frps 不可达时仅按登记表判定
+        snapshot_names = set()
+    resolved, skipped = [], []
+    for hostname in devices:
+        if hostname not in store.roster and hostname not in snapshot_names:
+            skipped.append({"hostname": hostname, "reason": "未知设备（不在面板记录中）"})
+            continue
+        busy = device_busy(hostname)
+        if busy:
+            skipped.append({"hostname": hostname, "reason": f"已有任务 {busy} 在进行中"})
+            continue
+        ssh_port, arch, error = _resolve_device(hostname)
+        if error:
+            skipped.append({"hostname": hostname, "reason": error})
+            continue
+        if needs_pkg and arch not in pkgs:
+            skipped.append({"hostname": hostname,
+                            "reason": f"版本 {version} 缺少 {arch}（{'amd64' if arch == 'rk3588-arm64' else 'rk3588-arm64'}）机型安装包"})
+            continue
+        resolved.append((hostname, ssh_port, arch))
+    if not resolved:
+        return {"ok": False, "error": "没有可执行的设备", "skipped": skipped}
+    # 建任务（job + 每台一个子任务）
+    first_id, _ = _next_upgrade_ids(1 + len(resolved))
+    job_id = first_id
+    job = UpgradeJob(job_id, kind, version, {k: v for k, v in (params or {}).items()
+                                             if k in ("version", "old_tag", "install_timeout", "pkg_src")})
+    with UPGRADES_LOCK:
+        UPGRADES[job_id] = job
+    store.create_upgrade_job(job_id, kind, version,
+                             json.dumps(job.params, ensure_ascii=False), len(resolved), datetime.now())
+    for i, (hostname, ssh_port, arch) in enumerate(resolved):
+        task_id = first_id + 1 + i
+        pkg = pkgs.get(arch) or {}
+        ctx = {"version": version, "arch": arch, "file": pkg.get("file", ""),
+               "sha256": pkg.get("sha256", ""),
+               "old_tag": str((params or {}).get("old_tag") or ""),
+               "install_timeout": (params or {}).get("install_timeout") or INSTALL_TIMEOUT,
+               "pkg_src": str((params or {}).get("pkg_src") or "")}
+        task = UpgradeTask(task_id, job, hostname, ssh_port, ctx)
+        with job.lock:
+            job.tasks.append(task)
+        store.create_upgrade_task(task_id, job_id, hostname, ssh_port)
+        UPGRADE_POOL.submit(_run_upgrade_task, task)
+    BUS.publish({"type": "job", "job": job.to_dict()})
+    return {"ok": True, "job_id": job_id, "total": len(resolved), "skipped": skipped}
+
+
+def upgrade_job_view(job_id):
+    with UPGRADES_LOCK:
+        job = UPGRADES.get(job_id)
+    if job is not None:
+        return job.to_dict()
+    if store.enabled:
+        return store.upgrade_job_view(job_id)
+    return None
+
+
+def upgrade_jobs_list_view(limit=50):
+    out = []
+    with UPGRADES_LOCK:
+        jobs = sorted(UPGRADES.values(), key=lambda j: -j.id)[:limit]
+        out = [j.to_dict(with_tasks=False) for j in jobs]
+    if store.enabled:
+        known = {j["id"] for j in out}
+        for row in store.upgrade_jobs_list(limit):
+            if row["id"] not in known:
+                out.append(row)
+        out.sort(key=lambda j: -j["id"])
+    return out[:limit]
+
+
+def upgrade_task_log_view(job_id, task_id=None, hostname=None, offset=0):
+    """日志增量读取（内存态优先，重启后回落 DB）；返回 dict 或 None。"""
+    task = None
+    with UPGRADES_LOCK:
+        job = UPGRADES.get(job_id)
+    if job is not None:
+        with job.lock:
+            candidates = job.tasks
+        if task_id is not None:
+            task = next((t for t in candidates if t.id == task_id), None)
+        elif hostname:
+            task = next((t for t in candidates if t.hostname == hostname), None)
+    if task is not None:
+        with task.lock:
+            text, total = task.text[offset:], len(task.text)
+        return {"ok": True, "task_id": task.id, "hostname": task.hostname,
+                "status": task.status, "log": text, "next_offset": total}
+    if store.enabled:
+        row = store.upgrade_task_log(job_id, task_id=task_id, hostname=hostname)
+        if row is not None:
+            text, status = row
+            return {"ok": True, "hostname": hostname, "status": status,
+                    "log": (text or "")[offset:], "next_offset": len(text or "")}
+    return None
+
+
+def _prune_upgrade_memory():
+    """清理 24h 前已结束的内存态任务（历史回看走 DB）。"""
+    with UPGRADES_LOCK:
+        stale = [jid for jid, j in UPGRADES.items()
+                 if j.status != "running" and time.time() - (j.finished_at or j.created_at) > 86400]
+        for jid in stale:
+            UPGRADES.pop(jid, None)
+
+
+# ----------------------------------------------------------------------------
+# 数据保留与每日备份（随服务运行的后台线程）
+# ----------------------------------------------------------------------------
+def run_maintenance(retention=True, backup=True, reason="daily"):
+    """30 天数据保留清理 + mysqldump 每日备份；devices / collect_duration 永不清理。"""
+    result = {"reason": reason, "retention": {}, "backup": None, "enabled": store.enabled}
+    if store.enabled and retention:
+        for label, sql, args in (
+            ("host_status", "DELETE FROM host_status WHERE ts < NOW() - INTERVAL %s DAY", (RETENTION_DAYS,)),
+            ("refresh_batches", "DELETE FROM refresh_batches WHERE ts < NOW() - INTERVAL %s DAY", (RETENTION_DAYS,)),
+            ("host_events", "DELETE FROM host_events WHERE ts < NOW() - INTERVAL %s DAY", (RETENTION_DAYS,)),
+            ("upgrade_tasks", "DELETE t FROM upgrade_tasks t JOIN upgrade_jobs j "
+                              "ON t.job_id = j.id WHERE j.created_at < NOW() - INTERVAL %s DAY", (RETENTION_DAYS,)),
+            ("upgrade_jobs", "DELETE FROM upgrade_jobs WHERE created_at < NOW() - INTERVAL %s DAY", (RETENTION_DAYS,)),
+        ):
+            result["retention"][label] = store._execute(sql, args)
+    if store.enabled and backup:
+        result["backup"] = _run_db_backup()
+    _prune_upgrade_memory()
+    return result
+
+
+def _run_db_backup():
+    """mysqldump frp_monitor → BACKUP_DIR/frp_monitor-<ts>.sql.gz，保留最近 BACKUP_KEEP 份。
+
+    凭据经临时 defaults-extra-file（0600）传入，不出现在命令行。"""
+    if not shutil.which("mysqldump"):
+        return {"ok": False, "error": "mysqldump 不可用（请安装 mysql-client）"}
+    try:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+    except OSError as exc:
+        return {"ok": False, "error": f"无法创建备份目录 {BACKUP_DIR}: {exc}"}
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    dest = os.path.join(BACKUP_DIR, f"frp_monitor-{stamp}.sql.gz")
+    defaults = os.path.join(BACKUP_DIR, f".my-{stamp}.cnf")
+    try:
+        with open(defaults, "w", encoding="utf-8") as fh:
+            fh.write("[client]\n")
+            fh.write(f"user={DB_USER}\n")
+            fh.write(f"password={DB_PASSWORD}\n")
+            fh.write(f"host={DB_HOST}\n")
+            fh.write(f"port={DB_PORT}\n")
+        os.chmod(defaults, 0o600)
+        with open(dest, "wb") as out:
+            proc = subprocess.run(
+                ["mysqldump", f"--defaults-extra-file={defaults}", "--single-transaction",
+                 "--routines", "--triggers", DB_NAME],
+                stdout=out, stderr=subprocess.PIPE, timeout=1800)
+        if proc.returncode != 0:
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            return {"ok": False, "error": _sanitize(proc.stderr.decode("utf-8", "replace")[:300])}
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+    finally:
+        try:
+            os.remove(defaults)
+        except OSError:
+            pass
+    # 只保留最近 BACKUP_KEEP 份
+    try:
+        backups = sorted(
+            (f for f in os.listdir(BACKUP_DIR)
+             if f.startswith("frp_monitor-") and f.endswith(".sql.gz")),
+            key=lambda f: os.path.getmtime(os.path.join(BACKUP_DIR, f)))
+        for old in backups[:-BACKUP_KEEP]:
+            os.remove(os.path.join(BACKUP_DIR, old))
+    except OSError:
+        pass
+    return {"ok": True, "file": os.path.basename(dest), "size": os.path.getsize(dest),
+            "kept": BACKUP_KEEP, "dir": BACKUP_DIR}
+
+
+def _parse_maintenance_time(spec):
+    hh, sep, mm = (spec or "").strip().partition(":")
+    try:
+        hh, mm = int(hh), int(mm)
+    except ValueError:
+        return 3, 30
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        return 3, 30
+    return hh, mm
+
+
+def _next_maintenance_slot(now=None):
+    hh, mm = _parse_maintenance_time(MAINTENANCE_TIME)
+    now = now or datetime.now()
+    cand = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if cand <= now:
+        cand += timedelta(days=1)
+    return cand
+
+
+def _maintenance_loop():
+    while True:
+        deadline = _next_maintenance_slot()
+        while True:
+            remaining = (deadline - datetime.now()).total_seconds()
+            if remaining <= 0:
+                break
+            time.sleep(min(60.0, remaining))
+        try:
+            result = run_maintenance(reason="daily")
+            retention = result.get("retention") or {}
+            backup = result.get("backup") or {}
+            print(f"frp-monitor: daily maintenance done: retention="
+                  f"{ {k: v for k, v in retention.items()} } backup={backup.get('file') or backup.get('error')}",
+                  flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"frp-monitor: daily maintenance failed: {exc}", flush=True)
+
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
+
+    # -- 安装包下载（设备 curl 用：免面板认证，支持 Range 续传） ---------------
+    def _serve_package(self, head_only=False):
+        """GET/HEAD /packages/<filename>：免认证（设备无法携带凭据）。"""
+        name = unquote(urlsplit(self.path).path[len("/packages/"):]).strip("/")
+        if not name or "/" in name or "\\" in name or name.startswith(".") or ".." in name:
+            return self.send_json(400, {"error": "invalid filename"})
+        path = os.path.join(PKG_DIR, name)
+        try:
+            st = os.stat(path)
+            if not (st.st_mode & 0o100000):
+                raise OSError
+        except OSError:
+            return self.send_json(404, {"error": "package not found", "file": name})
+        size = st.st_size
+        start, end = 0, size - 1
+        status = 200
+        range_header = self.headers.get("Range") or ""
+        if range_header.startswith("bytes="):
+            spec = range_header[6:].split(",")[0].strip()
+            m = re.match(r"^(\d*)-(\d*)$", spec)
+            if m and (m.group(1) or m.group(2)):
+                if m.group(1):
+                    start = int(m.group(1))
+                    if m.group(2):
+                        end = min(int(m.group(2)), size - 1)
+                else:
+                    start = max(0, size - int(m.group(2)))  # 后 N 字节
+                    end = size - 1
+                if start > size - 1 or start > end:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.end_headers()
+                    return
+                status = 206
+        length = end - start + 1
+        self.send_response(status)
+        self.send_header("Content-Type", "application/gzip")
+        self.send_header("Content-Length", str(length))
+        self.send_header("Accept-Ranges", "bytes")
+        if status == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if head_only:
+            return
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = fh.read(min(1 << 20, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+
+    def do_HEAD(self):
+        path = urlsplit(self.path).path
+        if path.startswith("/packages/"):
+            return self._serve_package(head_only=True)
+        self.send_error(404)
 
     def send_json(self, status, data):
         body = json.dumps(data, ensure_ascii=False).encode()
@@ -997,11 +2249,121 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b'{"error": "unauthorized"}')
 
+    def _json_body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        return json.loads(self.rfile.read(n) or b"{}")
+
+    def _upload_package(self):
+        """POST /api/packages/upload?name=<filename>：流式落盘 + 边写边算 sha256。"""
+        qs = parse_qs(urlsplit(self.path).query)
+        name = (qs.get("name", [""])[0] or self.headers.get("X-Filename") or "").strip()
+        if not name or "/" in name or "\\" in name or ".." in name or not SAFE_FILENAME_RE.match(name):
+            return self.send_json(400, {"ok": False, "error": "非法文件名（仅允许 *.tar.gz，且不含路径）"})
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0:
+            self.send_response(411)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b'{"ok": false, "error": "missing Content-Length"}')
+            return
+        try:
+            os.makedirs(PKG_DIR, exist_ok=True)
+        except OSError as exc:
+            return self.send_json(500, {"ok": False, "error": f"无法创建包目录: {exc}"})
+        final = os.path.join(PKG_DIR, name)
+        tmp = final + ".uploading"
+        digest = hashlib.sha256()
+        written = 0
+        try:
+            with open(tmp, "wb") as fh:
+                remaining = length
+                while remaining > 0:
+                    chunk = self.rfile.read(min(1 << 20, remaining))
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    digest.update(chunk)
+                    written += len(chunk)
+                    remaining -= len(chunk)
+            if written != length:
+                os.remove(tmp)
+                return self.send_json(400, {"ok": False, "error": f"上传不完整（{written}/{length} 字节）"})
+            os.replace(tmp, final)
+        except OSError as exc:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return self.send_json(500, {"ok": False, "error": str(exc)})
+        # 上传即完成哈希：直接写入缓存，免后台重算 1G
+        st = os.stat(final)
+        with _PKG_LOCK:
+            _PKG_CACHE[final] = {"mtime": st.st_mtime, "size": st.st_size,
+                                 "sha256": digest.hexdigest()}
+        m = PKG_NAME_RE.match(name)
+        self.send_json(200, {"ok": True, "file": name, "size": written,
+                             "sha256": digest.hexdigest(),
+                             "version": m.group(1) if m else "", "arch": m.group(2) if m else ""})
+
     def do_GET(self):
+        path = urlsplit(self.path).path
+        if path.startswith("/packages/"):
+            # 设备下载专用：免面板认证（设备 curl 无法携带凭据）
+            return self._serve_package()
         if not self._authorized():
             self.send_unauthorized()
             return
-        path = urlsplit(self.path).path
+        if path == "/api/packages":
+            pkgs = packages_view()
+            for p in pkgs:
+                p["url"] = f"/packages/{p['file']}"
+            self.send_json(200, {"dir": PKG_DIR, "count": len(pkgs), "packages": pkgs})
+            return
+        if path == "/api/upgrade/jobs":
+            qs = parse_qs(urlsplit(self.path).query)
+            try:
+                limit = min(max(int(qs.get("limit", ["50"])[0]), 1), 200)
+            except (TypeError, ValueError):
+                limit = 50
+            self.send_json(200, {"jobs": upgrade_jobs_list_view(limit)})
+            return
+        m = re.match(r"^/api/upgrade/jobs/(\d+)$", path)
+        if m:
+            job = upgrade_job_view(int(m.group(1)))
+            if job is None:
+                self.send_json(404, {"error": "unknown job", "job_id": int(m.group(1))})
+            else:
+                self.send_json(200, job)
+            return
+        m = re.match(r"^/api/upgrade/jobs/(\d+)/log$", path)
+        if m:
+            qs = parse_qs(urlsplit(self.path).query)
+            job_id = int(m.group(1))
+            task_id = hostname = None
+            if qs.get("task"):
+                try:
+                    task_id = int(qs["task"][0])
+                except (TypeError, ValueError):
+                    return self.send_json(400, {"error": "bad task id"})
+            elif qs.get("hostname"):
+                hostname = qs["hostname"][0].strip().casefold()
+            if task_id is None and not hostname:
+                return self.send_json(400, {"error": "需要 task=<id> 或 hostname=<设备名> 指定子任务"})
+            try:
+                offset = max(0, int(qs.get("offset", ["0"])[0]))
+            except (TypeError, ValueError):
+                offset = 0
+            view = upgrade_task_log_view(job_id, task_id=task_id, hostname=hostname, offset=offset)
+            if view is None:
+                self.send_json(404, {"error": "unknown job/task", "job_id": job_id})
+            else:
+                self.send_json(200, view)
+            return
+        if path == "/api/upgrade/events":
+            return self._sse()
         if path == "/api/hosts":
             force = "refresh" in parse_qs(urlsplit(self.path).query)
             if force:
@@ -1171,11 +2533,55 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_error(404)
 
+    def _sse(self):
+        """SSE：任务状态变更 / 逐台阶段流转 / 日志块增量。"""
+        q = BUS.subscribe()
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(b": connected\n\n")
+            self.wfile.flush()
+            while True:
+                try:
+                    ev = q.get(timeout=15)
+                except queue.Empty:
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                    continue
+                data = json.dumps(ev, ensure_ascii=False)
+                self.wfile.write(f"data: {data}\n\n".encode("utf-8"))
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            pass
+        finally:
+            BUS.unsubscribe(q)
+
     def do_POST(self):
+        path = urlsplit(self.path).path
+        if path == "/api/packages/upload":
+            if not self._authorized():
+                self.send_unauthorized()
+                return
+            return self._upload_package()
         if not self._authorized():
             self.send_unauthorized()
             return
-        path = urlsplit(self.path).path
+        if path == "/api/upgrade/jobs":
+            try:
+                req = self._json_body()
+            except json.JSONDecodeError:
+                return self.send_json(400, {"ok": False, "error": "bad json"})
+            params = req.get("params") or {}
+            if not isinstance(params, dict):
+                return self.send_json(400, {"ok": False, "error": "params 必须是对象"})
+            out = create_upgrade_job(str(req.get("kind") or ""),
+                                     req.get("devices") or [], params)
+            return self.send_json(200 if out.get("ok") else 400, out)
+        if path == "/api/maintenance/run-cleanup":
+            result = run_maintenance(retention=True, backup=False, reason="manual")
+            return self.send_json(200, result)
         if path == "/api/collect-duration/run":
             # 手动触发一次拉取（自测/验证用，不必等到 19:00）
             try:
@@ -1189,6 +2595,31 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    # 目录就绪（已存在则无副作用；无权限时不阻塞启动）
+    for _d in (PKG_DIR, BACKUP_DIR, os.path.dirname(SSH_KNOWN_HOSTS)):
+        try:
+            os.makedirs(_d, exist_ok=True)
+        except OSError:
+            pass
+    if store.enabled:
+        try:
+            _restarted = store.reconcile_upgrade_jobs()
+            if _restarted:
+                print(f"frp-monitor: reconciled {_restarted} interrupted upgrade task(s) "
+                      f"left by a previous process", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"frp-monitor: upgrade job reconcile failed: {exc}", flush=True)
+    if not DEPLOY_PW:
+        print("frp-monitor: DEPLOY_PW not set —— 升级编排不可用（浏览可用），"
+              "请在 /etc/frp-monitor.env 配置后重启", flush=True)
     threading.Thread(target=_refresh_loop, name="snapshot-refresher", daemon=True).start()
     threading.Thread(target=_collect_duration_loop, name="collect-duration-puller", daemon=True).start()
-    ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), Handler).serve_forever()
+    threading.Thread(target=_pkg_scan_loop, name="package-scanner", daemon=True).start()
+    threading.Thread(target=_maintenance_loop, name="daily-maintenance", daemon=True).start()
+    print(f"frp-monitor: serving on :{HTTP_PORT} (pkg_dir={PKG_DIR}, "
+          f"upgrade_parallel={UPGRADE_MAX_PARALLEL}, retention={RETENTION_DAYS}d, "
+          f"backup={BACKUP_DIR} keep {BACKUP_KEEP}, download_base=http://{PUBLIC_IP}:{HTTP_PORT})",
+          flush=True)
+    httpd = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), Handler)
+    httpd.daemon_threads = True  # SSE 长连接随主进程退出，不阻塞重启
+    httpd.serve_forever()

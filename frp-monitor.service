@@ -7,6 +7,9 @@ Wants=network-online.target
 Type=simple
 User=ubuntu
 WorkingDirectory=/opt/frp-monitor
+# 运行时凭据（DB 密码、DEPLOY_PW、PKG_DIR 等）统一放 /etc/frp-monitor.env；
+# 「-」前缀：文件不存在时不阻塞启动（无凭据时降级浏览模式）
+EnvironmentFile=-/etc/frp-monitor.env
 ExecStart=/usr/bin/python3 /opt/frp-monitor/server.py
 Restart=always
 RestartSec=3
