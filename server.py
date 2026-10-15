@@ -84,16 +84,58 @@ def device_type(hostname):
 
 INDEX = """<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>EGO 设备面板</title><style>{css}</style></head><body><main>
 <header><div><h1>EGO 设备面板</h1><p id=sub>正在加载…</p></div><button id=refresh>立即刷新</button></header>
+<nav id=viewTabs class=vtabs><button type=button data-view=overview class=on>设备总览</button><button type=button data-view=upgrade>升级</button></nav>
+<section id=viewOverview>
 <section class=summary><div><b id=online>0</b><span>在线设备</span></div><div><b id=registered>0</b><span>登记设备</span></div><div><b id=pendingN>0</b><span id=targetLbl>待升级</span></div><div><b id=sitesN>0</b><span>站点</span></div><div><b id=missingN>0</b><span>未上线</span></div></section>
 <div class=toolbar><input id=q placeholder="搜索 hostname / device_id / 设备名 / IP"><select id=statusFilter><option value=all>全部状态</option><option value=online selected>仅在线</option><option value=offline>仅未上线</option></select><select id=targetSel title="升级目标版本"></select><button id=copyPending class=listbtn title="按当前筛选（站点/状态/版本/搜索）复制：设备号 站点 IP SSH端口 device_id 当前版本">复制待升级清单</button><button id=copyCmds class=listbtn title="按当前筛选复制 SSH 跳板登录命令">复制跳板命令</button><button id=copyList class=listbtn title="按当前筛选复制设备编号">复制编号</button></div>
 <nav id=sites class=sitesbar></nav>
 <nav id=vers class=sitesbar></nav>
 <div id=grid class=grid></div>
 <section id=events><h2>最近事件（24 小时）</h2><div id=eventsBody class=elist><p class=eempty>加载中…</p></div></section>
+</section>
+<section id=viewUpgrade hidden>
+<section class=upanel><div class=uhead><h2>① 安装包</h2><div class=uactions><input type=file id=upgFile hidden accept=".tar.gz,.gz"><button type=button id=upgUploadBtn class=listbtn>上传安装包</button><button type=button id=upgPkgRefresh class=listbtn>刷新</button><label class=utarget>目标版本 <select id=upgVerSel></select></label></div></div><div id=upgUpBar class=pbarwrap hidden><div class=pbar><i id=upgUpFill></i></div><span id=upgUpPct></span></div><div class=twrap><table><thead><tr><th>版本</th><th>机型</th><th>大小</th><th>sha256</th><th>状态</th></tr></thead><tbody id=upgPkgBody></tbody></table></div><p class=uhint id=upgPkgHint></p><p class=uhint id=upgShaInfo></p></section>
+<section class=upanel><div class=uhead><h2>② 选择目标设备</h2><div class=uselbar id=upgSelBar>已选 0 台</div></div><div id=upgDevGroups><p class=uempty>加载中…</p></div></section>
+<section class=upanel id=upgActPanel><div class=uhead><h2>③ 发起升级</h2></div><div class=ubtns><button type=button id=upgRunAll>▶ 全流程升级所选</button><button type=button class=stagebtn data-kind=precheck>仅预检</button><button type=button class=stagebtn data-kind=download>仅下载</button><button type=button class=stagebtn data-kind=install>仅安装</button><button type=button class=stagebtn data-kind=verify>仅验证</button><button type=button class=stagebtn data-kind=cleanup>仅清理</button></div><p class=uhint id=upgActHint></p></section>
+<section class=upanel><div class=uhead><h2>④ 任务与进度</h2><span id=upgConn class=connchip>未连接</span></div><div id=upgJobSummary><p class=uempty>暂无升级任务</p></div><div id=upgTaskGrid></div></section>
+</section>
 </main>
 <div id=modal class=modal><div id=modalBody class=mbody></div></div>
+<div id=upgModal class=modal><div id=upgModalBody class=mbody></div></div>
 <script>{js}</script></body></html>"""
-CSS = """*{box-sizing:border-box}body{margin:0;background:#f4f7fb;color:#172033;font:14px system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif}main{max-width:1100px;margin:0 auto;padding:32px 20px}header{display:flex;justify-content:space-between;align-items:center;margin-bottom:22px}h1{margin:0 0 7px;font-size:28px}p{margin:0;color:#718096}button{border:0;border-radius:8px;padding:10px 16px;background:#2563eb;color:white;cursor:pointer;font-size:14px}input,select{font:inherit;padding:9px 12px;border:1px solid #cbd5e1;border-radius:8px;background:white;color:#172033;outline:none}input:focus,select:focus{border-color:#2563eb}.summary{display:flex;gap:14px;margin-bottom:18px;flex-wrap:wrap}.summary div{background:white;border:1px solid #e5eaf1;border-radius:12px;padding:14px 22px;min-width:120px;box-shadow:0 2px 8px #1720330a}.summary b{display:block;font-size:26px}.summary span{color:#718096;font-size:12px}.toolbar{display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap}.toolbar input{flex:1;min-width:180px}.listbtn{background:#f1f5f9;color:#334155;border:1px solid #cbd5e1;white-space:nowrap}.listbtn:hover{background:#e2e8f0}.sitesbar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px}.chip{border:1px solid #e5eaf1;background:white;color:#334155;border-radius:999px;padding:6px 14px;font-size:13px;cursor:pointer}.chip b{color:var(--c,#2563eb)}.chip.on{background:var(--c,#2563eb);border-color:var(--c,#2563eb);color:white}.chip.on b{color:white}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:14px}.card{background:white;border:1px solid #e5eaf1;border-radius:12px;padding:16px;box-shadow:0 2px 8px #1720330a;cursor:pointer;transition:transform .08s}.card:hover{transform:translateY(-1px);border-color:#b9cbdf}.card.offline{opacity:.72;background:#fafbfc}.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;gap:6px}.name{font-weight:700;font-size:16px;word-break:break-all}.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px;background:#16a34a}.dot.off{background:#dc2626}.stag{font-size:11px;padding:2px 9px;border-radius:999px;background:color-mix(in srgb,var(--c,#64748b) 12%,white);color:var(--c,#64748b);border:1px solid color-mix(in srgb,var(--c,#64748b) 35%,white);white-space:nowrap}.row{display:flex;justify-content:space-between;color:#667085;padding-top:7px;font-size:13px;gap:8px}.value{font-family:monospace;color:#344054;text-align:right;word-break:break-all}.value.bad{color:#dc2626}small{color:#98a2b3}.empty{grid-column:1/-1;background:white;border:1px dashed #cbd5e1;border-radius:12px;padding:30px;text-align:center;color:#718096}#events{margin-top:26px;background:white;border:1px solid #e5eaf1;border-radius:12px;padding:18px 20px}#events h2{margin:0 0 10px;font-size:16px}#events .elist{max-height:320px;overflow:auto}.erow{display:flex;gap:10px;align-items:baseline;padding:7px 0;border-bottom:1px dashed #eef2f7;font-size:13px}.erow:last-child{border-bottom:0}.erow b{font-family:monospace}.etag{display:inline-block;min-width:64px;text-align:center;padding:2px 8px;border-radius:999px;font-size:12px;white-space:nowrap}.etag.online,.etag.first_seen{background:#dcfce7;color:#15803d}.etag.offline{background:#fee2e2;color:#b91c1c}.etag.version_change{background:#dbeafe;color:#1d4ed8}.edetail{color:#475569;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.erow time{color:#98a2b3;font-size:12px;white-space:nowrap}.eempty{color:#718096;margin:6px 0}.modal{display:none;position:fixed;inset:0;background:#0f172ac9;z-index:50;padding:24px;overflow:auto}.modal.show{display:flex;align-items:flex-start;justify-content:center}.mbody{width:min(760px,100%);background:white;border-radius:14px;padding:22px 24px;box-shadow:0 30px 90px #0006}.mbody header{margin-bottom:6px}.mbody .name{font-size:19px}.mbody .x{background:#f1f5f9;color:#475569;padding:6px 12px;font-size:15px}.mbody h3{margin:18px 0 8px;font-size:14px;color:#334155}.mgrid{display:grid;grid-template-columns:auto 1fr;gap:6px 16px;margin:12px 0;font-size:13px}.mgrid span{color:#718096}.mgrid b{font-family:ui-monospace,monospace;font-weight:600;word-break:break-all}.cmd{display:flex;gap:8px;align-items:center;background:#0f172a;border-radius:8px;padding:10px 12px;margin:10px 0}.cmd code{flex:1;color:#7dd3fc;font-size:12px;font-family:ui-monospace,monospace;word-break:break-all}.cmd button{padding:7px 12px;font-size:12px;background:#0369a1;white-space:nowrap}.twrap{overflow:auto;border:1px solid #e5eaf1;border-radius:8px}.twrap table{width:100%;border-collapse:collapse;font-size:12px;min-width:420px}.twrap th,.twrap td{padding:7px 10px;border-bottom:1px solid #eef2f7;text-align:left}.twrap th{color:#718096;font-weight:500;background:#f8fafc}.mbody .elist{max-height:240px;overflow:auto}@media(max-width:640px){.toolbar{flex-direction:column}.summary div{min-width:100px;flex:1}}"""
+CSS = """*{box-sizing:border-box}body{margin:0;background:#f4f7fb;color:#172033;font:14px system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif}main{max-width:1100px;margin:0 auto;padding:32px 20px}header{display:flex;justify-content:space-between;align-items:center;margin-bottom:22px}h1{margin:0 0 7px;font-size:28px}p{margin:0;color:#718096}button{border:0;border-radius:8px;padding:10px 16px;background:#2563eb;color:white;cursor:pointer;font-size:14px}input,select{font:inherit;padding:9px 12px;border:1px solid #cbd5e1;border-radius:8px;background:white;color:#172033;outline:none}input:focus,select:focus{border-color:#2563eb}.summary{display:flex;gap:14px;margin-bottom:18px;flex-wrap:wrap}.summary div{background:white;border:1px solid #e5eaf1;border-radius:12px;padding:14px 22px;min-width:120px;box-shadow:0 2px 8px #1720330a}.summary b{display:block;font-size:26px}.summary span{color:#718096;font-size:12px}.toolbar{display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap}.toolbar input{flex:1;min-width:180px}.listbtn{background:#f1f5f9;color:#334155;border:1px solid #cbd5e1;white-space:nowrap}.listbtn:hover{background:#e2e8f0}.sitesbar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px}.chip{border:1px solid #e5eaf1;background:white;color:#334155;border-radius:999px;padding:6px 14px;font-size:13px;cursor:pointer}.chip b{color:var(--c,#2563eb)}.chip.on{background:var(--c,#2563eb);border-color:var(--c,#2563eb);color:white}.chip.on b{color:white}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:14px}.card{background:white;border:1px solid #e5eaf1;border-radius:12px;padding:16px;box-shadow:0 2px 8px #1720330a;cursor:pointer;transition:transform .08s}.card:hover{transform:translateY(-1px);border-color:#b9cbdf}.card.offline{opacity:.72;background:#fafbfc}.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;gap:6px}.name{font-weight:700;font-size:16px;word-break:break-all}.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px;background:#16a34a}.dot.off{background:#dc2626}.stag{font-size:11px;padding:2px 9px;border-radius:999px;background:color-mix(in srgb,var(--c,#64748b) 12%,white);color:var(--c,#64748b);border:1px solid color-mix(in srgb,var(--c,#64748b) 35%,white);white-space:nowrap}.row{display:flex;justify-content:space-between;color:#667085;padding-top:7px;font-size:13px;gap:8px}.value{font-family:monospace;color:#344054;text-align:right;word-break:break-all}.value.bad{color:#dc2626}small{color:#98a2b3}.empty{grid-column:1/-1;background:white;border:1px dashed #cbd5e1;border-radius:12px;padding:30px;text-align:center;color:#718096}#events{margin-top:26px;background:white;border:1px solid #e5eaf1;border-radius:12px;padding:18px 20px}#events h2{margin:0 0 10px;font-size:16px}#events .elist{max-height:320px;overflow:auto}.erow{display:flex;gap:10px;align-items:baseline;padding:7px 0;border-bottom:1px dashed #eef2f7;font-size:13px}.erow:last-child{border-bottom:0}.erow b{font-family:monospace}.etag{display:inline-block;min-width:64px;text-align:center;padding:2px 8px;border-radius:999px;font-size:12px;white-space:nowrap}.etag.online,.etag.first_seen{background:#dcfce7;color:#15803d}.etag.offline{background:#fee2e2;color:#b91c1c}.etag.version_change{background:#dbeafe;color:#1d4ed8}.edetail{color:#475569;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.erow time{color:#98a2b3;font-size:12px;white-space:nowrap}.eempty{color:#718096;margin:6px 0}.modal{display:none;position:fixed;inset:0;background:#0f172ac9;z-index:50;padding:24px;overflow:auto}.modal.show{display:flex;align-items:flex-start;justify-content:center}.mbody{width:min(760px,100%);background:white;border-radius:14px;padding:22px 24px;box-shadow:0 30px 90px #0006}.mbody header{margin-bottom:6px}.mbody .name{font-size:19px}.mbody .x{background:#f1f5f9;color:#475569;padding:6px 12px;font-size:15px}.mbody h3{margin:18px 0 8px;font-size:14px;color:#334155}.mgrid{display:grid;grid-template-columns:auto 1fr;gap:6px 16px;margin:12px 0;font-size:13px}.mgrid span{color:#718096}.mgrid b{font-family:ui-monospace,monospace;font-weight:600;word-break:break-all}.cmd{display:flex;gap:8px;align-items:center;background:#0f172a;border-radius:8px;padding:10px 12px;margin:10px 0}.cmd code{flex:1;color:#7dd3fc;font-size:12px;font-family:ui-monospace,monospace;word-break:break-all}.cmd button{padding:7px 12px;font-size:12px;background:#0369a1;white-space:nowrap}.twrap{overflow:auto;border:1px solid #e5eaf1;border-radius:8px}.twrap table{width:100%;border-collapse:collapse;font-size:12px;min-width:420px}.twrap th,.twrap td{padding:7px 10px;border-bottom:1px solid #eef2f7;text-align:left}.twrap th{color:#718096;font-weight:500;background:#f8fafc}.mbody .elist{max-height:240px;overflow:auto}@media(max-width:640px){.toolbar{flex-direction:column}.summary div{min-width:100px;flex:1}}
+/* ---- 升级管理视图（Upg） ---- */
+.vtabs{display:flex;gap:8px;margin:-6px 0 20px}.vtabs button{background:white;border:1px solid #e5eaf1;color:#475569;border-radius:999px;padding:8px 20px;font-size:14px}.vtabs button:hover{border-color:#b9cbdf}.vtabs button.on{background:#2563eb;border-color:#2563eb;color:white}
+.upanel{background:white;border:1px solid #e5eaf1;border-radius:12px;padding:18px 20px;margin-bottom:18px;box-shadow:0 2px 8px #1720330a}.upanel button:disabled{opacity:.5;cursor:not-allowed}
+.uhead{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap}.uhead h2{margin:0;font-size:16px}
+.uactions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.utarget{color:#667085;font-size:13px;display:inline-flex;gap:6px;align-items:center}.utarget select{padding:6px 10px}
+.uhint{color:#98a2b3;font-size:12px;margin:10px 0 0}.uhint.warn{color:#b45309}.uhint:empty{display:none}
+.shalink{display:inline-flex;align-items:center;gap:6px}.sha{font-family:ui-monospace,monospace;font-size:12px;color:#475569}
+.copymini{padding:2px 8px;font-size:11px;background:#f1f5f9;border:1px solid #cbd5e1;color:#334155}.copymini:hover{background:#e2e8f0}
+.pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;white-space:nowrap}.pill.ok{background:#dcfce7;color:#15803d}.pill.wait{background:#fef3c7;color:#b45309}
+.pbarwrap{display:flex;align-items:center;gap:10px;margin:10px 0}.pbar{flex:1;height:8px;background:#eef2f7;border-radius:999px;overflow:hidden}.pbar i{display:block;height:100%;width:0;background:#2563eb;border-radius:999px;transition:width .2s}.pbarwrap span{font-size:12px;color:#667085;white-space:nowrap}
+.uselbar{color:#475569;font-size:13px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}.uselbar b{color:#2563eb}
+.minibtn{padding:3px 10px;font-size:11px;background:#f1f5f9;border:1px solid #cbd5e1;color:#667085;border-radius:999px}.minibtn:hover{background:#e2e8f0}
+.vgroup{border:1px solid #e5eaf1;border-radius:10px;margin-bottom:12px;overflow:hidden}.vghead{display:flex;align-items:center;gap:10px;padding:9px 14px;background:#f8fafc;border-bottom:1px solid #eef2f7;font-size:13px;flex-wrap:wrap}.vghead .vgt{font-weight:600}.vghead .vgn{color:#98a2b3}.vghead .grpbtn{margin-left:auto;padding:4px 12px;font-size:12px;background:#f1f5f9;border:1px solid #cbd5e1;color:#334155}.vghead .grpbtn:hover{background:#e2e8f0}.vghead input,.vrow input[type=checkbox]{width:15px;height:15px;accent-color:#2563eb;flex:none}
+.vrows{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr))}.vrow{display:flex;align-items:center;gap:9px;padding:8px 14px;border-bottom:1px solid #f1f5f9;font-size:13px;min-width:0;cursor:pointer}.vrow:last-child{border-bottom:0}.vrow.off{opacity:.45;background:#fafbfc;cursor:not-allowed}.vrow .bh{font-family:ui-monospace,monospace;word-break:break-all}.vrow small{color:#98a2b3;white-space:nowrap}.vrow .vsite{margin-left:auto}
+.ubtns{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.ubtns #upgRunAll{background:#16a34a;font-size:15px;padding:11px 22px}.ubtns #upgRunAll:hover:not(:disabled){background:#15803d}.stagebtn{background:#f1f5f9;color:#334155;border:1px solid #cbd5e1;font-size:13px;padding:9px 14px}.stagebtn:hover:not(:disabled){background:#e2e8f0}
+.connchip{font-size:12px;padding:3px 12px;border-radius:999px;background:#f1f5f9;color:#98a2b3;white-space:nowrap}.connchip.live{background:#dcfce7;color:#15803d}.connchip.poll{background:#fef3c7;color:#b45309}
+.ujsum{background:#f8fafc;border:1px solid #e5eaf1;border-radius:10px;padding:10px 14px;font-size:13px;color:#475569;margin-bottom:14px;display:flex;gap:14px;flex-wrap:wrap;align-items:center}.ujsum b{color:#172033}
+.ucardgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:14px}
+.ucard{background:white;border:1px solid #e5eaf1;border-radius:12px;padding:14px 16px;box-shadow:0 2px 8px #1720330a;cursor:pointer}.ucard.done{border-color:#bbf7d0}.ucard.failed{border-color:#fecaca}.ucard.blocked{border-color:#fde68a}
+.ucard .uh{display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap}.ucard .uh .name{font-weight:700;font-size:15px;word-break:break-all}.ucard .uh .tstat{margin-left:auto}
+.tstat{font-size:12px;padding:2px 10px;border-radius:999px;white-space:nowrap}.tstat.running{background:#dbeafe;color:#1d4ed8}.tstat.success{background:#dcfce7;color:#15803d}.tstat.failed{background:#fee2e2;color:#b91c1c}.tstat.blocked{background:#fef3c7;color:#b45309}.tstat.pending{background:#f1f5f9;color:#667085}
+.uver{color:#667085;font-size:12px;margin-bottom:10px}
+.stepper{display:flex;gap:4px;margin-bottom:8px}.step{flex:1;text-align:center;font-size:11px;padding:5px 2px;border-radius:6px;background:#f1f5f9;color:#98a2b3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.step.done{background:#dcfce7;color:#15803d}.step.cur{background:#dbeafe;color:#1d4ed8;animation:upulse 1.2s ease-in-out infinite}.step.failed{background:#fee2e2;color:#b91c1c}.step.blocked{background:#fef3c7;color:#b45309}.step.na{opacity:.35}
+@keyframes upulse{0%,100%{opacity:1}50%{opacity:.5}}
+.terr{font-size:12px;color:#b91c1c;background:#fef2f2;border:1px solid #fee2e2;border-radius:6px;padding:5px 8px;margin-bottom:8px;word-break:break-all}.terr.blocked{color:#b45309;background:#fffbeb;border-color:#fde68a}
+.ulogwrap{display:none;border-top:1px dashed #eef2f7;margin-top:8px;padding-top:8px}.ucard.expanded .ulogwrap{display:block}.ucard.expanded{cursor:default}
+.ulogbar{display:flex;gap:8px;align-items:center;margin-bottom:6px}.ulogbar span{font-size:11px;color:#98a2b3}.ulogbar button{padding:3px 10px;font-size:11px;background:#f1f5f9;border:1px solid #cbd5e1;color:#334155}.ulogbar button:hover{background:#e2e8f0}
+.ulog{background:#0f172a;color:#e2e8f0;border-radius:8px;padding:10px 12px;font:11px/1.55 ui-monospace,monospace;max-height:260px;overflow:auto;white-space:pre-wrap;word-break:break-all;margin:0}
+.uempty{border:1px dashed #cbd5e1;border-radius:10px;padding:26px;text-align:center;color:#718096;font-size:13px;margin:0}
+.uwarn{background:#fffbeb;border:1px solid #fde68a;color:#92400e;border-radius:8px;padding:10px 12px;font-size:13px;margin:12px 0 0}
+@media(max-width:640px){.vrows{grid-template-columns:1fr}.ucardgrid{grid-template-columns:1fr}.stepper{flex-wrap:wrap}.step{flex:1 1 30%}}"""
 JS = """const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
 const ETAGS={online:'上线',offline:'掉线',version_change:'版本变更',first_seen:'新设备'};
@@ -278,7 +320,359 @@ async function loadCollectDuration(){
   }catch(e){/* 接口未上线或拉取失败:沿用已有数据,无数据时展示 — / 空态 */}
   if(fleet.length)renderGrid();
 }
-loadCollectDuration();setInterval(loadCollectDuration,300000);"""
+loadCollectDuration();setInterval(loadCollectDuration,300000);
+
+/* ================= 升级管理视图（Upg.* 独立命名空间，不改动设备总览逻辑） =================
+ 数据契约（后端联调基准）：GET /api/packages、POST /api/upgrade/jobs、GET /api/upgrade/jobs(/<id>)、
+ GET /api/upgrade/events（SSE：{type:'job'|'task'|'log',...}）、GET /api/upgrade/jobs/<id>/log?offset=N[&hostname=]。
+ 字段解析全部做了兼容容错，后端未上线时各区城优雅空态。 */
+const Upg={
+STAGES:['precheck','download','prepare','install','verify','cleanup'],
+STAGE_LBL:{precheck:'预检',download:'下载',prepare:'准备',install:'安装',verify:'验证',cleanup:'清理'},
+KIND_LBL:{upgrade:'全流程升级',precheck:'仅预检',download:'仅下载',prepare:'仅准备',install:'仅安装',verify:'仅验证',cleanup:'仅清理'},
+STAT_LBL:{running:'进行中',success:'成功',failed:'失败',blocked:'已阻断',pending:'等待中'},
+packages:[],fleet:[],selected:new Set(),selTouched:false,targetVersion:'',pkgFail:0,
+job:null,tasks:[],logs:{},logOff:{},follow:{},expanded:null,fromSnap:{},
+es:null,pollT:null,connState:'off',view:'overview',upXhr:null,
+gid(i){return document.getElementById(i)},
+normStatus(s){s=String(s==null?'':s).toLowerCase();
+ if(['success','done','ok','complete','completed','finished'].includes(s))return 'success';
+ if(['failed','fail','error','err'].includes(s))return 'failed';
+ if(['blocked','block','skipped','skip'].includes(s))return 'blocked';
+ if(['running','run','active','in_progress','progress','started'].includes(s))return 'running';
+ return 'pending'},
+active(){return !!this.job&&['running','pending'].includes(this.normStatus(this.job.status))},
+fmtB(n){if(n==null||isNaN(n))return '—';const u=['B','KB','MB','GB','TB'];let i=0;n=Number(n);while(n>=1024&&i<u.length-1){n/=1024;i++}return(i?n.toFixed(1):Math.round(n))+' '+u[i]},
+parseTs(v){if(v==null)return null;if(typeof v==='number')return v<1e12?v*1000:v;const t=Date.parse(String(v).replace(' ','T'));return isNaN(t)?null:t},
+fmtClock(ms){const d=new Date(ms);return isNaN(d.getTime())?String(ms==null?'—':ms):d.toLocaleString('zh-CN',{hour12:false})},
+fmtDur2(sec){if(sec==null||isNaN(sec)||sec<0)return '—';sec=Math.round(sec);const h=Math.floor(sec/3600),m=Math.floor(sec%3600/60),s=sec%60;if(h)return h+'时'+m+'分';if(m)return m+'分'+s+'秒';return s+'秒'},
+verCmp(a,b){const pa=String(a).split(/[.-]/),pb=String(b).split(/[.-]/);for(let i=0;i<Math.max(pa.length,pb.length);i++){const x=parseInt(pa[i]),y=parseInt(pb[i]);if(!isNaN(x)&&!isNaN(y)){if(x!==y)return x<y?-1:1}else{const c=String(pa[i]||'').localeCompare(String(pb[i]||''));if(c)return c<0?-1:1}}return 0},
+archOf(f){const m=String((f&&(f.hw_model||f.hardware))||'').toLowerCase();if(/rk3588|rk3576|rk3568|arm64|aarch64|orange\\s?pi|v1/.test(m))return 'rk3588-arm64';if(/amd64|x86|intel|celeron|n100|v0/.test(m))return 'amd64';return ''},
+init(){
+ const tabs=this.gid('viewTabs');
+ tabs.addEventListener('click',e=>{const b=e.target.closest('button[data-view]');if(b)this.setView(b.dataset.view)});
+ window.addEventListener('hashchange',()=>{const v=new URLSearchParams(location.hash.slice(1)).get('view')==='upgrade'?'upgrade':'overview';if(v!==this.view)this.setView(v,true)});
+ this.gid('upgUploadBtn').onclick=()=>this.gid('upgFile').click();
+ this.gid('upgFile').onchange=e=>{const f=e.target.files&&e.target.files[0];if(f)this.upload(f);e.target.value=''};
+ this.gid('upgPkgRefresh').onclick=()=>this.loadPkgs();
+ this.gid('upgVerSel').onchange=e=>{this.targetVersion=e.target.value;this.renderPkgs();this.updateSelBar();this.updateActions()};
+ this.gid('upgPkgBody').addEventListener('click',async e=>{const b=e.target.closest('button[data-sha]');if(!b)return;b.textContent='…';const ok=await copyText(b.dataset.sha);b.textContent=ok?'已复制':'失败';setTimeout(()=>b.textContent='复制',1500)});
+ const dg=this.gid('upgDevGroups');
+ dg.addEventListener('change',e=>{const el=e.target;
+  if(el.dataset.h!==undefined&&el.type==='checkbox'){this.selTouched=true;if(el.checked)this.selected.add(el.dataset.h);else this.selected.delete(el.dataset.h);this.renderDevs();this.updateSelBar();this.updateActions()}
+  else if(el.dataset.grp!==undefined){this.selTouched=true;const rows=this.devRows().filter(r=>r.ver===el.dataset.grp&&r.online);for(const r of rows){if(el.checked)this.selected.add(r.h);else this.selected.delete(r.h)}this.renderDevs();this.updateSelBar();this.updateActions()}});
+ dg.addEventListener('click',e=>{const b=e.target.closest('button[data-grpup]');if(!b)return;const k=b.dataset.grpup;this.selTouched=true;const rows=this.devRows().filter(r=>r.ver===k&&r.online);this.selected=new Set(rows.map(r=>r.h));this.renderDevs();this.updateSelBar();this.updateActions();this.setActHint('已选择 '+k+' 全组 '+rows.length+' 台，确认无误后在下方发起',false);this.gid('upgActPanel').scrollIntoView({behavior:'smooth',block:'center'})});
+ this.gid('upgSelBar').addEventListener('click',e=>{if(e.target.closest('button[data-clr]')){this.selected.clear();this.selTouched=true;this.renderDevs();this.updateSelBar();this.updateActions()}});
+ this.gid('upgRunAll').onclick=()=>{if(this.canLaunch())this.showConfirm()};
+ document.querySelectorAll('.stagebtn[data-kind]').forEach(b=>b.onclick=()=>{if(this.canLaunch())this.launch(b.dataset.kind)});
+ const grid=this.gid('upgTaskGrid');
+ grid.addEventListener('click',e=>{
+  const fb=e.target.closest('button[data-fl]');if(fb){const h=fb.dataset.fl;const cur=this.follow[h]!==false;this.follow[h]=!cur;fb.textContent=this.follow[h]===false?'恢复跟随':'暂停跟随';if(this.follow[h]!==false){const pre=this.logDom(h);if(pre)pre.scrollTop=pre.scrollHeight}return}
+  const c=e.target.closest('.ucard');if(c)this.toggleLog(c.dataset.h)});
+ const um=this.gid('upgModal');um.addEventListener('click',e=>{if(e.target===um)this.closeConfirm()});
+ document.addEventListener('keydown',e=>{if(e.key==='Escape')this.closeConfirm()});
+ this.route();
+ setInterval(()=>{if(this.view==='upgrade')this.loadFleet()},15000);
+ setInterval(()=>{if(this.view==='upgrade'&&this.packages.some(p=>!p.ready))this.loadPkgs()},15000);
+},
+setView(v,skipHash){
+ if(v!=='upgrade')v='overview';
+ this.view=v;
+ this.gid('viewOverview').hidden=v!=='overview';
+ this.gid('viewUpgrade').hidden=v!=='upgrade';
+ document.querySelectorAll('#viewTabs button').forEach(b=>b.classList.toggle('on',b.dataset.view===v));
+ if(!skipHash){const p=new URLSearchParams(location.hash.slice(1));if(v==='upgrade')p.set('view','upgrade');else p.delete('view');const s=p.toString();history.replaceState(null,'',location.pathname+location.search+(s?'#'+s:''))}
+ if(v==='upgrade')this.enter();
+},
+route(){const v=new URLSearchParams(location.hash.slice(1)).get('view')==='upgrade'?'upgrade':'overview';this.setView(v,true)},
+enter(){this.loadPkgs();this.loadFleet();this.loadJobs();this.updateSelBar();this.updateActions()},
+setPkgHint(msg,warn){const el=this.gid('upgPkgHint');el.textContent=msg||'';el.className='uhint'+(warn?' warn':'')},
+setActHint(msg,warn){const el=this.gid('upgActHint');el.textContent=msg||'';el.className='uhint'+(warn?' warn':'')},
+normPkg(p){
+ const fn=String(p.filename||p.name||'');
+ let ver=p.version||p.ver||'';if(!ver){const m=fn.match(/v\\d+\\.\\d+(\\.\\d+)*/i);ver=m?m[0].toLowerCase():(fn||'未知版本')}
+ let arch=p.arch||p.platform||p.machine||'';
+ if(!arch){if(/rk3588|arm64|aarch64/i.test(fn))arch='rk3588-arm64';else if(/amd64|x86/i.test(fn))arch='amd64';else arch=''}
+ const sha=String(p.sha256||p.hash||'');
+ return{filename:fn,version:ver,arch:arch||'未知机型',size:p.size!=null?p.size:p.bytes,sha256:sha,ready:!!sha&&p.ready!==false}
+},
+async loadPkgs(){
+ try{
+  const r=await fetch('/api/packages',{cache:'no-store'});const d=await r.json();
+  if(!r.ok)throw Error(d.error||('HTTP '+r.status));
+  const list=d.packages||d.items||(Array.isArray(d)?d:[]);
+  this.packages=list.map(p=>this.normPkg(p));this.pkgFail=0;this.renderPkgs();
+ }catch(e){this.pkgFail++;this.renderPkgs()}
+},
+renderPkgs(){
+ const tb=this.gid('upgPkgBody');
+ if(this.pkgFail){tb.innerHTML='<tr><td colspan=5 class=eempty>安装包接口不可用（后端未上线或服务异常），可点「刷新」重试</td></tr>';this.setPkgHint('GET /api/packages 请求失败：稍后自动重试或手动刷新',true)}
+ else if(!this.packages.length){tb.innerHTML='<tr><td colspan=5 class=eempty>暂无安装包：可点「上传安装包」，或由 ops 将包 scp 到服务器包目录后点「刷新」</td></tr>';this.setPkgHint('')}
+ else{tb.innerHTML=this.packages.map(p=>{
+  const shaCell=p.sha256?`<span class=shalink><span class=sha title="${esc(p.sha256)}">${esc(p.sha256.slice(0,14))}…</span><button type=button class=copymini data-sha="${esc(p.sha256)}">复制</button></span>`:'<span class=sha>—</span>';
+  const st=p.ready?'<span class="pill ok">就绪</span>':'<span class="pill wait">哈希计算中…</span>';
+  return `<tr><td>${esc(p.version)}</td><td>${esc(p.arch)}</td><td>${this.fmtB(p.size)}</td><td>${shaCell}</td><td>${st}</td></tr>`}).join('');this.setPkgHint('')}
+ const sel=this.gid('upgVerSel');
+ const vers=[...new Set(this.packages.map(p=>p.version))].sort((a,b)=>this.verCmp(b,a));
+ sel.innerHTML=vers.length?vers.map(v=>`<option value="${esc(v)}">${esc(v)}</option>`).join(''):'<option value="">（暂无版本）</option>';
+ if(!vers.includes(this.targetVersion)){
+  const ready=[...new Set(this.packages.filter(p=>p.ready).map(p=>p.version))].sort((a,b)=>this.verCmp(b,a));
+  this.targetVersion=ready[0]||vers[0]||''}
+ if(this.targetVersion)sel.value=this.targetVersion;
+ this.renderShaInfo();
+ this.updateSelBar();this.updateActions();
+},
+renderShaInfo(){
+ const el=this.gid('upgShaInfo');
+ if(!this.targetVersion){el.textContent='';return}
+ const pkgs=this.packages.filter(p=>p.version===this.targetVersion);
+ if(!pkgs.length){el.textContent='';return}
+ const parts=pkgs.map(p=>`${p.ready?p.arch+'：'+this.fmtB(p.size)+' · sha256 '+p.sha256.slice(0,16)+'…（就绪）':p.arch+'：'+this.fmtB(p.size)+' · 哈希计算中…'}`);
+ el.textContent='目标版本 '+this.targetVersion+' 已关联 '+parts.join('；')+'，发起时自动校验设备端下载哈希';
+ el.className='uhint'+(pkgs.some(p=>!p.ready)?' warn':'');
+},
+upload(file){
+ if(this.upXhr)return;
+ const fd=new FormData();fd.append('file',file);
+ const x=new XMLHttpRequest();this.upXhr=x;
+ const bar=this.gid('upgUpBar'),fill=this.gid('upgUpFill'),pct=this.gid('upgUpPct');
+ bar.hidden=false;fill.style.width='0%';pct.textContent='上传中 0%';
+ x.open('POST','/api/packages/upload');
+ x.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(e.loaded/e.total*100);fill.style.width=p+'%';pct.textContent='上传中 '+p+'%（'+this.fmtB(e.loaded)+' / '+this.fmtB(e.total)+'）'}};
+ x.onload=()=>{this.upXhr=null;bar.hidden=true;let d={};try{d=JSON.parse(x.responseText)}catch(e){}
+  if(x.status>=200&&x.status<300){this.setPkgHint('已上传 '+file.name+'，正在刷新包列表…');this.loadPkgs()}
+  else this.setPkgHint('上传失败：'+(d.error||('HTTP '+x.status)),true)};
+ x.onerror=()=>{this.upXhr=null;bar.hidden=true;this.setPkgHint('上传失败：网络错误',true)};
+ x.send(fd);
+},
+devRows(){return this.fleet.filter(f=>!f.retired).map(f=>({h:f.hostname,site:f.site||'',online:!!f.online,ver:(f.version||'').trim()||'未获取',arch:this.archOf(f),hw:f.hardware||f.hw_model||''}))},
+async loadFleet(){
+ try{
+  const r=await fetch('/api/hosts',{cache:'no-store'});const d=await r.json();
+  if(!r.ok)throw Error('HTTP '+r.status);
+  this.fleet=d.fleet||[];
+  const online=this.fleet.filter(f=>!f.retired&&f.online).map(f=>f.hostname);
+  if(!this.selTouched)this.selected=new Set(online);
+  else{const live=new Set(online);for(const h of [...this.selected])if(!live.has(h))this.selected.delete(h)}
+  this.renderDevs();this.updateSelBar();this.updateActions();
+ }catch(e){if(!this.fleet.length){const el=this.gid('upgDevGroups');if(el)el.innerHTML='<p class=uempty>设备数据加载失败（/api/hosts 不可用），稍后自动重试</p>'};this.updateSelBar();this.updateActions()}
+},
+renderDevs(){
+ const wrap=this.gid('upgDevGroups');
+ const rows=this.devRows();
+ if(!rows.length){wrap.innerHTML='<p class=uempty>暂无设备数据——设备总览接口不可用或未登记设备</p>';return}
+ const groups={};
+ for(const r of rows)(groups[r.ver]=groups[r.ver]||[]).push(r);
+ const keys=Object.keys(groups).sort((a,b)=>a==='未获取'?1:b==='未获取'?-1:this.verCmp(b,a));
+ let h='';
+ for(const k of keys){
+  const g=groups[k].sort((a,b)=>(b.online-a.online)||a.h.localeCompare(b.h,undefined,{numeric:true}));
+  const on=g.filter(r=>r.online);const selN=on.filter(r=>this.selected.has(r.h)).length;
+  h+=`<div class=vgroup><div class=vghead><input type=checkbox data-grp="${esc(k)}" ${on.length&&selN===on.length?'checked':''} ${on.length?'':'disabled'}><span class=vgt>${esc(k)}</span><span class=vgn>${on.length}/${g.length} 在线${selN?' · 已选 '+selN:''}</span><button type=button class=grpbtn data-grpup="${esc(k)}">全组升级</button></div><div class=vrows>`;
+  for(const r of g){
+   const tag=r.site?`<span class="stag vsite" style="--c:${siteColor(r.site)}">${esc(r.site)}</span>`:'';
+   h+=`<label class="vrow${r.online?'':' off'}" title="${r.online?'':'离线设备不可选'}"><input type=checkbox data-h="${esc(r.h)}" ${this.selected.has(r.h)?'checked':''} ${r.online?'':'disabled'}><span class=bh>${esc(r.h)}</span><small>${esc(r.arch||r.hw||'')}</small>${tag}</label>`}
+  h+='</div></div>'
+ }
+ wrap.innerHTML=h;
+},
+updateSelBar(){
+ const n=this.selected.size;const el=this.gid('upgSelBar');
+ el.innerHTML=`已选 <b>${n}</b> 台 · 预计目标版本 <b>${esc(this.targetVersion||'—')}</b>${n?' <button type=button class=minibtn data-clr>清空选择</button>':''}`;
+},
+canLaunch(){return !this.active()&&!!this.targetVersion&&this.selected.size>0},
+updateActions(){
+ const busy=this.active();const noVer=!this.targetVersion;const noSel=!this.selected.size;
+ let warnArches=[];
+ if(this.targetVersion&&this.selected.size){
+  const ready=new Set(this.packages.filter(p=>p.ready&&p.version===this.targetVersion).map(p=>p.arch));
+  const need=new Set();
+  for(const h of this.selected){const f=this.fleet.find(x=>x.hostname===h);const a=f&&this.archOf(f);if(a&&!ready.has(a))need.add(a)}
+  warnArches=[...need]
+ }
+ let hint='',warn=false;
+ if(busy)hint='有升级任务进行中（#'+this.job.id+'），任务结束后才能发起新任务（后端并发护栏兜底）';
+ else if(warnArches.length){hint='⚠ 目标版本 '+this.targetVersion+' 缺少 '+warnArches.join('、')+' 机型的就绪安装包（未上传或哈希未完成），下载/安装类操作暂不可发起';warn=true}
+ else if(noVer)hint='请先在「① 安装包」区选择目标版本（选中后自动关联 sha256 基准）';
+ else if(noSel)hint='请至少勾选一台在线设备（默认已勾选全部在线设备，离线设备不可选）';
+ const heavy=busy||noVer||noSel||warnArches.length>0;
+ this.gid('upgRunAll').disabled=heavy;
+ document.querySelectorAll('.stagebtn[data-kind]').forEach(b=>{const k=b.dataset.kind;b.disabled=(k==='download'||k==='install')?heavy:(busy||noVer||noSel)});
+ this.setActHint(hint,warn);
+},
+closeConfirm(){const m=this.gid('upgModal');if(m)m.classList.remove('show')},
+showConfirm(){
+ const n=this.selected.size;const vs=this.targetVersion;
+ const archSplit={};for(const h of this.selected){const f=this.fleet.find(x=>x.hostname===h);const a=(f&&this.archOf(f))||'未知机型';archSplit[a]=(archSplit[a]||0)+1}
+ const archTxt=Object.entries(archSplit).map(([a,c])=>esc(a)+' × '+c).join('、');
+ const list=[...this.selected].sort((a,b)=>a.localeCompare(b,undefined,{numeric:true}));
+ const preview=esc(list.length>12?list.slice(0,12).join('、')+' 等 '+n+' 台':list.join('、'));
+ const m=this.gid('upgModalBody');
+ m.innerHTML=`<header><div><span class=name>确认发起全流程升级</span></div><button type=button class="x" id=upgConfirmClose>✕</button></header>
+ <div class=mgrid>
+  <span>目标版本</span><b>${esc(vs)}</b>
+  <span>设备数量</span><b>${n} 台（${archTxt}）</b>
+  <span>设备清单</span><b>${preview}</b>
+  <span>执行流程</span><b>预检 → 下载 → 准备 → 安装 → 验证 → 清理</b>
+ </div>
+ <p class=uwarn>⚠ 升级将覆盖设备上的程序，过程不可逆；单台失败不影响其他设备，安装器失败时会自动回滚兜底。请确认目标版本与设备清单无误后再发起。</p>
+ <div class=ubtns style="justify-content:flex-end;margin-top:16px"><button type=button class=stagebtn id=upgConfirmNo>取消</button><button type=button id=upgConfirmYes>确认发起升级</button></div>`;
+ this.gid('upgModal').classList.add('show');
+ this.gid('upgConfirmClose').onclick=this.gid('upgConfirmNo').onclick=()=>this.closeConfirm();
+ this.gid('upgConfirmYes').onclick=()=>{this.closeConfirm();this.launch('upgrade')};
+},
+async launch(kind){
+ const devices=[...this.selected];
+ this.setActHint('正在创建任务…');
+ try{
+  const r=await fetch('/api/upgrade/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind,devices,params:{version:this.targetVersion}})});
+  const d=await r.json().catch(()=>({}));
+  if(!r.ok)throw Error(d.error||('HTTP '+r.status));
+  const j=d.job||d;const id=j.id!=null?j.id:j.job_id;
+  if(id==null)throw Error('响应缺少任务 id');
+  this.fromSnap={};for(const h of devices){const f=this.fleet.find(x=>x.hostname===h);if(f)this.fromSnap[h]=f.version||''}
+  this.adoptJob({id:id,kind:j.kind||kind,version:j.version||this.targetVersion,status:j.status||'running',created_at:j.created_at||new Date().toISOString(),finished_at:j.finished_at||null,devices:devices});
+  this.setActHint('任务 #'+id+' 已创建');
+  this.loadJobDetail(id);this.subscribe();
+ }catch(e){this.setActHint('发起失败：'+e.message,true)}
+},
+normJob(j){return{id:j.id!=null?j.id:j.job_id,kind:j.kind||'',version:j.version||(j.params&&j.params.version)||'',status:j.status||'running',created_at:j.created_at||j.createdAt||null,finished_at:j.finished_at||j.finishedAt||null,devices:j.devices||[],summary:j.summary||null}},
+normTask(t){return{hostname:t.hostname||t.host||'',stage:String(t.stage||'').toLowerCase(),status:this.normStatus(t.status),error:t.error||t.reason||'',started_at:t.started_at||t.startedAt||null,finished_at:t.finished_at||t.finishedAt||null,from_version:t.from_version||t.version_before||''}},
+adoptJob(j){this.job=j;this.tasks=(j.devices||[]).map(h=>({hostname:h,stage:'',status:'pending',error:'',from_version:this.fromSnap[h]||''}));this.logs={};this.logOff={};this.expanded=null;this.renderJob()},
+async loadJobs(){
+ try{
+  const r=await fetch('/api/upgrade/jobs',{cache:'no-store'});const d=await r.json();
+  if(!r.ok)throw Error(d.error||('HTTP '+r.status));
+  const list=d.jobs||d.items||(Array.isArray(d)?d:[]);
+  if(!list.length){if(!this.job)this.renderJob();return}
+  const j=this.normJob(list[0]);
+  if(j.id==null)return;
+  if(!this.job||this.job.id!==j.id){this.adoptJob(j);this.loadJobDetail(j.id)}
+  else{this.job=j;this.renderJob()}
+  if(this.active())this.subscribe();
+ }catch(e){if(!this.job){const el=this.gid('upgJobSummary');if(el)el.innerHTML='<p class=uempty>升级任务接口暂不可用（后端未上线？），发起任务后此处展示逐台进度</p>';this.gid('upgTaskGrid').innerHTML=''}}
+},
+async loadJobDetail(id){
+ try{
+  const r=await fetch('/api/upgrade/jobs/'+encodeURIComponent(id),{cache:'no-store'});const d=await r.json();
+  if(!r.ok)throw Error(d.error||('HTTP '+r.status));
+  const j=this.normJob(d.job||d);
+  if(this.job&&this.job.id!==j.id)return;
+  this.job=j;
+  const ts=(d.tasks||j.tasks||[]).map(t=>this.normTask(t));
+  if(ts.length)this.tasks=ts;
+  else if((j.devices||[]).length&&!this.tasks.length)this.tasks=j.devices.map(h=>({hostname:h,stage:'',status:'pending',error:'',from_version:''}));
+  this.renderJob();
+  if(!this.active())this.teardown();
+ }catch(e){/*保留已有状态，等待下次刷新/SSE*/}
+},
+renderJob(){
+ this.updateActions();
+ const sumEl=this.gid('upgJobSummary'),grid=this.gid('upgTaskGrid');
+ if(!this.job){sumEl.innerHTML='<p class=uempty>暂无升级任务——在上方勾选设备发起后，这里展示逐台进度与日志</p>';grid.innerHTML='';return}
+ const j=this.job;const st=this.normStatus(j.status);
+ const cnt={success:0,failed:0,blocked:0,running:0,pending:0};
+ for(const t of this.tasks)cnt[t.status]=(cnt[t.status]||0)+1;
+ const total=this.tasks.length||((j.devices||[]).length)||((j.summary&&j.summary.total)||0);
+ const created=this.parseTs(j.created_at);const fin=this.parseTs(j.finished_at);
+ const end=fin||(st==='running'?Date.now():null);
+ const el=(created&&end)?(end-created)/1000:null;
+ sumEl.innerHTML=`<b>#${esc(j.id)}</b><span>${esc(this.KIND_LBL[j.kind]||j.kind||'任务')} → <b>${esc(j.version||'—')}</b></span><span class="tstat ${st}">${this.STAT_LBL[st]||esc(st)}</span><span>共 <b>${total}</b> 台</span><span>成功 <b style="color:#15803d">${cnt.success}</b></span><span>失败 <b style="color:#b91c1c">${cnt.failed}</b></span><span>阻断 <b style="color:#b45309">${cnt.blocked}</b></span><span>进行中 <b style="color:#1d4ed8">${cnt.running}</b></span><span>等待 <b>${cnt.pending}</b></span>${el!=null?`<span>耗时 <b>${this.fmtDur2(el)}</b></span>`:''}${created?`<span>发起于 ${esc(this.fmtClock(created))}</span>`:''}`;
+ grid.innerHTML=this.tasks.length?this.tasks.map(t=>this.cardHtml(t)).join(''):(this.active()?'<p class=uempty>任务已创建，等待设备状态上报…</p>':'');
+},
+cardHtml(t){
+ const h=t.hostname;const f=this.fleet.find(x=>x.hostname===h);
+ const site=(f&&f.site)||'';const tag=site?`<span class="stag" style="--c:${siteColor(site)}">${esc(site)}</span>`:'';
+ const from=t.from_version||this.fromSnap[h]||((f&&f.version)||'');
+ const to=this.job.version||this.targetVersion||'';
+ const st=t.status;
+ const cls=st==='success'?'done':st==='failed'?'failed':st==='blocked'?'blocked':'';
+ const scopeIdx=this.job.kind==='upgrade'?null:this.STAGES.indexOf(this.job.kind);
+ const curIdx=this.STAGES.indexOf(t.stage);
+ let steps='';
+ for(let i=0;i<this.STAGES.length;i++){
+  let c='';
+  if(scopeIdx!=null&&i!==scopeIdx)c='na';
+  else if(st==='success')c='done';
+  else if(st==='failed'||st==='blocked')c=i===curIdx?st:(curIdx>=0&&i<curIdx?'done':'');
+  else if(st==='running')c=i===curIdx?'cur':(curIdx>=0&&i<curIdx?'done':'');
+  steps+=`<span class="step ${c}">${this.STAGE_LBL[this.STAGES[i]]}</span>`
+ }
+ const errBox=(st==='failed'||st==='blocked')&&t.error?`<div class="terr ${st}">${esc(st==='blocked'?'阻断：':'失败：')}${esc(t.error)}</div>`:'';
+ return `<article class="ucard ${cls}${this.expanded===h?' expanded':''}" data-h="${esc(h)}">
+ <div class=uh><span class=name>${esc(h)}</span>${tag}<span class="tstat ${st}">${this.STAT_LBL[st]||esc(st)}</span></div>
+ <div class=uver>版本：${esc(from||'—')} → <b>${esc(to||'—')}</b></div>
+ <div class=stepper>${steps}</div>
+ ${errBox}
+ <div class=ulogwrap><div class=ulogbar><span>实时日志（SSE 增量，点击卡片收起）</span><button type=button data-fl="${esc(h)}">${this.follow[h]===false?'恢复跟随':'暂停跟随'}</button></div><pre class=ulog>${esc(this.logs[h]||'')}</pre></div>
+ </article>`;
+},
+logDom(h){try{return document.querySelector('.ucard[data-h="'+(window.CSS&&CSS.escape?CSS.escape(h):h)+'"] .ulog')}catch(e){return null}},
+toggleLog(h){
+ this.expanded=this.expanded===h?null:h;
+ this.renderJob();
+ if(this.expanded===h&&this.job)this.fetchLog(h);
+},
+appendLog(h,txt){
+ if(h==null||txt==null)return;let s=String(txt);if(!s)return;
+ if(!this.logs[h])this.logs[h]='';
+ if(!s.endsWith('\\n'))s+='\\n';
+ this.logs[h]+=s;
+ if(this.expanded===h){const pre=this.logDom(h);if(pre){pre.textContent=this.logs[h];if(this.follow[h]!==false)pre.scrollTop=pre.scrollHeight}}
+},
+async fetchLog(h){
+ if(!this.job||this.job.id==null)return;
+ const off=this.logOff[h]||0;
+ try{
+  const r=await fetch('/api/upgrade/jobs/'+encodeURIComponent(this.job.id)+'/log?offset='+off+'&hostname='+encodeURIComponent(h),{cache:'no-store'});
+  const d=await r.json();
+  if(!r.ok)return;
+  let txt=d.text||d.chunk||d.data||(Array.isArray(d.lines)?d.lines.join('\\n'):'');
+  if(!txt)return;
+  if(d.offset!=null)this.logOff[h]=d.offset;else this.logOff[h]=off+String(txt).length;
+  this.appendLog(h,txt);
+ }catch(e){}
+},
+setConn(s){this.connState=s;const el=this.gid('upgConn');if(!el)return;el.className='connchip '+s;el.textContent=s==='live'?'● 实时连接正常':s==='poll'?'○ 实时连接断开 · 轮询中':'未连接'},
+subscribe(){
+ if(!this.active())return;
+ if(this.es&&this.es.readyState<=1)return;
+ try{this.es=new EventSource('/api/upgrade/events')}catch(e){this.degrade();return}
+ this.es.onopen=()=>{this.setConn('live');if(this.pollT){clearInterval(this.pollT);this.pollT=null}};
+ this.es.onmessage=e=>this.onEvent('message',e.data);
+ for(const n of['job','task','log','stage','progress'])this.es.addEventListener(n,e=>this.onEvent(n,e.data));
+ this.es.onerror=()=>this.degrade();
+},
+degrade(){this.setConn('poll');if(!this.pollT&&(this.active()||this.expanded!=null))this.pollT=setInterval(()=>this.pollTick(),5000)},
+pollTick(){if(!this.job)return;this.loadJobDetail(this.job.id);if(this.expanded!=null)this.fetchLog(this.expanded)},
+teardown(){if(this.es){this.es.close();this.es=null}if(this.pollT){clearInterval(this.pollT);this.pollT=null}this.setConn('off')},
+onEvent(name,raw){
+ let m=null;const s=String(raw==null?'':raw);
+ if(s.trim().startsWith('{')){try{m=JSON.parse(s)}catch(e){m=null}}
+ if(!m)return;
+ const type=String(m.type||name||'').toLowerCase();
+ if(type==='job'||m.job){
+  const j=this.normJob(m.job||m);
+  if(j.id==null)return;
+  if(!this.job||this.job.id!==j.id)this.adoptJob(j);else{this.job=j}
+  this.renderJob();
+  if(!this.active()){this.teardown();this.loadJobDetail(j.id)}
+  return}
+ if(type==='task'||m.task){this.applyTask(this.normTask(m.task||m));return}
+ if(type==='log'||m.text||m.chunk||m.lines){
+  const h=m.hostname;if(h!=null){let txt=m.text||m.chunk||(Array.isArray(m.lines)?m.lines.join('\\n'):'');if(m.offset!=null)this.logOff[h]=m.offset;this.appendLog(h,txt)}
+  return}
+ if(m.hostname&&(m.stage!=null||m.status!=null))this.applyTask(this.normTask(m));
+},
+applyTask(t){
+ if(!t.hostname)return;
+ if(!this.job||!this.tasks.length)this.tasks.push(t);
+ const i=this.tasks.findIndex(x=>x.hostname===t.hostname);
+ if(i>=0)this.tasks[i]=Object.assign({},this.tasks[i],t);else this.tasks.push(t);
+ this.renderJob();
+}
+};
+Upg.init();"""
 
 
 def _json_request(url, *, method="GET", data=None, headers=None, timeout=4):
