@@ -1894,8 +1894,10 @@ class UpgradeTask:
                 self.text = "…（前文截断）…\n" + self.text[cut + 1:]
             total = len(self.text)
             flush = total - self._flushed >= 65536
+        # 契约兼容：chunk/total + hostname/offset 别名（前端按 hostname 路由日志块）
         BUS.publish({"type": "log", "job_id": self.job.id, "task_id": self.id,
-                     "chunk": chunk, "total": total})
+                     "hostname": self.hostname, "chunk": chunk, "total": total,
+                     "text": chunk, "offset": total})
         if flush:
             self.persist(log=True)
 
@@ -2417,7 +2419,9 @@ def upgrade_jobs_list_view(limit=50):
 
 
 def upgrade_task_log_view(job_id, task_id=None, hostname=None, offset=0):
-    """日志增量读取（内存态优先，重启后回落 DB）；返回 dict 或 None。"""
+    """日志增量读取（内存态优先，重启后回落 DB）；返回 dict 或 None。
+
+    字段契约兼容：log/text 同义，next_offset/offset 同义。"""
     task = None
     with UPGRADES_LOCK:
         job = UPGRADES.get(job_id)
@@ -2432,13 +2436,16 @@ def upgrade_task_log_view(job_id, task_id=None, hostname=None, offset=0):
         with task.lock:
             text, total = task.text[offset:], len(task.text)
         return {"ok": True, "task_id": task.id, "hostname": task.hostname,
-                "status": task.status, "log": text, "next_offset": total}
+                "status": task.status, "log": text, "text": text,
+                "next_offset": total, "offset": total}
     if store.enabled:
         row = store.upgrade_task_log(job_id, task_id=task_id, hostname=hostname)
         if row is not None:
             text, status = row
+            text = text or ""
             return {"ok": True, "hostname": hostname, "status": status,
-                    "log": (text or "")[offset:], "next_offset": len(text or "")}
+                    "log": text[offset:], "text": text[offset:],
+                    "next_offset": len(text), "offset": len(text)}
     return None
 
 
@@ -2668,7 +2675,13 @@ class Handler(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(n) or b"{}")
 
     def _upload_package(self):
-        """POST /api/packages/upload?name=<filename>：流式落盘 + 边写边算 sha256。"""
+        """POST /api/packages/upload：流式落盘 + 边写边算 sha256。
+
+        两种载荷：multipart/form-data（浏览器 FormData，字段 file，文件名取自
+        Content-Disposition）或原始字节流 + ?name=<filename>（curl 直传）。"""
+        ctype = (self.headers.get("Content-Type") or "").strip()
+        if ctype.lower().startswith("multipart/form-data"):
+            return self._upload_package_multipart(ctype)
         qs = parse_qs(urlsplit(self.path).query)
         name = (qs.get("name", [""])[0] or self.headers.get("X-Filename") or "").strip()
         if not name or "/" in name or "\\" in name or ".." in name or not SAFE_FILENAME_RE.match(name):
@@ -2712,14 +2725,119 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass
             return self.send_json(500, {"ok": False, "error": str(exc)})
-        # 上传即完成哈希：直接写入缓存，免后台重算 1G
+        self._register_uploaded(final, digest.hexdigest())
+
+    def _upload_package_multipart(self, ctype):
+        """流式解析 multipart/form-data（单文件字段）：只留最后一个 part 的
+        正文落盘，哈希不含 multipart 边界字节。"""
+        m = re.search(r'boundary="?([^";]+)"?', ctype)
+        if not m:
+            return self.send_json(400, {"ok": False, "error": "multipart 缺少 boundary"})
+        boundary = ("--" + m.group(1)).encode()
+        hold = len(boundary) + 8  # 尾部滞留窗口，防把边界字节写进文件
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0:
+            return self.send_json(411, {"ok": False, "error": "missing Content-Length"})
+        try:
+            os.makedirs(PKG_DIR, exist_ok=True)
+        except OSError as exc:
+            return self.send_json(500, {"ok": False, "error": f"无法创建包目录: {exc}"})
+        tmp = None
+        out = None
+        digest = hashlib.sha256()
+        written = 0
+        complete = False
+        try:
+            remaining = length
+            buf = b""
+            state = "preamble"   # preamble -> headers -> body
+            while remaining > 0 or (state == "body" and buf):
+                if remaining > 0:
+                    chunk = self.rfile.read(min(1 << 20, remaining))
+                    if not chunk:
+                        break  # 连接中断：保持 complete=False，走失败清理
+                    remaining -= len(chunk)
+                    buf += chunk
+                if state == "preamble":
+                    i = buf.find(boundary)
+                    if i < 0:
+                        buf = buf[-(len(boundary) + 4):] if len(buf) > len(boundary) + 4 else buf
+                        continue
+                    buf = buf[i + len(boundary):]
+                    state = "headers"
+                if state == "headers":
+                    i = buf.find(b"\r\n\r\n")
+                    if i < 0:
+                        continue
+                    header_block = buf[:i].decode("utf-8", "replace")
+                    buf = buf[i + 4:]
+                    md = re.search(r'filename="([^"]+)"', header_block)
+                    name = (md.group(1) if md else "").strip()
+                    if not name or "/" in name or "\\" in name or ".." in name \
+                            or not SAFE_FILENAME_RE.match(name):
+                        return self.send_json(400, {"ok": False,
+                                                    "error": "非法文件名（仅允许 *.tar.gz，且不含路径）"})
+                    tmp = os.path.join(PKG_DIR, name + ".uploading")
+                    out = open(tmp, "wb")
+                    state = "body"
+                if state == "body":
+                    # 滞留尾部，防把结束边界字节写进文件
+                    flush_upto = max(0, len(buf) - hold)
+                    if flush_upto:
+                        out.write(buf[:flush_upto])
+                        digest.update(buf[:flush_upto])
+                        written += flush_upto
+                        buf = buf[flush_upto:]
+                    if remaining <= 0:
+                        # 全部读完后，从尾部滞留里剥掉结束边界 \r\n--boundary…
+                        j = buf.find(b"\r\n" + boundary)
+                        body_tail = buf[:j] if j >= 0 else buf
+                        out.write(body_tail)
+                        digest.update(body_tail)
+                        written += len(body_tail)
+                        buf = b""
+                        complete = j >= 0
+                        break
+            if not complete:
+                if out is not None:
+                    out.close()
+                    out = None
+                if tmp:
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+                return self.send_json(400, {"ok": False, "error": "multipart 上传不完整或缺少结束边界"})
+            if out is None or written == 0:
+                return self.send_json(400, {"ok": False, "error": "multipart 中未找到文件内容"})
+            out.close()
+            out = None
+            final = tmp[:-len(".uploading")]
+            os.replace(tmp, final)
+        except OSError as exc:
+            if out is not None:
+                out.close()
+            if tmp:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            return self.send_json(500, {"ok": False, "error": str(exc)})
+        self._register_uploaded(final, digest.hexdigest())
+
+    def _register_uploaded(self, final, sha256_hex):
+        """上传完成：哈希直接入缓存（免后台重算）+ 返回包信息。"""
+        name = os.path.basename(final)
         st = os.stat(final)
         with _PKG_LOCK:
             _PKG_CACHE[final] = {"mtime": st.st_mtime, "size": st.st_size,
-                                 "sha256": digest.hexdigest()}
+                                 "sha256": sha256_hex, "hashing": False}
         m = PKG_NAME_RE.match(name)
-        self.send_json(200, {"ok": True, "file": name, "size": written,
-                             "sha256": digest.hexdigest(),
+        self.send_json(200, {"ok": True, "file": name, "size": st.st_size,
+                             "sha256": sha256_hex,
                              "version": m.group(1) if m else "", "arch": m.group(2) if m else ""})
 
     def do_GET(self):
