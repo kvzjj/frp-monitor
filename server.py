@@ -99,7 +99,10 @@ async function copyText(text){
   try{const ta=document.createElement('textarea');ta.value=text;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();const ok=document.execCommand('copy');ta.remove();return ok}catch(e){return false}
 }
 function pct(v){return v==null?'—':(Math.round(v*1000)/10)+'%'}
+function fmtDuration(m){if(m==null||isNaN(m))return '—';m=Math.round(m);if(m<=0)return '0分钟';const h=Math.floor(m/60),r=m%60;if(h&&r)return h+'小时'+r+'分';if(h)return h+'小时';return r+'分钟'}
+function fmtHours(m){return m==null||isNaN(m)?'—':(m/60).toFixed(1)+'h'}
 let fleet=[],sites=[],versions=[],sshHint={},q='',siteFilter='',verFilter='',targetVer='',pendingOnly=false,statusFilter='online',refreshInterval=15;
+let collectDur={enabled:false,map:{}};
 function matches(f){
   if(siteFilter&&(f.site||'未登记')!==siteFilter)return false;
   if(verFilter&&(f.version||'未获取')!==verFilter)return false;
@@ -154,6 +157,7 @@ function renderTargetSel(){
 }
 function card(f){
   const tag=f.site?`<span class="stag" style="--c:${siteColor(f.site)}">${esc(f.site)}</span>`:'';
+  const cd=collectDur.enabled?collectDur.map[(f.hostname||'').toLowerCase()]:null;
   if(f.online){
     return `<article class="card online" data-h="${esc(f.hostname)}"><div class="top"><span class="name"><i class="dot"></i>${esc(f.hostname)}</span>${tag}</div>
     <div class="row"><span>版本</span><span class="value">${esc(f.version||'未获取')}${f.version_error?` <small title="${esc(f.version_error)}">(读取失败)</small>`:''}</span></div>
@@ -162,6 +166,7 @@ function card(f){
     <div class="row"><span>SSH / Web</span><span class="value">${f.ssh_port||'—'} / ${f.web_port||'—'}</span></div>
     <div class="row"><span>device_id</span><span class="value">${esc(f.device_id||'—')}</span></div>
     <div class="row"><span>连接数</span><span class="value">${f.connections!=null?f.connections:'—'}</span></div>
+    ${collectDur.enabled?`<div class="row"><span>今日采集</span><span class="value">${cd&&cd.today_minutes!=null?fmtHours(cd.today_minutes):'—'}</span></div>`:''}
     <div class="row"><small>frpc 上线：${esc(f.started||'—')}</small></div></article>`;
   }
   return `<article class="card offline" data-h="${esc(f.hostname)}"><div class="top"><span class="name"><i class="dot off"></i>${esc(f.hostname)}</span>${tag}</div>
@@ -197,6 +202,8 @@ async function openDevice(h){
     const r=await fetch('/api/device/'+encodeURIComponent(h));const d=await r.json();
     if(!r.ok)throw Error(d.error||'读取失败');
     const hint=d.ssh_hint||sshHint||{};
+    const cd=(collectDur.map||{})[String(d.hostname||'').toLowerCase()]||null;
+    const cdRows=cd&&Array.isArray(cd.history)?cd.history.slice().sort((a,b)=>String(b.date||'').localeCompare(String(a.date||''))).map(r=>`<tr><td>${esc(r.date)}</td><td>${fmtDuration(r.minutes)}</td></tr>`).join(''):'';
     const evRows=(d.events||[]).map(e=>`<div class="erow"><span class="etag ${esc(e.event_type)}">${ETAGS[e.event_type]||esc(e.event_type)}</span><b>${esc(e.ts||'')}</b><span class="edetail">${esc(e.new_value||e.detail||'')}${e.old_value&&e.new_value?' ← '+esc(e.old_value):''}</span></div>`).join('')||'<p class="eempty">暂无事件</p>';
     const stRows=(d.status||[]).map(s=>`<tr><td>${esc(s.ts)}</td><td>${s.online?'<span style="color:#16a34a">在线</span>':'<span style="color:#dc2626">离线</span>'}</td><td>${esc(s.release_version||'—')}</td><td>${s.connections!=null?s.connections:'—'}</td></tr>`).join('');
     const cmd=d.ssh_port?`ssh -J ${hint.jump||'ubuntu@124.222.147.63'} -p ${d.ssh_port} ${hint.user||'orangepi'}@127.0.0.1`:'';
@@ -212,8 +219,10 @@ async function openDevice(h){
         <span>SSH / Web 端口</span><b>${d.ssh_port||'—'} / ${d.web_port||'—'}</b>
         <span>首次 / 最后在线</span><b>${esc(d.first_seen||'—')} / ${esc(d.last_seen||'从未')}</b>
         <span>在线率 24h / 7d</span><b>${pct(d.uptime_24h)} / ${pct(d.uptime_7d)}</b>
+        <span>采集时长</span><b>${fmtDuration(cd?cd.today_minutes:null)}</b>
       </div>
       ${cmd?`<div class="cmd"><code id="sshCmd">${esc(cmd)}</code><button id="copyBtn">复制跳板命令</button></div>`:''}
+      <h3>近 7 天采集时长</h3><div class="twrap"><table><tr><th>日期</th><th>时长</th></tr>${cdRows||`<tr><td colspan=2 class="eempty">${collectDur.enabled?'暂无采集记录':'采集时长统计未启用'}</td></tr>`}</table></div>
       <h3>最近快照（5 分钟一条）</h3><div class="twrap"><table><tr><th>时间</th><th>状态</th><th>版本</th><th>连接</th></tr>${stRows||'<tr><td colspan=4 class="eempty">暂无快照</td></tr>'}</table></div>
       <h3>最近事件</h3><div class="elist">${evRows}</div>`;
     $('#mClose').onclick=closeModal;
@@ -252,7 +261,18 @@ $('#modal').onclick=e=>{if(e.target.id==='modal')closeModal()};
 document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal()});
 load();setInterval(()=>load(false),15000);
 async function loadEvents(){const el=document.querySelector('#eventsBody');if(!el)return;try{const r=await fetch('/api/events?hours=24&limit=60',{cache:'no-store'});const d=await r.json();if(!d.enabled){el.innerHTML='<p class=eempty>历史持久化未启用（数据库不可用）</p>';return}el.innerHTML=d.events.length?d.events.map(e=>`<div class=erow><span class="etag ${esc(e.event_type)}">${ETAGS[e.event_type]||esc(e.event_type)}</span><b>${esc(e.hostname)}</b><span class=edetail>${esc(e.new_value||e.detail||'')}${e.old_value&&e.new_value?' ← '+esc(e.old_value):''}</span><time>${esc(e.ts)}</time></div>`).join(''):'<p class=eempty>24 小时内暂无事件</p>'}catch(err){el.innerHTML='<p class=eempty>事件读取失败</p>'}}
-loadEvents();setInterval(loadEvents,60000);"""
+loadEvents();setInterval(loadEvents,60000);
+async function loadCollectDuration(){
+  try{
+    const r=await fetch('/api/collect-duration?days=7',{cache:'no-store'});
+    const d=await r.json();
+    if(!r.ok)throw Error(d.error||'请求失败');
+    collectDur={enabled:!!d.enabled,map:{}};
+    for(const it of d.items||[])collectDur.map[String(it.hostname||'').toLowerCase()]=it;
+  }catch(e){/* 接口未上线或拉取失败:沿用已有数据,无数据时展示 — / 空态 */}
+  if(fleet.length)renderGrid();
+}
+loadCollectDuration();setInterval(loadCollectDuration,300000);"""
 
 
 def _json_request(url, *, method="GET", data=None, headers=None, timeout=4):
