@@ -379,7 +379,7 @@ fleet:[],selected:new Set(),selTouched:false,targetVersion:'',reg:[],regFail:fal
 param:{url:'',ok:false,filename:'',version:'',arch:'',expiresAt:null,sha256:'',shaSrc:'',size:null},
 shaComputing:false,shaPollT:null,shaPollN:0,urlTimer:null,
 job:null,tasks:[],logs:{},logOff:{},follow:{},expanded:null,fromSnap:{},
-es:null,pollT:null,connState:'off',view:'overview',
+es:null,pollT:null,connState:'off',view:'overview',stickyNote:null,
 gid(i){return document.getElementById(i)},
 normStatus(s){s=String(s==null?'':s).toLowerCase();
  if(['success','done','ok','complete','completed','finished'].includes(s))return 'success';
@@ -461,7 +461,7 @@ fmtRemain(ms){
  if(h>=1)return h.toFixed(1)+' 小时';
  return Math.max(1,Math.round(ms/60000))+' 分钟';
 },
-estMs(){return Math.max(1,Math.ceil((this.selected.size||1)/6))*15*60000},
+estMs(){return Math.max(1,Math.ceil((this.selected.size||1)/6))*12*60000},
 onUrlInput(){
  const url=this.gid('upgUrl').value;
  const prev=this.param.filename;
@@ -537,33 +537,52 @@ async computeSha(){
  if(!this.param.ok||!this.param.url){this.setActHint('请先粘贴有效的 OSS 签名 URL',true);return}
  this.shaComputing=true;this.renderParam();
  try{
-  const r=await fetch('/api/upgrade/sha256',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:this.param.url,filename:this.param.filename,version:this.param.version,arch:this.param.arch})});
+  const r=await fetch('/api/upgrade/packages/hash',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({oss_url:this.param.url})});
   const d=await r.json().catch(()=>({}));
-  if(!r.ok)throw Error(d.error||('HTTP '+r.status));
-  if(d.sha256){this.param.sha256=String(d.sha256).toLowerCase();this.param.shaSrc='server';this.shaComputing=false;this.loadRegistry()}
-  else if(d.computing||d.pending||String(d.status||'').toLowerCase()==='computing')this.startShaPoll();
-  else throw Error('响应未包含哈希结果');
+  if(!r.ok){
+   if(d.error_code==='oss_expired'){this.shaComputing=false;const m=this.gid('upgShaMeta');if(m){m.textContent='服务端计算失败：'+(d.error||'链接已过期')+'，请重新生成签名 URL';m.className='pmeta bad'}return}
+   throw Error(d.error||('HTTP '+r.status));
+  }
+  if(d.status==='done'&&(d.entry||{}).sha256){
+   this.param.sha256=String(d.entry.sha256).toLowerCase();this.param.shaSrc='server';
+   if(d.entry.size!=null)this.param.size=d.entry.size;
+   this.shaComputing=false;this.loadRegistry();
+  }else this.startShaPoll();
  }catch(e){
   this.shaComputing=false;
   const m=this.gid('upgShaMeta');if(m){m.textContent='服务端计算失败：'+e.message+'（可手填）';m.className='pmeta bad'}
  }
 },
+regEntry(){return this.reg.find(x=>x.version===this.param.version&&x.arch===this.param.arch)||this.reg.find(x=>String(x.filename||'')===this.param.filename&&x.filename)},
+async pollShaTick(){
+ try{
+  const r=await fetch('/api/upgrade/packages',{cache:'no-store'});
+  const d=await r.json();
+  if(!r.ok)return;
+  this.reg=d.packages||d.items||(Array.isArray(d)?d:[]);
+  this.regFail=false;
+ }catch(e){return}
+ const e=this.regEntry();
+ if(e&&e.sha256){this.stopShaPoll();this.shaComputing=false;this.param.sha256=String(e.sha256).toLowerCase();this.param.shaSrc='server';if(e.size!=null)this.param.size=e.size;this.renderParam();return}
+ if(e&&e.hash_status==='failed'){this.stopShaPoll();this.shaComputing=false;const m=this.gid('upgShaMeta');if(m){m.textContent='服务端计算失败：'+(e.error||e.error_code||'未知原因')+'（可手填）';m.className='pmeta bad'}return}
+ if(e&&e.hash_status==='computing'){
+  const m=this.gid('upgShaMeta');
+  if(m){m.className='pmeta';m.textContent=e.total>0?('服务端计算中：已从 OSS 拉取 '+Math.min(100,Math.round((e.downloaded||0)/e.total*100))+'%（'+this.fmtB(e.downloaded||0)+' / '+this.fmtB(e.total)+'），完成后自动填入并缓存进注册表…'):'服务端计算中：正在从 OSS 直连拉取整包（约 1G，耗时视出口带宽），完成后自动填入并缓存进注册表…'}
+ }
+ const rs=this.gid('upgRegState');
+ if(rs&&!this.regFail)rs.textContent=this.reg.length?('注册表已加载 '+this.reg.length+' 条'+(this.reg.some(x=>x.hash_status==='computing')?' · '+this.reg.filter(x=>x.hash_status==='computing').length+' 个计算中':'')):'';
+},
 startShaPoll(){
  this.stopShaPoll();this.shaPollN=0;
- this.shaPollT=setInterval(async()=>{
+ this.pollShaTick();
+ this.shaPollT=setInterval(()=>{
   this.shaPollN++;
-  if(this.shaPollN>60){this.stopShaPoll();this.shaComputing=false;const m=this.gid('upgShaMeta');if(m){m.textContent='服务端计算超时（>4 分钟），可稍后重试或手填';m.className='pmeta bad'}return}
-  try{
-   const r=await fetch('/api/upgrade/sha256?filename='+encodeURIComponent(this.param.filename),{cache:'no-store'});
-   const d=await r.json();
-   if(!r.ok)return;
-   if(d.computing||String(d.status||'').toLowerCase()==='computing')return;
-   if(d.sha256){this.stopShaPoll();this.shaComputing=false;this.param.sha256=String(d.sha256).toLowerCase();this.param.shaSrc='server';this.loadRegistry()}
-  }catch(e){}
- },4000);
+  if(this.shaPollN>150){this.stopShaPoll();this.shaComputing=false;const m=this.gid('upgShaMeta');if(m){m.textContent='服务端计算超时（>10 分钟仍未完成），可稍后重试或手填';m.className='pmeta bad'}return}
+  this.pollShaTick()},4000);
 },
 stopShaPoll(){if(this.shaPollT){clearInterval(this.shaPollT);this.shaPollT=null}},
-isOssErr(t){
+isOssErr(t,code){
+ if(String(code||'').toLowerCase()==='oss_expired')return true;
  t=String(t||'');
  if(!t)return false;
  return /(^|[^0-9])403([^0-9]|$)/i.test(t)||/access ?denied|oss_expired|forbidden/i.test(t)||/链接?过期|重新生成/.test(t);
@@ -628,6 +647,8 @@ updateActions(){
  else if(mism)hint='⚠ 所选设备中 '+mism+' 台机型与目标包（'+this.param.arch+'）不符，下载/安装类操作不可发起；请改选相符机型设备，或更换对应机型的包链接',warn=true;
  else if(noSha)hint='⚠ 尚无 sha256 基准：下载/安装类操作不可发起（注册表未命中时请手填或点「服务端计算」）；仅预检/验证/清理可发起',warn=true;
  else if(lowTime)hint='⚠ 链接剩余有效期低于预估批量时长（'+this.fmtRemain(this.estMs())+'），批量中途可能过期，建议重新生成更长时效链接',warn=true;
+ if(busy&&this.stickyNote&&Date.now()<this.stickyNote.until){hint=this.stickyNote.text;warn=this.stickyNote.warn}
+ else if(!busy)this.stickyNote=null;
  const heavy=busy||noUrl||noVer||noSel||expired||mism>0||noSha;
  const light=busy||noUrl||noVer||noSel||expired;
  this.gid('upgRunAll').disabled=heavy;
@@ -664,9 +685,13 @@ async launch(kind){
  try{
   const r=await fetch('/api/upgrade/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind,devices,params:{version:this.targetVersion,oss_url:this.param.url,sha256:this.param.sha256||undefined}})});
   const d=await r.json().catch(()=>({}));
-  if(!r.ok)throw Error(d.error||('HTTP '+r.status));
+  if(!r.ok){
+   if(d.error_code==='oss_expired'){this.param.expiresAt=Date.now()-1000;this.renderParam();throw Error((d.error||'OSS 链接已过期')+'（后端校验拒绝）')}
+   if(d.error_code==='sha_missing')throw Error(d.error||'缺少 sha256 基准');
+   throw Error(d.error||('HTTP '+r.status));
+  }
   const j=d.job||d;const id=j.id!=null?j.id:j.job_id;
-  if(id==null)throw Error('响应缺少任务 id');
+  if(id==null)throw Error('响应缺少任务 id（job_id）');
   if(d.expires_at!=null){const t=this.parseTs(d.expires_at);if(t)this.param.expiresAt=t}
   this.fromSnap={};for(const h of devices){const f=this.fleet.find(x=>x.hostname===h);if(f)this.fromSnap[h]=f.version||''}
   const effective=(Array.isArray(d.devices)&&d.devices.length)?d.devices:devices;
@@ -674,12 +699,13 @@ async launch(kind){
   let note='任务 #'+id+' 已创建';
   if(Array.isArray(d.skipped)&&d.skipped.length)note+='；'+d.skipped.length+' 台被跳过：'+d.skipped.map(s=>esc(s.hostname)+'（'+esc(s.reason||s.error||'原因未说明')+'）').join('、');
   if(Array.isArray(d.warnings)&&d.warnings.length)note+='；⚠ '+d.warnings.map(w=>esc(typeof w==='string'?w:(w.message||w.msg||''))).join('；');
-  this.setActHint(note,!!(d.warnings&&d.warnings.length));
+  this.stickyNote={text:note,warn:!!(d.warnings&&d.warnings.length),until:Date.now()+20000};
+  this.setActHint(this.stickyNote.text,this.stickyNote.warn);
   this.loadJobDetail(id);this.subscribe();
  }catch(e){this.setActHint('发起失败：'+e.message,true)}
 },
-normJob(j){return{id:j.id!=null?j.id:j.job_id,kind:j.kind||'',version:j.version||(j.params&&j.params.version)||'',filename:j.filename||'',error:j.error||'',status:j.status||'running',created_at:j.created_at||j.createdAt||null,finished_at:j.finished_at||j.finishedAt||null,devices:j.devices||[],summary:j.summary||null}},
-normTask(t){return{hostname:t.hostname||t.host||'',stage:String(t.stage||'').toLowerCase(),status:this.normStatus(t.status),error:t.error||t.reason||'',started_at:t.started_at||t.startedAt||null,finished_at:t.finished_at||t.finishedAt||null,from_version:t.from_version||t.version_before||''}},
+normJob(j){return{id:j.id!=null?j.id:j.job_id,kind:j.kind||'',version:j.version||(j.params&&j.params.version)||'',filename:j.filename||'',oss_url_expires:j.oss_url_expires!=null?j.oss_url_expires:null,error:j.error||j.error_code||'',error_code:j.error_code||'',status:j.status||'running',created_at:j.created_at||j.createdAt||null,finished_at:j.finished_at||j.finishedAt||null,devices:j.devices||[],summary:j.summary||null}},
+normTask(t){return{hostname:t.hostname||t.host||'',stage:String(t.stage||'').toLowerCase(),status:this.normStatus(t.status),error:t.error||t.reason||'',error_code:t.error_code||'',started_at:t.started_at||t.startedAt||null,finished_at:t.finished_at||t.finishedAt||null,from_version:t.from_version||t.version_before||''}},
 adoptJob(j){this.job=j;this.tasks=(j.devices||[]).map(h=>({hostname:h,stage:'',status:'pending',error:'',from_version:this.fromSnap[h]||''}));this.logs={};this.logOff={};this.expanded=null;this.renderJob()},
 async loadJobs(){
  try{
@@ -720,9 +746,9 @@ renderJob(){
  const end=fin||(st==='running'?Date.now():null);
  const el=(created&&end)?(end-created)/1000:null;
  let oss=false;
- if(this.isOssErr(j.error))oss=true;
- if(!oss)for(const t of this.tasks){if(t.status==='failed'&&this.isOssErr(t.error)){oss=true;break}}
- sumEl.innerHTML=(oss?'<div class=ossban>⚠ OSS 链接已过期（403），设备下载被拒——请重新生成签名 URL 并新建任务</div>':'')+`<b>#${esc(j.id)}</b><span>${esc(this.KIND_LBL[j.kind]||j.kind||'任务')} → <b>${esc(j.version||'—')}</b></span><span class="tstat ${st}">${this.STAT_LBL[st]||esc(st)}</span><span>共 <b>${total}</b> 台</span><span>成功 <b style="color:#15803d">${cnt.success}</b></span><span>失败 <b style="color:#b91c1c">${cnt.failed}</b></span><span>阻断 <b style="color:#b45309">${cnt.blocked}</b></span><span>进行中 <b style="color:#1d4ed8">${cnt.running}</b></span><span>等待 <b>${cnt.pending}</b></span>${el!=null?`<span>耗时 <b>${this.fmtDur2(el)}</b></span>`:''}${created?`<span>发起于 ${esc(this.fmtClock(created))}</span>`:''}`;
+ if(this.isOssErr(j.error,j.error_code))oss=true;
+ if(!oss)for(const t of this.tasks){if(t.status==='failed'&&this.isOssErr(t.error,t.error_code)){oss=true;break}}
+ sumEl.innerHTML=(oss?'<div class=ossban>⚠ OSS 链接已过期（403），设备下载被拒——请重新生成签名 URL 并新建任务</div>':'')+`<b>#${esc(j.id)}</b><span>${esc(this.KIND_LBL[j.kind]||j.kind||'任务')} → <b>${esc(j.version||'—')}</b></span><span class="tstat ${st}">${this.STAT_LBL[st]||esc(st)}</span><span>共 <b>${total}</b> 台</span><span>成功 <b style="color:#15803d">${cnt.success}</b></span><span>失败 <b style="color:#b91c1c">${cnt.failed}</b></span><span>阻断 <b style="color:#b45309">${cnt.blocked}</b></span><span>进行中 <b style="color:#1d4ed8">${cnt.running}</b></span><span>等待 <b>${cnt.pending}</b></span>${el!=null?`<span>耗时 <b>${this.fmtDur2(el)}</b></span>`:''}${created?`<span>发起于 ${esc(this.fmtClock(created))}</span>`:''}${j.oss_url_expires?`<span>链接有效期 ${esc(this.fmtRemain(j.oss_url_expires*1000-Date.now()))}</span>`:''}`;
  grid.innerHTML=this.tasks.length?this.tasks.map(t=>this.cardHtml(t)).join(''):(this.active()?'<p class=uempty>任务已创建，等待设备状态上报…</p>':'');
 },
 cardHtml(t){
@@ -802,6 +828,12 @@ onEvent(name,raw){
   if(!this.job||this.job.id!==j.id)this.adoptJob(j);else{this.job=j}
   this.renderJob();
   if(!this.active()){this.teardown();this.loadJobDetail(j.id)}
+  return}
+ if(type==='pkg'){
+  if(this.shaComputing&&m.version!=null&&String(m.version)===String(this.param.version)&&(!m.arch||String(m.arch)===String(this.param.arch))){
+   if(m.status==='ok'&&m.sha256){this.stopShaPoll();this.shaComputing=false;this.param.sha256=String(m.sha256).toLowerCase();this.param.shaSrc='server';if(m.size!=null)this.param.size=m.size;this.renderParam()}
+   else this.pollShaTick();
+  }else if(m.status==='ok')this.loadRegistry();
   return}
  if(type==='task'||m.task){this.applyTask(this.normTask(m.task||m));return}
  if(type==='log'||m.text||m.chunk||m.lines){
