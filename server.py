@@ -10,7 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, unquote, urlsplit
 from urllib.request import Request, urlopen
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import base64
 import hashlib
 import hmac
@@ -21,6 +21,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 
@@ -60,20 +61,25 @@ SSH_DEVICE_USER = os.getenv("FRP_MONITOR_SSH_DEVICE_USER", "orangepi")
 COLLECT_TIMES = os.getenv("FRP_MONITOR_COLLECT_TIMES", "19:00,21:00")
 COLLECT_DURATION_TIMEOUT = float(os.getenv("FRP_MONITOR_COLLECT_DURATION_TIMEOUT", "8"))
 
-# --- 批量升级：安装包托管 / 升级编排引擎 / 数据保留与每日备份 -----------------
-# 包目录：自动发现 *.tar.gz；ops 可直接 scp 放入，也可经面板上传。
-PKG_DIR = os.getenv("PKG_DIR", "/opt/frp-monitor/packages")
+# --- 批量升级：OSS 签名链接分发 / 升级编排引擎 / 数据保留与每日备份 ---------
+# 分发通道（设计变更 2026-10-14）：不做服务端包托管/下载代理。安装包经 OSS
+# 签名 URL 由设备本地直连下载；服务器仅在计算 sha256 基准时从 OSS 直连拉
+# 一次包（拉完即删临时文件），哈希入 pkg_registry，不做存储与分发。
 # 设备登录/sudo 密码：来自 /etc/frp-monitor.env（systemd EnvironmentFile 注入），
 # 日志与 API 输出全程脱敏，严禁落盘/入库。
 DEPLOY_PW = os.getenv("DEPLOY_PW", "")
 # 并行升级设备数（SOP：预检/安装可更高，默认 6 为保守值）
 UPGRADE_MAX_PARALLEL = max(1, int(os.getenv("UPGRADE_MAX_PARALLEL", "6")))
-# 设备下载安装包用的对外地址：默认取 SSH_JUMP 里的网关 IP（frp-monitor 与 frps 同机）
-PUBLIC_IP = os.getenv("FRP_MONITOR_PUBLIC_IP", "") or (SSH_JUMP.split("@")[-1].strip() if SSH_JUMP else "")
 # SSH 目标：设备代理绑定本机 127.0.0.1:<ssh_port>（端口以面板设备记录为准，不按公式推算）
 SSH_KNOWN_HOSTS = os.getenv("FRP_MONITOR_SSH_KNOWN_HOSTS", "/opt/frp-monitor/.known-hosts")
 INSTALL_TIMEOUT = int(os.getenv("FRP_MONITOR_INSTALL_TIMEOUT", "2400"))  # 单台安装跟踪上限（秒）
+# 服务端一次性拉包算哈希的临时目录与超时（拉完即删，不落盘存包）
+OSS_HASH_TMP_DIR = os.getenv("FRP_MONITOR_OSS_HASH_TMP_DIR", "/var/tmp")
+OSS_HASH_TIMEOUT = int(os.getenv("FRP_MONITOR_OSS_HASH_TIMEOUT", "1800"))
+# 设备端下载停滞阈值（秒）：size 持续不变则杀掉 curl 并上设备验尸（SOP 坑 #13）
+DOWNLOAD_STALL_TIMEOUT = int(os.getenv("FRP_MONITOR_DOWNLOAD_STALL_TIMEOUT", "180"))
 # 数据保留：host_status / refresh_batches / host_events / upgrade_* 统一保留天数
+# （devices、collect_duration、pkg_registry 永不清理）
 RETENTION_DAYS = max(1, int(os.getenv("FRP_MONITOR_RETENTION_DAYS", "30")))
 # 每日备份：mysqldump frp_monitor → BACKUP_DIR，保留最近 BACKUP_KEEP 份
 BACKUP_DIR = os.getenv("FRP_MONITOR_BACKUP_DIR", "/opt/frp-monitor/backups")
@@ -1175,13 +1181,16 @@ class Store:
             "UNIQUE KEY uq_host_date (hostname, stat_date)"
             ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4")
         # 批量升级：任务（一次批量操作）与逐台子任务；日志随子任务入库，
-        # 重启后仍可回看；每日维护线程按保留窗口清理。
+        # 重启后仍可回看；每日维护线程按保留窗口清理。签名 URL 只存脱敏摘要
+        # （文件名 + 过期时间），完整 URL 仅存在于运行期内存与设备端命令。
         self._execute(
             "CREATE TABLE IF NOT EXISTS upgrade_jobs ("
             "id INT NOT NULL PRIMARY KEY, "
             "kind VARCHAR(16) NOT NULL, "               # precheck/download/prepare/install/verify/cleanup/upgrade
             "version VARCHAR(32) NOT NULL DEFAULT '', "
-            "params TEXT NULL, "                        # 创建参数快照（不含凭据）
+            "filename VARCHAR(255) NOT NULL DEFAULT '', "  # OSS 包文件名（脱敏摘要，不含签名）
+            "oss_url_expires DATETIME NULL, "            # 签名链接过期时间（无则 NULL）
+            "params TEXT NULL, "                        # 创建参数快照（sha256/old_tag 等，不含 URL）
             "status VARCHAR(16) NOT NULL DEFAULT 'running', "  # running/completed
             "total INT NOT NULL DEFAULT 0, "
             "created_at DATETIME NOT NULL, "
@@ -1197,11 +1206,23 @@ class Store:
             "stage VARCHAR(16) NOT NULL DEFAULT '', "   # 当前/最后阶段
             "status VARCHAR(16) NOT NULL DEFAULT 'queued', "  # queued/running/success/failed/blocked
             "error VARCHAR(500) NOT NULL DEFAULT '', "
+            "error_code VARCHAR(32) NOT NULL DEFAULT '', "  # 结构化错误码（如 oss_expired）
             "log LONGTEXT NULL, "
             "started_at DATETIME NULL, "
             "finished_at DATETIME NULL, "
             "KEY idx_job (job_id), "
             "KEY idx_host (hostname)"
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4")
+        # 包注册表：sha256 基准缓存（服务端一次性从 OSS 拉包计算），永不清理
+        self._execute(
+            "CREATE TABLE IF NOT EXISTS pkg_registry ("
+            "version VARCHAR(32) NOT NULL, "
+            "arch VARCHAR(16) NOT NULL, "              # rk3588-arm64 / amd64
+            "filename VARCHAR(255) NOT NULL DEFAULT '', "
+            "sha256 CHAR(64) NOT NULL, "
+            "size BIGINT NOT NULL DEFAULT 0, "
+            "first_seen DATETIME NOT NULL, "
+            "UNIQUE KEY uq_ver_arch (version, arch)"
             ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4")
         rows = self._execute(
             "SELECT column_name FROM information_schema.columns "
@@ -1211,6 +1232,21 @@ class Store:
             self._execute("ALTER TABLE devices ADD COLUMN hw_model VARCHAR(64) NOT NULL DEFAULT ''")
         if "ip" not in cols:
             self._execute("ALTER TABLE devices ADD COLUMN ip VARCHAR(64) NOT NULL DEFAULT ''")
+        # 老库补列（返工前版本建的 upgrade_* 表）
+        rows = self._execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema=DATABASE() AND table_name='upgrade_jobs'", fetch="all")
+        jcols = {r[0] for r in rows or []}
+        if jcols and "filename" not in jcols:
+            self._execute("ALTER TABLE upgrade_jobs ADD COLUMN filename VARCHAR(255) NOT NULL DEFAULT ''")
+        if jcols and "oss_url_expires" not in jcols:
+            self._execute("ALTER TABLE upgrade_jobs ADD COLUMN oss_url_expires DATETIME NULL")
+        rows = self._execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema=DATABASE() AND table_name='upgrade_tasks'", fetch="all")
+        tcols = {r[0] for r in rows or []}
+        if tcols and "error_code" not in tcols:
+            self._execute("ALTER TABLE upgrade_tasks ADD COLUMN error_code VARCHAR(32) NOT NULL DEFAULT ''")
 
     def _load_roster(self):
         rows = self._execute(
@@ -1421,11 +1457,12 @@ class Store:
         return items
 
     # --- 批量升级任务持久化 -------------------------------------------------
-    def create_upgrade_job(self, job_id, kind, version, params_json, total, created_at):
+    def create_upgrade_job(self, job_id, kind, version, params_json, total, created_at,
+                           filename="", oss_url_expires=None):
         self._execute(
-            "INSERT INTO upgrade_jobs (id, kind, version, params, status, total, created_at) "
-            "VALUES (%s, %s, %s, %s, 'running', %s, %s)",
-            (job_id, kind, version, params_json, total, created_at))
+            "INSERT INTO upgrade_jobs (id, kind, version, filename, oss_url_expires, "
+            "params, status, total, created_at) VALUES (%s, %s, %s, %s, %s, %s, 'running', %s, %s)",
+            (job_id, kind, version, filename[:255], oss_url_expires, params_json, total, created_at))
 
     def create_upgrade_task(self, task_id, job_id, hostname, ssh_port):
         self._execute(
@@ -1441,7 +1478,7 @@ class Store:
             (task_id, job_id, hostname, ssh_port, error[:500], now, now))
 
     def update_upgrade_task(self, task_id, stage=None, status=None, error=None,
-                            log=None, started_at=None, finished_at=None):
+                            error_code=None, log=None, started_at=None, finished_at=None):
         sets, args = [], []
         if stage is not None:
             sets.append("stage=%s"); args.append(stage)
@@ -1449,6 +1486,8 @@ class Store:
             sets.append("status=%s"); args.append(status)
         if error is not None:
             sets.append("error=%s"); args.append(error[:500])
+        if error_code is not None:
+            sets.append("error_code=%s"); args.append(error_code[:32])
         if log is not None:
             sets.append("log=%s"); args.append(log)
         if started_at is not None:
@@ -1465,45 +1504,78 @@ class Store:
                       (finished_at, job_id))
 
     def upgrade_job_view(self, job_id):
-        """单任务视图（含逐台状态）；不存在返回 None。"""
+        """单任务视图（含逐台状态）；不存在返回 None。签名 URL 只回显脱敏摘要。"""
         row = self._execute(
-            "SELECT id, kind, version, status, total, params, "
+            "SELECT id, kind, version, filename, oss_url_expires, status, total, params, "
             "UNIX_TIMESTAMP(created_at), IFNULL(UNIX_TIMESTAMP(finished_at), 0) "
             "FROM upgrade_jobs WHERE id=%s", (job_id,), fetch="one")
         if not row:
             return None
-        job = {"id": row[0], "kind": row[1], "version": row[2] or "", "status": row[3],
-               "total": row[4], "params": json.loads(row[5]) if row[5] else {},
-               "created_at": row[6], "finished_at": row[7] or None, "tasks": self.upgrade_tasks_view(job_id)}
+        job = {"id": row[0], "kind": row[1], "version": row[2] or "", "filename": row[3] or "",
+               "oss_url_expires": int(row[4].timestamp()) if row[4] else None,
+               "status": row[5], "total": row[6],
+               "params": json.loads(row[7]) if row[7] else {},
+               "created_at": row[8], "finished_at": row[9] or None, "tasks": self.upgrade_tasks_view(job_id)}
         job["counts"] = _task_counts(job["tasks"])
         return job
 
     def upgrade_tasks_view(self, job_id):
         rows = self._execute(
-            "SELECT t.id, t.hostname, t.stage, t.status, t.error, "
+            "SELECT t.id, t.hostname, t.stage, t.status, t.error, t.error_code, "
             "IFNULL(UNIX_TIMESTAMP(t.started_at), 0), IFNULL(UNIX_TIMESTAMP(t.finished_at), 0), "
             "IFNULL(LENGTH(t.log), 0) "
             "FROM upgrade_tasks t WHERE t.job_id=%s ORDER BY t.id", (job_id,), fetch="all")
         out = []
-        for tid, hostname, stage, status, error, started, finished, chars in rows or []:
+        for tid, hostname, stage, status, error, error_code, started, finished, chars in rows or []:
             out.append({"id": tid, "hostname": hostname, "stage": stage or "",
                         "stage_cn": STAGE_CN.get(stage or "", stage or ""), "status": status,
-                        "error": error or "", "started_at": started or None,
+                        "error": error or "", "error_code": error_code or "",
+                        "started_at": started or None,
                         "finished_at": finished or None, "chars": int(chars or 0)})
         return out
 
     def upgrade_jobs_list(self, limit=50):
         rows = self._execute(
-            "SELECT j.id, j.kind, j.version, j.status, j.total, "
+            "SELECT j.id, j.kind, j.version, j.filename, IFNULL(UNIX_TIMESTAMP(j.oss_url_expires), 0), "
+            "j.status, j.total, "
             "UNIX_TIMESTAMP(j.created_at), IFNULL(UNIX_TIMESTAMP(j.finished_at), 0), "
             "IFNULL(SUM(t.status='success'), 0), IFNULL(SUM(t.status='failed'), 0), "
             "IFNULL(SUM(t.status='blocked'), 0) "
             "FROM upgrade_jobs j LEFT JOIN upgrade_tasks t ON t.job_id=j.id "
             "GROUP BY j.id ORDER BY j.id DESC LIMIT %s", (limit,), fetch="all")
-        return [{"id": r[0], "kind": r[1], "version": r[2] or "", "status": r[3], "total": r[4],
-                 "created_at": r[5], "finished_at": r[6] or None,
-                 "counts": {"success": int(r[7]), "failed": int(r[8]), "blocked": int(r[9])}}
+        return [{"id": r[0], "kind": r[1], "version": r[2] or "", "filename": r[3] or "",
+                 "oss_url_expires": r[4] or None,
+                 "status": r[5], "total": r[6],
+                 "created_at": r[7], "finished_at": r[8] or None,
+                 "counts": {"success": int(r[9]), "failed": int(r[10]), "blocked": int(r[11])}}
                 for r in rows or []]
+
+    # --- 包注册表（sha256 基准缓存） ------------------------------------------
+    def register_pkg(self, version, arch, filename, sha256, size):
+        """注册/刷新 (version, arch) 基准；重复升级直接命中。"""
+        self._execute(
+            "INSERT INTO pkg_registry (version, arch, filename, sha256, size, first_seen) "
+            "VALUES (%s, %s, %s, %s, %s, %s) "
+            "ON DUPLICATE KEY UPDATE filename=VALUES(filename), sha256=VALUES(sha256), "
+            "size=VALUES(size), first_seen=VALUES(first_seen)",
+            (version, arch, filename[:255], sha256, size, datetime.now()))
+
+    def pkg_registry_get(self, version, arch):
+        row = self._execute(
+            "SELECT version, arch, filename, sha256, size, "
+            "UNIX_TIMESTAMP(first_seen) FROM pkg_registry WHERE version=%s AND arch=%s",
+            (version, arch), fetch="one")
+        if not row:
+            return None
+        return {"version": row[0], "arch": row[1], "filename": row[2], "sha256": row[3],
+                "size": int(row[4] or 0), "first_seen": row[5]}
+
+    def pkg_registry_list(self):
+        rows = self._execute(
+            "SELECT version, arch, filename, sha256, size, UNIX_TIMESTAMP(first_seen) "
+            "FROM pkg_registry", fetch="all")
+        return [{"version": r[0], "arch": r[1], "filename": r[2], "sha256": r[3],
+                 "size": int(r[4] or 0), "first_seen": r[5]} for r in rows or []]
 
     def upgrade_task_log(self, job_id, task_id=None, hostname=None):
         """取库内日志（进程重启后的回看亮底）；返回 (log, status) 或 None。"""
@@ -1671,18 +1743,21 @@ def _collect_duration_loop():
 # ============================================================================
 # 批量升级：设备端阶段脚本（以字符串常量内嵌，随服务分发）
 # 来源：update/scripts/*.sh（同步日期 2026-10-15，含 SOP 15 条坑位护栏）。
+# 分发通道（设计变更 2026-10-14）：设备直连 OSS 签名 URL 下载，不经服务器。
 # 与源文件的差异：
 #   precheck.sh  —— 增加 NOW_EPOCH 时钟偏差检查（SOP 坑 #10：>5min 预检告警）；
-#                   OSS_URL 连通性探测改为 PKG_URL（面板托管包地址）
-#   download.sh  —— OSS_URL 换为 PKG_URL（面板托管包）；其余（重试/续传/哈希输出）不变
+#                   其余与源文件一致（OSS_URL 连通性探测保留）
+#   download.sh  —— 设备直连 OSS 下载，在源文件基础上增加：403 预探（链接过期
+#                   明确报 OSS_HTTP=403）+ 下载停滞看门狗（size 持续不变杀 curl
+#                   并 pgrep 验尸，SOP 坑 #13）+ 周期性 size 心跳输出
 #   prepare.sh   —— PKG_SRC 默认改为 $BASE/pkg.tar.gz（下载阶段落点）；其余不变
 #   run-install.sh / verify.sh / cleanup.sh —— 原样内嵌，无改动
 # 所有脚本仍以 stdin 推送 + bash -s 执行，参数走远程命令行环境变量。
 # ============================================================================
 SCRIPT_PRECHECK = r'''#!/usr/bin/env bash
-# [内嵌自 update/scripts/precheck.sh · 2026-10-15]
+# [内嵌自 update/scripts/precheck.sh · 2026-10-15；差异：+NOW_EPOCH 时钟检查]
 # 设备端升级前预检（经 FRP SSH 推送执行）。可选环境变量：
-#   PKG_URL（面板托管包连通性探测）、NOW_EPOCH（面板 epoch，时钟偏差告警）
+#   OSS_URL（OSS 签名链接连通性探测）、NOW_EPOCH（面板 epoch，时钟偏差告警）
 set -u
 echo "### host=$(hostname) arch=$(uname -m) date=$(date -u +%FT%TZ)"
 pw=${DEPLOY_PW:-}
@@ -1702,28 +1777,55 @@ echo "### pkg:"
 for p in "${PKG_SRC:-}" /home/orangepi/ego-portal-*-rk3588-arm64.tar.gz /var/tmp/ego-*/pkg.tar.gz; do
   [ -f "$p" ] && echo "found: $p size=$(stat -c %s "$p")"
 done 2>/dev/null | sort -u
-[ -n "${PKG_URL:-}" ] && { echo -n "### pkg-url: "; curl -s -o /dev/null -w 'http=%{http_code}\n' --max-time 20 -r 0-0 "$PKG_URL" || echo FAIL; }
+[ -n "${OSS_URL:-}" ] && { echo -n "### OSS: "; curl -s -o /dev/null -w 'http=%{http_code}\n' --max-time 20 -r 0-0 "$OSS_URL" || echo FAIL; }
 echo "### done"
 '''
 
 SCRIPT_DOWNLOAD = r'''#!/usr/bin/env bash
-# [内嵌自 update/scripts/download.sh · 2026-10-15；OSS_URL → PKG_URL 面板托管包]
-# 设备端从面板下载安装包（断点续传，/tmp 是 tmpfs 一律放 /var/tmp）。
-# 必需环境变量：PKG_URL；可选：PKG_VERSION、DEST
-set -euo pipefail
-: "${PKG_URL:?need PKG_URL}"
+# [内嵌自 update/scripts/download.sh · 2026-10-15；差异：+403 预探 + 停滞看门狗]
+# 设备端直连 OSS 签名 URL 下载安装包（断点续传，/tmp 是 tmpfs 一律放 /var/tmp）。
+# 必需环境变量：OSS_URL、PKG_VERSION；可选：DEST、STALL_TIMEOUT（默认 180s）
+set -u
+: "${OSS_URL:?need OSS_URL}"
 PKG_VERSION="${PKG_VERSION:?need PKG_VERSION, e.g. v0.4.6}"
 DEST="${DEST:-/var/tmp/ego-${PKG_VERSION}}"
+STALL_TIMEOUT="${STALL_TIMEOUT:-180}"
 mkdir -p "$DEST" && cd "$DEST"
+probe=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -r 0-0 "$OSS_URL" || echo 000)
+echo "probe_http=$probe"
+case "$probe" in
+  200|206) ;;
+  403) echo "OSS_HTTP=403"; echo "ERROR_LINK_EXPIRED"; exit 10 ;;
+  *)    echo "OSS_HTTP=$probe"; echo "ERROR_LINK_UNREACHABLE"; exit 11 ;;
+esac
 echo "==> downloading to $DEST/pkg.tar.gz"
-curl -fL --retry 4 --retry-delay 2 --connect-timeout 15 -C - -o pkg.tar.gz "$PKG_URL"
-rc=$?
+curl -fL --retry 4 --retry-delay 2 --connect-timeout 15 -C - -o pkg.tar.gz "$OSS_URL" &
+cpid=$!
+last=0; stall=0
+while kill -0 "$cpid" 2>/dev/null; do
+  sleep 15
+  sz=$(stat -c %s pkg.tar.gz 2>/dev/null || echo 0)
+  echo "progress size=$sz"
+  if [ "$sz" = "$last" ]; then stall=$((stall+15)); else stall=0; last=$sz; fi
+  if [ "$stall" -ge "$STALL_TIMEOUT" ]; then
+    echo "DOWNLOAD_STALLED size_unchanged=${stall}s"
+    kill "$cpid" 2>/dev/null
+    break
+  fi
+done
+wait "$cpid"; rc=$?
 echo "curl_exit=$rc"
-if [ $rc -eq 0 ]; then
+echo "curl_procs_after=$(pgrep -c -x curl || true)"   # 验尸（坑 #13：无声死亡）
+if [ "$rc" -eq 22 ]; then  # HTTP 错误（含 403）：再探一次区分链接过期
+  probe2=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -r 0-0 "$OSS_URL" || echo 000)
+  if [ "$probe2" = "403" ]; then echo "OSS_HTTP=403"; echo "ERROR_LINK_EXPIRED"; exit 10; fi
+fi
+if [ "$rc" -eq 0 ]; then
   echo "size=$(stat -c %s pkg.tar.gz)"
   echo "sha256=$(sha256sum pkg.tar.gz | awk '{print $1}')"
   echo "DOWNLOAD_OK   # 与面板基准 sha256 比对，一致才可安装"
 fi
+exit "$rc"
 '''
 
 SCRIPT_PREPARE = r'''#!/usr/bin/env bash
@@ -1857,74 +1959,11 @@ BUS = Bus()
 
 
 # ----------------------------------------------------------------------------
-# 安装包托管：PKG_DIR 自动发现 *.tar.gz，sha256 后台预算 + 缓存
+# 升级参数与包注册（pkg_registry）：OSS 签名 URL 解析 + sha256 基准缓存。
+# 签名 URL 属敏感凭据：只存在于运行期内存与设备端命令行，不进日志/DB/API 回显。
 # ----------------------------------------------------------------------------
-PKG_NAME_RE = re.compile(r"^ego-portal-(v[0-9][0-9A-Za-z.\-]+?)-(rk3588-arm64|amd64)\.tar\.gz$")
+PKG_NAME_RE = re.compile(r"ego-portal-(v[0-9][0-9A-Za-z.\-]+?)-(rk3588-arm64|amd64)\.tar\.gz")
 SAFE_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.tar\.gz$")
-_PKG_CACHE = {}          # 绝对路径 -> {mtime, size, sha256}
-_PKG_LOCK = threading.Lock()
-
-
-def _hash_file(path):
-    h = hashlib.sha256()
-    with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(1 << 22), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def _hash_pkg_async(path):
-    try:
-        digest = _hash_file(path)
-    except OSError:
-        digest = ""
-    finally:
-        with _PKG_LOCK:
-            ent = _PKG_CACHE.get(str(path))
-            if ent is not None:
-                ent["hashing"] = False
-                if digest:
-                    ent["sha256"] = digest
-
-
-def scan_packages():
-    """扫描 PKG_DIR 下的 *.tar.gz；新文件/变更文件后台预算 sha256（约 1G 需数秒）。"""
-    found = []
-    try:
-        entries = sorted(os.listdir(PKG_DIR))
-    except OSError:
-        entries = []
-    for name in entries:
-        if not name.endswith(".tar.gz") or name.startswith("."):
-            continue
-        path = os.path.join(PKG_DIR, name)
-        try:
-            st = os.stat(path)
-        except OSError:
-            continue
-        if not (st.st_mode & 0o100000):  # 不是普通文件（目录等）
-            continue
-        with _PKG_LOCK:
-            ent = _PKG_CACHE.get(path)
-            if not ent or ent["mtime"] != st.st_mtime or ent["size"] != st.st_size:
-                ent = {"mtime": st.st_mtime, "size": st.st_size, "sha256": "", "hashing": False}
-                _PKG_CACHE[path] = ent
-                need_hash = True
-            else:
-                need_hash = not ent["sha256"] and not ent.get("hashing")
-                if need_hash:
-                    ent["hashing"] = True
-        if need_hash:
-            threading.Thread(target=_hash_pkg_async, args=(path,), daemon=True).start()
-        m = PKG_NAME_RE.match(name)
-        found.append({
-            "version": m.group(1) if m else "",
-            "arch": m.group(2) if m else "",
-            "file": name, "size": st.st_size,
-            "sha256": ent["sha256"], "hash_status": "ok" if ent["sha256"] else "computing",
-            "mtime": int(st.st_mtime),
-        })
-    return found
 
 
 def _vkey(version):
@@ -1934,24 +1973,170 @@ def _vkey(version):
     return [int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4) or ""]
 
 
-def packages_view():
-    pkgs = scan_packages()
-    pkgs.sort(key=lambda p: (_vkey(p.get("version") or ""), p.get("arch") or ""))
-    return pkgs
+def _sanitize_oss_url(url):
+    """签名 URL 的展示形态：仅保留 host + 文件名（凭据全隐）。"""
+    try:
+        parts = urlsplit(url)
+        return f"{parts.scheme}://{parts.netloc}/…/{os.path.basename(parts.path)}"
+    except Exception:  # noqa: BLE001
+        return "<oss-url>"
 
 
-def all_packages_for_version(version):
-    return {p["arch"]: p for p in packages_view() if p.get("version") == version}
+def parse_oss_url(url):
+    """解析 OSS 签名 URL：文件名/版本/机型识别 + 有效期。
+
+    返回 {ok, error, error_code, filename, version, arch, expires_epoch}。
+    有效期来源：Expires（V1 签名，绝对 epoch）或 x-oss-date + x-oss-expires
+    （V4 签名，日期 + 时长秒）；均缺失时 expires_epoch=None（无法预警）。
+    """
+    url = (url or "").strip()
+    out = {"ok": False, "error": "", "error_code": "", "filename": "",
+           "version": "", "arch": "", "expires_epoch": None}
+    if not url.startswith(("http://", "https://")):
+        out["error"] = "oss_url 必须是 http(s) 链接"
+        return out
+    try:
+        parts = urlsplit(url)
+        qs = parse_qs(parts.query)
+    except ValueError:
+        out["error"] = "oss_url 无法解析"
+        return out
+    filename = os.path.basename(unquote(parts.path))
+    m = PKG_NAME_RE.search(filename)
+    if not m or not SAFE_FILENAME_RE.match(filename):
+        out["error"] = (f"无法从 URL 识别安装包（期望文件名形如 "
+                        f"ego-portal-<版本>-rk3588-arm64|amd64.tar.gz）：{_sanitize_oss_url(url)}")
+        return out
+    out["filename"] = filename
+    out["version"], out["arch"] = m.group(1), m.group(2)
+    # 有效期
+    try:
+        if qs.get("Expires"):
+            out["expires_epoch"] = int(qs["Expires"][0])
+        elif qs.get("x-oss-expires") and qs.get("x-oss-date"):
+            date = qs["x-oss-date"][0]
+            base = datetime.strptime(date, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+            out["expires_epoch"] = int(base.timestamp()) + int(qs["x-oss-expires"][0])
+    except (ValueError, OverflowError):
+        out["expires_epoch"] = None
+    out["ok"] = True
+    return out
 
 
-def _pkg_scan_loop():
-    """周期重扫：ops 直接 scp 放入目录后面板自动可见。"""
-    while True:
+# 服务端一次性拉包算哈希：同 (version,arch) 只算一次，拉完即删临时文件
+_PKG_HASH_JOBS = {}        # (version, arch) -> {status, filename, downloaded, total, error, error_code}
+_PKG_HASH_LOCK = threading.Lock()
+
+
+def start_pkg_hash(oss_url):
+    """触发服务端从 OSS 直连拉包计算 sha256（异步；不经 frp，拉完即删）。
+
+    已在注册表命中则直接返回；已在计算中则返回进行态。"""
+    meta = parse_oss_url(oss_url)
+    if not meta["ok"]:
+        return {"ok": False, "error": meta["error"], "error_code": meta["error_code"] or "bad_url"}
+    key = (meta["version"], meta["arch"])
+    hit = store.pkg_registry_get(meta["version"], meta["arch"])
+    if hit and hit.get("sha256"):
+        return {"ok": True, "status": "done", "entry": hit}
+    if meta["expires_epoch"] is not None and meta["expires_epoch"] <= time.time():
+        return {"ok": False, "error": "链接已过期，请重新生成", "error_code": "oss_expired"}
+    with _PKG_HASH_LOCK:
+        job = _PKG_HASH_JOBS.get(key)
+        if job and job["status"] == "computing":
+            return {"ok": True, "status": "computing",
+                    "version": meta["version"], "arch": meta["arch"],
+                    "filename": meta["filename"],
+                    "downloaded": job["downloaded"], "total": job["total"]}
+        _PKG_HASH_JOBS[key] = {"status": "computing", "filename": meta["filename"],
+                               "downloaded": 0, "total": 0, "error": "", "error_code": ""}
+    threading.Thread(target=_hash_pkg_from_oss, args=(oss_url, meta), daemon=True).start()
+    return {"ok": True, "status": "computing", "version": meta["version"],
+            "arch": meta["arch"], "filename": meta["filename"],
+            "downloaded": 0, "total": 0}
+
+
+def _hash_pkg_from_oss(oss_url, meta):
+    """直连 OSS 流式拉包 → 边拉边算 sha256 → 入 pkg_registry → 立即删临时文件。
+
+    服务器不存储、不分发安装包；此路径只为建立基准哈希。"""
+    key = (meta["version"], meta["arch"])
+    job = _PKG_HASH_JOBS[key]
+    digest = hashlib.sha256()
+    size = 0
+    fd, tmp_path = tempfile.mkstemp(prefix="frpmon-pkg-", suffix=".tar.gz",
+                                    dir=OSS_HASH_TMP_DIR)
+    tmp = os.fdopen(fd, "wb")
+    try:
+        request = Request(oss_url, method="GET", headers={"User-Agent": "frp-monitor-hash/1.0"})
+        with urlopen(request, timeout=60) as resp, tmp:
+            total = int(resp.headers.get("Content-Length") or 0)
+            job["total"] = total
+            deadline = time.time() + OSS_HASH_TIMEOUT
+            while True:
+                chunk = resp.read(1 << 22)
+                if not chunk:
+                    break
+                if time.time() > deadline:
+                    raise TimeoutError(f"拉包超时（>{OSS_HASH_TIMEOUT}s）")
+                tmp.write(chunk)
+                digest.update(chunk)
+                size += len(chunk)
+                job["downloaded"] = size
+        store.register_pkg(meta["version"], meta["arch"], meta["filename"],
+                           digest.hexdigest(), size)
+        job.update(status="ok", sha256=digest.hexdigest(), size=size, error="")
+        print(f"frp-monitor: pkg_registry +{meta['version']}/{meta['arch']} "
+              f"sha256={digest.hexdigest()[:16]}… size={size}（临时文件已删）", flush=True)
+        BUS.publish({"type": "pkg", "status": "ok", "version": meta["version"],
+                     "arch": meta["arch"], "filename": meta["filename"],
+                     "sha256": digest.hexdigest(), "size": size})
+    except HTTPError as exc:
+        code = "oss_expired" if exc.code == 403 else "oss_unreachable"
+        msg = "链接已过期（403），请重新生成" if exc.code == 403 else f"OSS 拉取失败: HTTP {exc.code}"
+        job.update(status="failed", error=msg, error_code=code)
+        BUS.publish({"type": "pkg", "status": "failed", "version": meta["version"],
+                     "arch": meta["arch"], "filename": meta["filename"],
+                     "error": msg, "error_code": code})
+    except (URLError, TimeoutError, OSError) as exc:
+        job.update(status="failed", error=f"OSS 拉取失败: {exc}", error_code="oss_unreachable")
+        BUS.publish({"type": "pkg", "status": "failed", "version": meta["version"],
+                     "arch": meta["arch"], "filename": meta["filename"],
+                     "error": str(exc), "error_code": "oss_unreachable"})
+    finally:
         try:
-            scan_packages()
-        except Exception:
+            os.remove(tmp_path)
+        except OSError:
             pass
-        time.sleep(60)
+
+
+def packages_registry_view():
+    """GET /api/upgrade/packages 视图：注册表命中项 + 计算中项（含进度）。"""
+    out = []
+    computing = []
+    with _PKG_HASH_LOCK:
+        for (version, arch), job in _PKG_HASH_JOBS.items():
+            if job["status"] == "ok":
+                continue  # 已入注册表：以 DB 行为准（带 first_seen）
+            entry = {"version": version, "arch": arch, "filename": job["filename"],
+                     "sha256": "", "size": None, "first_seen": None,
+                     "hash_status": job["status"],
+                     "downloaded": job.get("downloaded", 0), "total": job.get("total", 0)}
+            if job["status"] == "failed":
+                entry["error"] = job["error"]
+                entry["error_code"] = job["error_code"]
+                out.append(entry)
+            else:  # computing
+                computing.append(entry)
+    for row in store.pkg_registry_list():
+        if any(e["version"] == row["version"] and e["arch"] == row["arch"] for e in out):
+            continue
+        out.append({"version": row["version"], "arch": row["arch"],
+                    "filename": row["filename"], "sha256": row["sha256"],
+                    "size": row["size"], "first_seen": row["first_seen"],
+                    "hash_status": "ok"})
+    out.sort(key=lambda p: (_vkey(p["version"]), p["arch"]), reverse=True)
+    return out + computing
 
 
 # ----------------------------------------------------------------------------
@@ -1992,6 +2177,7 @@ class UpgradeTask:
         self.status = "queued"
         self.stage = ""
         self.error = ""
+        self.error_code = ""   # 结构化错误码（如 oss_expired），前端醒目提示用
         self.started_at = 0.0
         self.finished_at = 0.0
         self.text = ""
@@ -2020,14 +2206,16 @@ class UpgradeTask:
         self.persist(stage=stage, log=True)
         BUS.publish({"type": "task", "job_id": self.job.id, "task": self.to_dict()})
 
-    def set_status(self, status, error=None):
+    def set_status(self, status, error=None, error_code=None):
         with self.lock:
             self.status = status
             if error is not None:
                 self.error = _sanitize(str(error))[:500]
+            if error_code is not None:
+                self.error_code = str(error_code)[:32]
         BUS.publish({"type": "task", "job_id": self.job.id, "task": self.to_dict()})
 
-    def persist(self, stage=None, status=None, error=None, log=False,
+    def persist(self, stage=None, status=None, error=None, error_code=None, log=False,
                 started=False, finished=False):
         kwargs = {}
         if stage is not None:
@@ -2036,6 +2224,8 @@ class UpgradeTask:
             kwargs["status"] = status
         if error is not None:
             kwargs["error"] = error
+        if error_code is not None:
+            kwargs["error_code"] = error_code
         if log:
             with self.lock:
                 kwargs["log"] = self.text
@@ -2052,7 +2242,7 @@ class UpgradeTask:
             return {"id": self.id, "hostname": self.hostname,
                     "site": (store.roster.get(self.hostname) or {}).get("site", ""),
                     "stage": self.stage, "stage_cn": STAGE_CN.get(self.stage, self.stage),
-                    "status": self.status, "error": self.error,
+                    "status": self.status, "error": self.error, "error_code": self.error_code,
                     "started_at": self.started_at or None,
                     "finished_at": self.finished_at or None,
                     "chars": len(self.text)}
@@ -2064,6 +2254,8 @@ class UpgradeJob:
         self.kind = kind
         self.version = version
         self.params = params
+        self.filename = ""          # OSS 包文件名（脱敏摘要，签名 URL 不入库）
+        self.oss_url_expires = None  # 签名链接过期时间（epoch 秒；无则 None）
         self.status = "running"
         self.created_at = time.time()
         self.finished_at = None
@@ -2074,6 +2266,8 @@ class UpgradeJob:
         with self.lock:
             tasks = [t.to_dict() for t in self.tasks]
             out = {"id": self.id, "kind": self.kind, "version": self.version,
+                   "filename": self.filename,
+                   "oss_url_expires": self.oss_url_expires,
                    "status": self.status, "total": len(tasks),
                    "params": self.params, "created_at": self.created_at,
                    "finished_at": self.finished_at, "counts": _task_counts(tasks)}
@@ -2194,14 +2388,10 @@ def _base_dir(version):
     return f"/var/tmp/ego-{version}" if version else ""
 
 
-def _pkg_url(file):
-    return f"http://{PUBLIC_IP}:{HTTP_PORT}/packages/{file}"
-
-
 def stage_precheck(task, ctx):
     envs = {"NOW_EPOCH": str(int(time.time()))}
-    if ctx.get("file"):
-        envs["PKG_URL"] = _pkg_url(ctx["file"])
+    if ctx.get("oss_url"):
+        envs["OSS_URL"] = ctx["oss_url"]
     rc, out = push_script(task, SCRIPT_PRECHECK, envs, timeout=180)
     if rc != 0:
         task.set_status("failed", "预检 SSH 失败（设备不可达或凭据失效）")
@@ -2217,8 +2407,13 @@ def stage_precheck(task, ctx):
                 clock_warn = drift
                 task.log(f"[panel] 预检告警：设备时钟偏差 {drift}s（>5min），"
                          f"apt 可能失败，建议先修复时间同步再升级（SOP 坑 #10）")
-        elif line.startswith("### pkg-url:") and "http=206" not in line and "http=200" not in line:
-            task.log(f"[panel] 预检告警：设备无法连通面板包地址（{line.strip()}），下载阶段可能失败")
+        elif line.startswith("### OSS:"):
+            if "http=403" in line:
+                task.set_status("failed", "OSS 链接已过期（403），请重新生成签名 URL 后新建任务",
+                                error_code="oss_expired")
+                return False
+            if "http=206" not in line and "http=200" not in line:
+                task.log(f"[panel] 预检告警：设备无法连通 OSS（{line.strip()}），下载阶段可能失败")
     if clock_warn is None:
         task.log("[panel] 时钟偏差正常（≤5min）")
     # 活跃采集会话（非 [] = 禁止升级）；check-skipped = 采集库不可读，放行
@@ -2240,20 +2435,33 @@ def stage_precheck(task, ctx):
 
 
 def stage_download(task, ctx):
-    if not ctx.get("file") or not ctx.get("sha256"):
-        task.set_status("failed", "缺少安装包或 sha256 基准，无法下载")
+    """设备直连 OSS 下载；403（链接过期）与停滞看门狗为结构化错误。"""
+    if not ctx.get("oss_url") or not ctx.get("sha256"):
+        task.set_status("failed", "缺少 OSS 链接或 sha256 基准，无法下载")
         return False
-    envs = {"PKG_URL": _pkg_url(ctx["file"]), "PKG_VERSION": ctx["version"]}
+    envs = {"OSS_URL": ctx["oss_url"], "PKG_VERSION": ctx["version"],
+            "STALL_TIMEOUT": str(ctx.get("stall_timeout") or DOWNLOAD_STALL_TIMEOUT)}
     rc, out = push_script(task, SCRIPT_DOWNLOAD, envs, timeout=3600)
+    if "ERROR_LINK_EXPIRED" in out or "OSS_HTTP=403" in out:
+        task.set_status("failed", "OSS 链接已过期（403），请重新生成签名 URL 后新建任务",
+                        error_code="oss_expired")
+        return False
+    if "DOWNLOAD_STALLED" in out:
+        procs = next((l for l in out.splitlines() if l.startswith("curl_procs_after=")), "")
+        task.set_status("failed", f"下载停滞（size 长时间不变，已终止；{procs}），"
+                                  f"可重试续传或检查设备网络（SOP 坑 #13）",
+                        error_code="download_stalled")
+        return False
     if rc != 0 or "DOWNLOAD_OK" not in out:
         task.set_status("failed", "下载失败（curl 未完成，详见日志）")
         return False
     got = next((l.split("=", 1)[1].strip() for l in out.splitlines()
                 if l.startswith("sha256=")), "")
     if got != ctx["sha256"]:
-        task.set_status("failed", f"sha256 不一致：设备端 {got[:16]}… ≠ 面板基准 {ctx['sha256'][:16]}…，已终止")
+        task.set_status("failed", f"sha256 不一致：设备端 {got[:16]}… ≠ 基准 {ctx['sha256'][:16]}…，已终止",
+                        error_code="sha_mismatch")
         return False
-    task.log("[panel] 下载完成且 sha256 与面板基准一致")
+    task.log("[panel] 下载完成且 sha256 与基准一致")
     return True
 
 
@@ -2408,7 +2616,8 @@ def _run_upgrade_task(task):
         task.set_status("failed", f"任务异常: {exc!r}")
     finally:
         task.finished_at = time.time()
-        task.persist(status=task.status, error=task.error or None, log=True, finished=True)
+        task.persist(status=task.status, error=task.error or None,
+                     error_code=task.error_code or None, log=True, finished=True)
         BUS.publish({"type": "task", "job_id": task.job.id, "task": task.to_dict()})
         task.job.check_done()
 
@@ -2436,7 +2645,11 @@ def _resolve_device(hostname):
 
 
 def create_upgrade_job(kind, devices, params):
-    """创建升级任务；返回 {ok, job_id, total, skipped:[{hostname, reason}]} 或 {ok:False, error}。"""
+    """创建升级任务（OSS 签名链接分发）。
+
+    返回 {ok, job_id, total, skipped, expires_at, warnings} 或
+    {ok:False, error, error_code?}；链接过期返回 error_code=oss_expired。
+    完整 oss_url 只进运行期内存（ctx），DB 仅存文件名 + 过期时间。"""
     if kind not in UPGRADE_KINDS:
         return {"ok": False, "error": f"未知操作类型: {kind}（可选 {sorted(UPGRADE_KINDS)}）"}
     if not DEPLOY_PW:
@@ -2446,15 +2659,50 @@ def create_upgrade_job(kind, devices, params):
     devices = [h for h in devices if not (h in seen or seen.add(h))]
     if not devices:
         return {"ok": False, "error": "未指定设备"}
-    version = str((params or {}).get("version") or "").strip()
+    params = params or {}
+    version = str(params.get("version") or "").strip()
+    oss_url = str(params.get("oss_url") or "").strip()
+    manual_sha = str(params.get("sha256") or "").strip().lower()
     needs_pkg = kind in ("download", "prepare", "install", "upgrade")
-    if needs_pkg and not version:
-        return {"ok": False, "error": f"{kind} 需要目标版本 version"}
-    pkgs = all_packages_for_version(version) if version else {}
-    if needs_pkg and not pkgs:
-        return {"ok": False, "error": f"版本 {version} 的安装包不存在（先上传或 scp 到 {PKG_DIR}）"}
-    if needs_pkg and any(p["hash_status"] != "ok" for p in pkgs.values()):
-        return {"ok": False, "error": f"版本 {version} 的安装包 sha256 尚未就绪，稍后重试"}
+    warnings = []
+    meta = None
+    sha256 = ""
+    arch_from_url = ""
+    expires_at = None
+    if oss_url:
+        meta = parse_oss_url(oss_url)
+        if not meta["ok"]:
+            return {"ok": False, "error": meta["error"], "error_code": "bad_url"}
+        if needs_pkg:
+            # URL 识别出的版本/机型是权威：与手填 version 冲突时以 URL 为准并提示
+            if version and version != meta["version"]:
+                warnings.append(f"手填版本 {version} 与 URL 识别 {meta['version']} 不一致，已按 URL 为准")
+            version = meta["version"]
+            arch_from_url = meta["arch"]
+        expires_at = meta["expires_epoch"]
+    if needs_pkg:
+        if not version:
+            return {"ok": False, "error": f"{kind} 需要目标版本（从 oss_url 自动识别或手填 version）"}
+        if not oss_url:
+            return {"ok": False, "error": f"{kind} 需要 oss_url（OSS 签名链接，设备直连下载）"}
+        # sha256 基准：手填 > 注册表命中；都没有则拒绝并提示先触发计算
+        hit = store.pkg_registry_get(version, arch_from_url)
+        sha256 = manual_sha or (hit or {}).get("sha256", "")
+        if manual_sha and hit and manual_sha != hit["sha256"]:
+            warnings.append("手填 sha256 与注册表不一致，已按手填值执行")
+        if not sha256:
+            return {"ok": False, "error": f"版本 {version}/{arch_from_url} 无 sha256 基准："
+                                            f"请先触发服务端计算（POST /api/upgrade/packages/hash）"
+                                            f"或手填 params.sha256",
+                    "error_code": "sha_missing"}
+        # 链接有效期校验（解析不到有效期时只提示不阻断）
+        if expires_at is None:
+            warnings.append("OSS 链接未解析出有效期（Expires/x-oss-expires），无法预警过期")
+        else:
+            remaining = expires_at - time.time()
+            if remaining <= 0:
+                return {"ok": False, "error": "OSS 链接已过期，请重新生成签名 URL",
+                        "error_code": "oss_expired"}
     # 解析每台设备（端口/机型/占用），逐台给出跳过原因
     try:
         hosts, _ = get_snapshot()
@@ -2474,37 +2722,55 @@ def create_upgrade_job(kind, devices, params):
         if error:
             skipped.append({"hostname": hostname, "reason": error})
             continue
-        if needs_pkg and arch not in pkgs:
+        if needs_pkg and arch_from_url and arch != arch_from_url:
             skipped.append({"hostname": hostname,
-                            "reason": f"版本 {version} 缺少 {arch}（{'amd64' if arch == 'rk3588-arm64' else 'rk3588-arm64'}）机型安装包"})
+                            "reason": f"设备机型 {arch} 与链接机型 {arch_from_url} 不符，请使用对应机型的签名 URL"})
             continue
         resolved.append((hostname, ssh_port, arch))
     if not resolved:
         return {"ok": False, "error": "没有可执行的设备", "skipped": skipped}
-    # 建任务（job + 每台一个子任务）
+    # 批量时长预警：单台全流程 6~12 分钟，按并行度估算总窗口（SOP §3）
+    if expires_at is not None:
+        batches = max(1, -(-len(resolved) // UPGRADE_MAX_PARALLEL))
+        estimate = batches * 12 * 60  # 单台按 12 分钟上限估算
+        remaining = expires_at - time.time()
+        if remaining < estimate:
+            warnings.append(f"链接剩余 {int(remaining // 60)} 分钟，低于预估批量时长 "
+                            f"{int(estimate // 60)} 分钟（{len(resolved)} 台 ÷ {UPGRADE_MAX_PARALLEL} 并行 × ≤12min/台），"
+                            f"建议重新生成链接")
+    # 建任务（job + 每台一个子任务）；params 入库快照不含 oss_url
     first_id, _ = _next_upgrade_ids(1 + len(resolved))
     job_id = first_id
-    job = UpgradeJob(job_id, kind, version, {k: v for k, v in (params or {}).items()
-                                             if k in ("version", "old_tag", "install_timeout", "pkg_src")})
+    snap_params = {k: v for k, v in params.items()
+                   if k in ("version", "sha256", "old_tag", "install_timeout", "pkg_src")}
+    snap_params["version"] = version
+    job = UpgradeJob(job_id, kind, version, snap_params)
+    job.filename = meta["filename"] if meta else ""
+    job.oss_url_expires = expires_at
     with UPGRADES_LOCK:
         UPGRADES[job_id] = job
     store.create_upgrade_job(job_id, kind, version,
-                             json.dumps(job.params, ensure_ascii=False), len(resolved), datetime.now())
+                             json.dumps(snap_params, ensure_ascii=False), len(resolved), datetime.now(),
+                             filename=job.filename,
+                             oss_url_expires=(datetime.fromtimestamp(expires_at)
+                                              if expires_at else None))
     for i, (hostname, ssh_port, arch) in enumerate(resolved):
         task_id = first_id + 1 + i
-        pkg = pkgs.get(arch) or {}
-        ctx = {"version": version, "arch": arch, "file": pkg.get("file", ""),
-               "sha256": pkg.get("sha256", ""),
-               "old_tag": str((params or {}).get("old_tag") or ""),
-               "install_timeout": (params or {}).get("install_timeout") or INSTALL_TIMEOUT,
-               "pkg_src": str((params or {}).get("pkg_src") or "")}
+        ctx = {"version": version, "arch": arch,
+               "filename": meta["filename"] if meta else "",
+               "sha256": sha256, "oss_url": oss_url,
+               "old_tag": str(params.get("old_tag") or ""),
+               "install_timeout": params.get("install_timeout") or INSTALL_TIMEOUT,
+               "pkg_src": str(params.get("pkg_src") or ""),
+               "stall_timeout": params.get("stall_timeout") or DOWNLOAD_STALL_TIMEOUT}
         task = UpgradeTask(task_id, job, hostname, ssh_port, ctx)
         with job.lock:
             job.tasks.append(task)
         store.create_upgrade_task(task_id, job_id, hostname, ssh_port)
         UPGRADE_POOL.submit(_run_upgrade_task, task)
     BUS.publish({"type": "job", "job": job.to_dict()})
-    return {"ok": True, "job_id": job_id, "total": len(resolved), "skipped": skipped}
+    return {"ok": True, "job_id": job_id, "total": len(resolved), "skipped": skipped,
+            "expires_at": expires_at, "warnings": warnings}
 
 
 def upgrade_job_view(job_id):
@@ -2690,70 +2956,6 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
-    # -- 安装包下载（设备 curl 用：免面板认证，支持 Range 续传） ---------------
-    def _serve_package(self, head_only=False):
-        """GET/HEAD /packages/<filename>：免认证（设备无法携带凭据）。"""
-        name = unquote(urlsplit(self.path).path[len("/packages/"):]).strip("/")
-        if not name or "/" in name or "\\" in name or name.startswith(".") or ".." in name:
-            return self.send_json(400, {"error": "invalid filename"})
-        path = os.path.join(PKG_DIR, name)
-        try:
-            st = os.stat(path)
-            if not (st.st_mode & 0o100000):
-                raise OSError
-        except OSError:
-            return self.send_json(404, {"error": "package not found", "file": name})
-        size = st.st_size
-        start, end = 0, size - 1
-        status = 200
-        range_header = self.headers.get("Range") or ""
-        if range_header.startswith("bytes="):
-            spec = range_header[6:].split(",")[0].strip()
-            m = re.match(r"^(\d*)-(\d*)$", spec)
-            if m and (m.group(1) or m.group(2)):
-                if m.group(1):
-                    start = int(m.group(1))
-                    if m.group(2):
-                        end = min(int(m.group(2)), size - 1)
-                else:
-                    start = max(0, size - int(m.group(2)))  # 后 N 字节
-                    end = size - 1
-                if start > size - 1 or start > end:
-                    self.send_response(416)
-                    self.send_header("Content-Range", f"bytes */{size}")
-                    self.end_headers()
-                    return
-                status = 206
-        length = end - start + 1
-        self.send_response(status)
-        self.send_header("Content-Type", "application/gzip")
-        self.send_header("Content-Length", str(length))
-        self.send_header("Accept-Ranges", "bytes")
-        if status == 206:
-            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        if head_only:
-            return
-        try:
-            with open(path, "rb") as fh:
-                fh.seek(start)
-                remaining = length
-                while remaining > 0:
-                    chunk = fh.read(min(1 << 20, remaining))
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-                    remaining -= len(chunk)
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-            pass
-
-    def do_HEAD(self):
-        path = urlsplit(self.path).path
-        if path.startswith("/packages/"):
-            return self._serve_package(head_only=True)
-        self.send_error(404)
-
     def send_json(self, status, data):
         body = json.dumps(data, ensure_ascii=False).encode()
         self.send_response(status)
@@ -2787,185 +2989,14 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         return json.loads(self.rfile.read(n) or b"{}")
 
-    def _upload_package(self):
-        """POST /api/packages/upload：流式落盘 + 边写边算 sha256。
-
-        两种载荷：multipart/form-data（浏览器 FormData，字段 file，文件名取自
-        Content-Disposition）或原始字节流 + ?name=<filename>（curl 直传）。"""
-        ctype = (self.headers.get("Content-Type") or "").strip()
-        if ctype.lower().startswith("multipart/form-data"):
-            return self._upload_package_multipart(ctype)
-        qs = parse_qs(urlsplit(self.path).query)
-        name = (qs.get("name", [""])[0] or self.headers.get("X-Filename") or "").strip()
-        if not name or "/" in name or "\\" in name or ".." in name or not SAFE_FILENAME_RE.match(name):
-            return self.send_json(400, {"ok": False, "error": "非法文件名（仅允许 *.tar.gz，且不含路径）"})
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            length = 0
-        if length <= 0:
-            self.send_response(411)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(b'{"ok": false, "error": "missing Content-Length"}')
-            return
-        try:
-            os.makedirs(PKG_DIR, exist_ok=True)
-        except OSError as exc:
-            return self.send_json(500, {"ok": False, "error": f"无法创建包目录: {exc}"})
-        final = os.path.join(PKG_DIR, name)
-        tmp = final + ".uploading"
-        digest = hashlib.sha256()
-        written = 0
-        try:
-            with open(tmp, "wb") as fh:
-                remaining = length
-                while remaining > 0:
-                    chunk = self.rfile.read(min(1 << 20, remaining))
-                    if not chunk:
-                        break
-                    fh.write(chunk)
-                    digest.update(chunk)
-                    written += len(chunk)
-                    remaining -= len(chunk)
-            if written != length:
-                os.remove(tmp)
-                return self.send_json(400, {"ok": False, "error": f"上传不完整（{written}/{length} 字节）"})
-            os.replace(tmp, final)
-        except OSError as exc:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-            return self.send_json(500, {"ok": False, "error": str(exc)})
-        self._register_uploaded(final, digest.hexdigest())
-
-    def _upload_package_multipart(self, ctype):
-        """流式解析 multipart/form-data（单文件字段）：只留最后一个 part 的
-        正文落盘，哈希不含 multipart 边界字节。"""
-        m = re.search(r'boundary="?([^";]+)"?', ctype)
-        if not m:
-            return self.send_json(400, {"ok": False, "error": "multipart 缺少 boundary"})
-        boundary = ("--" + m.group(1)).encode()
-        hold = len(boundary) + 8  # 尾部滞留窗口，防把边界字节写进文件
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            length = 0
-        if length <= 0:
-            return self.send_json(411, {"ok": False, "error": "missing Content-Length"})
-        try:
-            os.makedirs(PKG_DIR, exist_ok=True)
-        except OSError as exc:
-            return self.send_json(500, {"ok": False, "error": f"无法创建包目录: {exc}"})
-        tmp = None
-        out = None
-        digest = hashlib.sha256()
-        written = 0
-        complete = False
-        try:
-            remaining = length
-            buf = b""
-            state = "preamble"   # preamble -> headers -> body
-            while remaining > 0 or (state == "body" and buf):
-                if remaining > 0:
-                    chunk = self.rfile.read(min(1 << 20, remaining))
-                    if not chunk:
-                        break  # 连接中断：保持 complete=False，走失败清理
-                    remaining -= len(chunk)
-                    buf += chunk
-                if state == "preamble":
-                    i = buf.find(boundary)
-                    if i < 0:
-                        buf = buf[-(len(boundary) + 4):] if len(buf) > len(boundary) + 4 else buf
-                        continue
-                    buf = buf[i + len(boundary):]
-                    state = "headers"
-                if state == "headers":
-                    i = buf.find(b"\r\n\r\n")
-                    if i < 0:
-                        continue
-                    header_block = buf[:i].decode("utf-8", "replace")
-                    buf = buf[i + 4:]
-                    md = re.search(r'filename="([^"]+)"', header_block)
-                    name = (md.group(1) if md else "").strip()
-                    if not name or "/" in name or "\\" in name or ".." in name \
-                            or not SAFE_FILENAME_RE.match(name):
-                        return self.send_json(400, {"ok": False,
-                                                    "error": "非法文件名（仅允许 *.tar.gz，且不含路径）"})
-                    tmp = os.path.join(PKG_DIR, name + ".uploading")
-                    out = open(tmp, "wb")
-                    state = "body"
-                if state == "body":
-                    # 滞留尾部，防把结束边界字节写进文件
-                    flush_upto = max(0, len(buf) - hold)
-                    if flush_upto:
-                        out.write(buf[:flush_upto])
-                        digest.update(buf[:flush_upto])
-                        written += flush_upto
-                        buf = buf[flush_upto:]
-                    if remaining <= 0:
-                        # 全部读完后，从尾部滞留里剥掉结束边界 \r\n--boundary…
-                        j = buf.find(b"\r\n" + boundary)
-                        body_tail = buf[:j] if j >= 0 else buf
-                        out.write(body_tail)
-                        digest.update(body_tail)
-                        written += len(body_tail)
-                        buf = b""
-                        complete = j >= 0
-                        break
-            if not complete:
-                if out is not None:
-                    out.close()
-                    out = None
-                if tmp:
-                    try:
-                        os.remove(tmp)
-                    except OSError:
-                        pass
-                return self.send_json(400, {"ok": False, "error": "multipart 上传不完整或缺少结束边界"})
-            if out is None or written == 0:
-                return self.send_json(400, {"ok": False, "error": "multipart 中未找到文件内容"})
-            out.close()
-            out = None
-            final = tmp[:-len(".uploading")]
-            os.replace(tmp, final)
-        except OSError as exc:
-            if out is not None:
-                out.close()
-            if tmp:
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
-            return self.send_json(500, {"ok": False, "error": str(exc)})
-        self._register_uploaded(final, digest.hexdigest())
-
-    def _register_uploaded(self, final, sha256_hex):
-        """上传完成：哈希直接入缓存（免后台重算）+ 返回包信息。"""
-        name = os.path.basename(final)
-        st = os.stat(final)
-        with _PKG_LOCK:
-            _PKG_CACHE[final] = {"mtime": st.st_mtime, "size": st.st_size,
-                                 "sha256": sha256_hex, "hashing": False}
-        m = PKG_NAME_RE.match(name)
-        self.send_json(200, {"ok": True, "file": name, "size": st.st_size,
-                             "sha256": sha256_hex,
-                             "version": m.group(1) if m else "", "arch": m.group(2) if m else ""})
-
     def do_GET(self):
-        path = urlsplit(self.path).path
-        if path.startswith("/packages/"):
-            # 设备下载专用：免面板认证（设备 curl 无法携带凭据）
-            return self._serve_package()
         if not self._authorized():
             self.send_unauthorized()
             return
-        if path == "/api/packages":
-            pkgs = packages_view()
-            for p in pkgs:
-                p["url"] = f"/packages/{p['file']}"
-            self.send_json(200, {"dir": PKG_DIR, "count": len(pkgs), "packages": pkgs})
+        path = urlsplit(self.path).path
+        if path == "/api/upgrade/packages":
+            # 包注册表（sha256 基准缓存）+ 计算中项（含进度）；不含签名 URL
+            self.send_json(200, {"packages": packages_registry_view()})
             return
         if path == "/api/upgrade/jobs":
             qs = parse_qs(urlsplit(self.path).query)
@@ -3205,14 +3236,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlsplit(self.path).path
-        if path == "/api/packages/upload":
-            if not self._authorized():
-                self.send_unauthorized()
-                return
-            return self._upload_package()
         if not self._authorized():
             self.send_unauthorized()
             return
+        if path == "/api/upgrade/packages/hash":
+            # 触发服务端从 OSS 直连拉包计算 sha256（异步，拉完即删临时文件）
+            try:
+                req = self._json_body()
+            except json.JSONDecodeError:
+                return self.send_json(400, {"ok": False, "error": "bad json"})
+            out = start_pkg_hash(str(req.get("oss_url") or ""))
+            code = 200 if out.get("ok") else 400
+            return self.send_json(code, out)
         if path == "/api/upgrade/jobs":
             try:
                 req = self._json_body()
@@ -3241,7 +3276,7 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     # 目录就绪（已存在则无副作用；无权限时不阻塞启动）
-    for _d in (PKG_DIR, BACKUP_DIR, os.path.dirname(SSH_KNOWN_HOSTS)):
+    for _d in (BACKUP_DIR, os.path.dirname(SSH_KNOWN_HOSTS), OSS_HASH_TMP_DIR):
         try:
             os.makedirs(_d, exist_ok=True)
         except OSError:
@@ -3259,11 +3294,10 @@ if __name__ == "__main__":
               "请在 /etc/frp-monitor.env 配置后重启", flush=True)
     threading.Thread(target=_refresh_loop, name="snapshot-refresher", daemon=True).start()
     threading.Thread(target=_collect_duration_loop, name="collect-duration-puller", daemon=True).start()
-    threading.Thread(target=_pkg_scan_loop, name="package-scanner", daemon=True).start()
     threading.Thread(target=_maintenance_loop, name="daily-maintenance", daemon=True).start()
-    print(f"frp-monitor: serving on :{HTTP_PORT} (pkg_dir={PKG_DIR}, "
+    print(f"frp-monitor: serving on :{HTTP_PORT} (oss-signed-url distribution, "
           f"upgrade_parallel={UPGRADE_MAX_PARALLEL}, retention={RETENTION_DAYS}d, "
-          f"backup={BACKUP_DIR} keep {BACKUP_KEEP}, download_base=http://{PUBLIC_IP}:{HTTP_PORT})",
+          f"backup={BACKUP_DIR} keep {BACKUP_KEEP})",
           flush=True)
     httpd = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), Handler)
     httpd.daemon_threads = True  # SSE 长连接随主进程退出，不阻塞重启
