@@ -53,7 +53,12 @@ SNAPSHOT_EVERY = float(os.getenv("FRP_MONITOR_SNAPSHOT_EVERY", "300"))
 PANEL_USER = os.getenv("FRP_MONITOR_PANEL_USER", "")
 PANEL_PASSWORD = os.getenv("FRP_MONITOR_PANEL_PASSWORD", "")
 SSH_JUMP = os.getenv("FRP_MONITOR_SSH_JUMP", "ubuntu@124.222.147.63")
-SSH_DEVICE_USER = os.getenv("FRP_MONITOR_SSH_DEVICE_USER", "orangepi")
+# 设备 SSH 用户名按机型区分（2026-10-16）：arm（V1/rk3588 等）→ orangepi，
+# amd64（V0/Intel）→ archebase。FRP_MONITOR_SSH_DEVICE_USER 非空时作为全局
+# 覆盖保留（兼容旧配置），优先级：全局覆盖 > 按机型解析。
+SSH_DEVICE_USER = os.getenv("FRP_MONITOR_SSH_DEVICE_USER", "")
+SSH_USER_ARM = os.getenv("FRP_MONITOR_SSH_USER_ARM", "orangepi")
+SSH_USER_AMD = os.getenv("FRP_MONITOR_SSH_USER_AMD", "archebase")
 
 # --- 设备采集时长（collect duration）-----------------------------------------
 # 每天这些服务器本地时间点各拉一次在线设备的当日采集时长；参数化便于自测，
@@ -113,6 +118,22 @@ def device_type(hostname):
     if name in V1_HOSTS:
         return "EGO-Stereo-V1"
     return "未知"
+
+
+def _ssh_user_for_arch(arch):
+    """设备 SSH 用户名按机型解析：arm（rk3588-arm64）→ orangepi，amd64/其他 → archebase。
+
+    FRP_MONITOR_SSH_DEVICE_USER 非空时全局覆盖（兼容旧配置），优先级最高。"""
+    if SSH_DEVICE_USER:
+        return SSH_DEVICE_USER
+    return SSH_USER_ARM if arch == "rk3588-arm64" else SSH_USER_AMD
+
+
+def ssh_user_for_device(hardware="", hw_model=""):
+    """按设备解析 SSH 用户名：hardware 字段（V0/V1）优先，回退 hw_model 型号识别。"""
+    hw = (hardware or "").strip() or _hardware_category(hw_model or "")
+    arch = ARCH_BY_HW.get(hw) or ARCH_BY_HW.get(hw.casefold() if hw else "")
+    return _ssh_user_for_arch(arch)
 
 INDEX = """<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>EGO 设备面板</title><style>{css}</style></head><body><main>
 <header><div><h1>EGO 设备面板</h1><p id=sub>正在加载…</p></div><button id=refresh>立即刷新</button></header>
@@ -337,7 +358,7 @@ $('#copyPending').onclick=async()=>{
 $('#copyCmds').onclick=async()=>{
   const hint=sshHint||{},jump=hint.jump||'ubuntu@124.222.147.63',user=hint.user||'orangepi';
   const rows=filtered().filter(f=>!f.retired&&f.ssh_port);
-  const text=rows.map(f=>`ssh -J ${jump} -p ${f.ssh_port} ${user}@127.0.0.1  # ${f.hostname.toUpperCase()}${f.site?' ('+f.site+')':''}`).join('\\n');
+  const text=rows.map(f=>`ssh -J ${jump} -p ${f.ssh_port} ${f.ssh_user||user}@127.0.0.1  # ${f.hostname.toUpperCase()}${f.site?' ('+f.site+')':''}`).join('\\n');
   await copyBtn($('#copyCmds'),rows.length?text:'','复制跳板命令',`已复制 ${rows.length} 台 ✓`);
 };
 $('#copyList').onclick=async()=>{
@@ -1778,6 +1799,7 @@ def _collect_duration_loop():
 # 分发通道（设计变更 2026-10-14）：设备直连 OSS 签名 URL 下载，不经服务器。
 # 与源文件的差异：
 #   precheck.sh  —— 增加 NOW_EPOCH 时钟偏差检查（SOP 坑 #10：>5min 预检告警）；
+#                   +PKG_HOME/PKG_ARCH 按机型适配家目录兜底路径（amd64→/home/archebase）；
 #                   其余与源文件一致（OSS_URL 连通性探测保留）
 #   download.sh  —— 设备直连 OSS 下载，在源文件基础上增加：403 预探（链接过期
 #                   明确报 OSS_HTTP=403）+ 下载停滞看门狗（size 持续不变杀 curl
@@ -1789,7 +1811,8 @@ def _collect_duration_loop():
 SCRIPT_PRECHECK = r'''#!/usr/bin/env bash
 # [内嵌自 update/scripts/precheck.sh · 2026-10-15；差异：+NOW_EPOCH 时钟检查]
 # 设备端升级前预检（经 FRP SSH 推送执行）。可选环境变量：
-#   OSS_URL（OSS 签名链接连通性探测）、NOW_EPOCH（面板 epoch，时钟偏差告警）
+#   OSS_URL（OSS 签名链接连通性探测）、NOW_EPOCH（面板 epoch，时钟偏差告警）、
+#   PKG_HOME/PKG_ARCH（家目录兜底路径按机型适配，默认 /home/orangepi + rk3588-arm64）
 set -u
 echo "### host=$(hostname) arch=$(uname -m) date=$(date -u +%FT%TZ)"
 pw=${DEPLOY_PW:-}
@@ -1806,7 +1829,7 @@ if [ -n "${NOW_EPOCH:-}" ]; then
   echo "### clock-drift: ${drift}s"
 fi
 echo "### pkg:"
-for p in "${PKG_SRC:-}" /home/orangepi/ego-portal-*-rk3588-arm64.tar.gz /var/tmp/ego-*/pkg.tar.gz; do
+for p in "${PKG_SRC:-}" "${PKG_HOME:-/home/orangepi}"/ego-portal-*-"${PKG_ARCH:-rk3588-arm64}".tar.gz /var/tmp/ego-*/pkg.tar.gz; do
   [ -f "$p" ] && echo "found: $p size=$(stat -c %s "$p")"
 done 2>/dev/null | sort -u
 [ -n "${OSS_URL:-}" ] && { echo -n "### OSS: "; curl -s -o /dev/null -w 'http=%{http_code}\n' --max-time 20 -r 0-0 "$OSS_URL" || echo FAIL; }
@@ -2206,6 +2229,8 @@ class UpgradeTask:
         self.hostname = hostname
         self.ssh_port = ssh_port
         self.ctx = ctx
+        # SSH 用户名按机型解析（amd64→archebase / arm→orangepi，环境变量可覆盖）
+        self.ssh_user = _ssh_user_for_arch((ctx or {}).get("arch") or "")
         self.status = "queued"
         self.stage = ""
         self.error = ""
@@ -2346,15 +2371,16 @@ def device_busy(hostname):
     return None
 
 
-def _ssh_argv(port, remote_cmd):
-    """frp-monitor 与 frps 同机：设备代理绑定本机 127.0.0.1:<port>，直连不走跳板。"""
+def _ssh_argv(port, user, remote_cmd):
+    """frp-monitor 与 frps 同机：设备代理绑定本机 127.0.0.1:<port>，直连不走跳板。
+    user 按设备机型解析（amd64→archebase / arm→orangepi）。"""
     return ["sshpass", "-e", "ssh",
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", f"UserKnownHostsFile={SSH_KNOWN_HOSTS}",
             "-o", "ConnectTimeout=15",
             "-o", "ServerAliveInterval=15",
             "-o", "NumberOfPasswordPrompts=1",
-            "-p", str(int(port)), f"{SSH_DEVICE_USER}@127.0.0.1", remote_cmd]
+            "-p", str(int(port)), f"{user}@127.0.0.1", remote_cmd]
 
 
 def run_remote(task, remote_cmd, timeout=60, stdin_data=None, retries=2, log=True):
@@ -2367,7 +2393,7 @@ def run_remote(task, remote_cmd, timeout=60, stdin_data=None, retries=2, log=Tru
     for attempt in range(retries + 1):
         try:
             proc = subprocess.Popen(
-                _ssh_argv(task.ssh_port, remote_cmd), env=env,
+                _ssh_argv(task.ssh_port, task.ssh_user, remote_cmd), env=env,
                 stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                 errors="replace")
@@ -2421,7 +2447,9 @@ def _base_dir(version):
 
 
 def stage_precheck(task, ctx):
-    envs = {"NOW_EPOCH": str(int(time.time()))}
+    envs = {"NOW_EPOCH": str(int(time.time())),
+            "PKG_HOME": f"/home/{task.ssh_user}",
+            "PKG_ARCH": ctx.get("arch") or "rk3588-arm64"}
     if ctx.get("oss_url"):
         envs["OSS_URL"] = ctx["oss_url"]
     rc, out = push_script(task, SCRIPT_PRECHECK, envs, timeout=180)
@@ -3087,10 +3115,12 @@ class Handler(BaseHTTPRequestHandler):
                     for d in store.devices_view():
                         snap = by_name.get(d["hostname"])
                         online = snap is not None
+                        hw = d["hardware"] or _hardware_category(d["hw_model"] or "")
                         fleet.append({
                             "hostname": d["hostname"], "site": d["site"], "owner": d["owner"],
-                            "hardware": d["hardware"] or _hardware_category(d["hw_model"] or ""), "retired": d["retired"],
+                            "hardware": hw, "retired": d["retired"],
                             "hw_model": ((snap.get("device") or {}).get("hw_model") if snap else "") or d["hw_model"] or "",
+                            "ssh_user": ssh_user_for_device(hw, d["hw_model"] or ""),
                             "ip": ((snap.get("device") or {}).get("ip") if snap else "") or d["ip"] or "",
                             "device_id": d["device_id"], "device_name": d["device_name"],
                             "online": online, "first_seen": d["first_seen"], "last_seen": d["last_seen"],
@@ -3114,6 +3144,7 @@ class Handler(BaseHTTPRequestHandler):
                               "retired": False, "device_id": (h.get("device") or {}).get("device_id", ""),
                               "device_name": (h.get("device") or {}).get("device_name", ""), "online": True,
                               "hw_model": (h.get("device") or {}).get("hw_model", ""),
+                              "ssh_user": ssh_user_for_device("", (h.get("device") or {}).get("hw_model") or ""),
                               "ip": (h.get("device") or {}).get("ip", ""),
                               "first_seen": "", "last_seen": "", "version": h.get("version", ""),
                               "version_error": h.get("version_error", ""), "ssh_port": h.get("port"),
@@ -3148,7 +3179,7 @@ class Handler(BaseHTTPRequestHandler):
                     "fleet": fleet, "registered": len(fleet), "roster_enabled": store.enabled,
                     "versions": ordered,
                     "sites": sorted(sites.values(), key=lambda s: -s["expected"]),
-                    "ssh_hint": {"jump": SSH_JUMP, "user": SSH_DEVICE_USER},
+                    "ssh_hint": {"jump": SSH_JUMP, "user": SSH_DEVICE_USER or SSH_USER_ARM},
                 })
             except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
                 self.send_json(502, {"timestamp": time.time(), "error": str(exc), "total": 0, "online": 0, "hosts": []})
@@ -3171,9 +3202,14 @@ class Handler(BaseHTTPRequestHandler):
                                      "ip": snap_device.get("ip", ""),
                                      "release_version": snap.get("version", ""), "events": [], "status": [],
                                      "ssh_port": snap.get("port"), "web_port": snap.get("web_port"),
-                                     "first_seen": "", "last_seen": ""})
+                                     "first_seen": "", "last_seen": "",
+                                     "ssh_hint": {"jump": SSH_JUMP,
+                                                  "user": ssh_user_for_device("", snap_device.get("hw_model") or "")}})
             else:
-                self.send_json(200, {**detail, "ssh_hint": {"jump": SSH_JUMP, "user": SSH_DEVICE_USER}})
+                self.send_json(200, {**detail, "ssh_hint": {
+                    "jump": SSH_JUMP,
+                    "user": ssh_user_for_device(detail.get("hardware") or "",
+                                                detail.get("hw_model") or "")}})
             return
         if path.startswith("/api/hosts/") and path.endswith("/version"):
             hostname = unquote(path[len("/api/hosts/"):-len("/version")]).strip("/")
