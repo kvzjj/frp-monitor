@@ -210,6 +210,7 @@ CSS = """*{box-sizing:border-box}body{margin:0;background:#f4f7fb;color:#172033;
 .wfixbar button:hover:not(:disabled){background:#b91c1c}
 .wfixbar button.arm{background:#b45309}
 .wfixbar button.arm:hover:not(:disabled){background:#92400e}
+.wfixbar button.err{background:#475569;color:#fff;cursor:default;overflow:hidden;text-overflow:ellipsis;max-width:100%}
 @media(max-width:640px){.vrows{grid-template-columns:1fr}.ucardgrid{grid-template-columns:1fr}.stepper{flex-wrap:wrap}.step{flex:1 1 30%}.prow label{width:auto;text-align:left}.pmeta{margin-left:0}}"""
 JS = """const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
@@ -226,7 +227,7 @@ function fmtDuration(m){if(m==null||isNaN(m))return '—';m=Math.round(m);if(m<=
 function fmtHours(m){return m==null||isNaN(m)?'—':(m/60).toFixed(1)+'h'}
 let fleet=[],sites=[],versions=[],sshHint={},q='',siteFilter='',verFilter='',targetVer='',pendingOnly=false,statusFilter='online',refreshInterval=15;
 let collectDur={enabled:false,map:{}};
-let webfix={map:{}};
+let webfix={map:{},cands:{}};
 function matches(f){
   if(siteFilter&&(f.site||'未登记')!==siteFilter)return false;
   if(verFilter&&(f.version||'未获取')!==verFilter)return false;
@@ -279,15 +280,19 @@ function renderTargetSel(){
   if(!targetVer||!opts.includes(targetVer))targetVer=opts.find(v=>v!=='未获取')||opts[0]||'';
   sel.value=targetVer;
 }
-/* ---- web 代理补配状态（KVWO-18）----
- 数据契约（以后端胡磊涛完成评论为准，字段解析已容错）：GET /api/webfix/tasks（各设备最新补配
- 任务：hostname / status queued|running|success|failed / error / attempts / trigger_type /
- created_at / finished_at）、POST /api/webfix/retry {devices:[hostname]}。
+/* ---- web 代理补配状态（KVWO-18，契约按 KVWO-19 feat/auto-webfix 定稿对齐）----
+ GET /api/webfix/tasks → {enabled,auto_enabled,port_base,port_max,verify_timeout,
+ candidates:[{hostname,web_port}],counts,tasks:[{task_id,hostname,site,trigger_type,
+ status queued|running|success|failed,error,attempts,web_port,created_at(Unix 秒),
+ finished_at,chars}]}（tasks 为每设备最新一行；candidates 为当前缺配候选）。
+ POST /api/webfix/retry {devices:[...]} → {ok,started:[{hostname,task_id,attempts}],
+ skipped:[{hostname,reason}]}（skipped 必须向用户呈现原因）；SSE 复用
+ /api/upgrade/events：type=webfix（task 同上字段）/ webfix_log（日志增量，总览不消费）。
  与 /api/hosts 的 web_port 组合判定：有 web_port → 正常（无标记）；在线 + 有 ssh_port + 无
  web_port → 缺配候选，再叠加最新任务状态：queued/running → 补配中，failed → 失败（悬停看
  error），success → 标记消失（版本随下次 /api/hosts 刷新恢复显示）。
  接口未上线（404）或拉取失败时优雅降级：沿用上次数据，从无数据时仅按 web_port 显示灰色
-「web 缺配」标记，不显示进行中/失败态。 */
+「web 缺配」标记，不显示进行中/失败态。字段解析保留容错（数组/字典形态、ISO/Unix 时间）。 */
 function webfixTask(f){return (webfix.map||{})[String((f&&(f.hostname||f.host))||'').toLowerCase()]||null}
 function webfixState(f){
   const t=webfixTask(f);
@@ -360,10 +365,12 @@ async function openDevice(h){
     const stRows=(d.status||[]).map(s=>`<tr><td>${esc(s.ts)}</td><td>${s.online?'<span style="color:#16a34a">在线</span>':'<span style="color:#dc2626">离线</span>'}</td><td>${esc(s.release_version||'—')}</td><td>${s.connections!=null?s.connections:'—'}</td></tr>`).join('');
     const cmd=d.ssh_port?`ssh -J ${hint.jump||'ubuntu@124.222.147.63'} -p ${d.ssh_port} ${hint.user||'orangepi'}@127.0.0.1`:'';
     const wf=webfixState(d);
+    const wfc=(webfix.cands||{})[String(d.hostname||d.host||'').toLowerCase()]||null;
+    const wfExp=(wfc&&wfc.web_port)||(wf.task&&wf.task.web_port)||null;
     const wfRow=wf.code==='normal'?`${d.web_port||'—'} / <span style="color:#16a34a">正常</span>`
       :wf.code==='running'?`${d.web_port||'—'} / <span style="color:#1d4ed8"><i class="wspin"></i> 补配中</span>`
       :wf.code==='failed'?`${d.web_port||'—'} / <span style="color:#dc2626" title="${esc(wf.title)}">失败：${esc(wf.title)}</span>`
-      :wf.code==='missing'?`${d.web_port||'—'} / <span style="color:#667085">缺配</span>`
+      :wf.code==='missing'?`${d.web_port||'—'} / <span style="color:#667085" title="未检测到 web 代理（ep-编号-web），等待自动补配">${wfExp?`缺配（补配后 ${esc(String(wfExp))}）`:'缺配'}</span>`
       :`${d.web_port||'—'} / <span style="color:#98a2b3" title="设备未在线或无 SSH 隧道时不判定缺配">—</span>`;
     const wfBar=wf.code==='failed'&&d.online&&d.ssh_port?`<div class="wfixbar"><small>自动补配仅触发一次；重试将重新推送 frpc 配置并重启该机 frpc（隧道秒级闪断）</small><button type="button" id="webfixRetry">重试补配</button></div>`:'';
     $('#modalBody').innerHTML=`
@@ -390,15 +397,22 @@ async function openDevice(h){
     const cb=$('#copyBtn');if(cb)cb.onclick=async()=>{if(await copyText(cmd)){cb.textContent='已复制 ✓';setTimeout(()=>cb.textContent='复制跳板命令',1500)}else alert(cmd)};
     const rb=$('#webfixRetry');
     if(rb)rb.onclick=async()=>{
-      if(rb.dataset.arm!=='1'){rb.dataset.arm='1';rb.classList.add('arm');rb.textContent='确认重试？';setTimeout(()=>{if(rb.isConnected){rb.dataset.arm='';rb.classList.remove('arm');rb.textContent='重试补配'}},4000);return}
+      if(rb.dataset.arm!=='1'){rb.dataset.arm='1';rb.classList.add('arm');rb.textContent='确认重试？';setTimeout(()=>{if(rb.isConnected&&rb.dataset.arm==='1'){rb.dataset.arm='';rb.classList.remove('arm');rb.textContent='重试补配'}},4000);return}
+      rb.dataset.arm='';rb.classList.remove('arm');
       rb.disabled=true;rb.textContent='发起中…';
+      const wfail=msg=>{rb.disabled=false;rb.classList.remove('arm');rb.classList.add('err');rb.textContent='未发起：'+msg;setTimeout(()=>{if(rb.isConnected&&!rb.disabled){rb.classList.remove('err');rb.textContent='重试补配'}},8000)};
       try{
         const r=await fetch('/api/webfix/retry',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({devices:[d.hostname]})});
         const j=await r.json().catch(()=>({}));
         if(!r.ok||j.ok===false)throw Error(j.error||('HTTP '+r.status));
+        const wnorm=x=>String((x&&(x.hostname||x.host))||'').toLowerCase();
+        const me=String(d.hostname||'').toLowerCase();
+        const wstarted=(j.started||[]).some(x=>wnorm(x)===me);
+        const wskip=(j.skipped||[]).find(x=>wnorm(x)===me);
+        if(!wstarted)throw Error(String((wskip&&(wskip.reason||wskip.error))||'服务端未确认该设备（响应无 started 记录）'));
         rb.classList.remove('arm');rb.textContent='已发起重试 ✓';
         setTimeout(()=>{loadWebfix();if($('#modal').classList.contains('show'))openDevice(d.hostname)},900);
-      }catch(e){rb.disabled=false;rb.textContent='重试补配';alert('重试发起失败：'+(e.message||e))}
+      }catch(e){wfail(String(e.message||e))}
     };
   }catch(e){$('#modalBody').innerHTML='<p class="eempty">'+esc(String(e))+'</p>'}
 }
@@ -453,14 +467,16 @@ async function loadWebfix(){
     if(!r.ok)throw Error(d.error||('HTTP '+r.status));
     let arr=Array.isArray(d)?d:(d.tasks||d.items||d.devices||d.list||[]);
     if(!Array.isArray(arr)&&arr&&typeof arr==='object')arr=Object.entries(arr).map(([h,t])=>Object.assign({hostname:h},(t&&typeof t==='object')?t:{status:t}));
+    const tsOf=v=>{if(typeof v==='number')return v>1e12?v:Math.round(v*1000);const p=Date.parse(String(v==null?'':v).replace(' ','T'));return isNaN(p)?0:p};
     const map={};
     for(const t of (arr||[])){
       const h=String((t&&(t.hostname||t.host))||'').toLowerCase();if(!h)continue;
-      const ts=Date.parse(String((t&&(t.created_at||t.created))||'').replace(' ','T'))||0;
+      const ts=tsOf(t&&(t.created_at||t.created));
       const old=map[h];if(old&&ts<old._ts)continue;
-      map[h]={hostname:h,status:t.status,error:t.error,attempts:t.attempts,trigger_type:t.trigger_type,created_at:t.created_at,finished_at:t.finished_at,_ts:ts};
+      map[h]={hostname:h,status:t.status,error:t.error,attempts:t.attempts,trigger_type:t.trigger_type,web_port:t.web_port,created_at:t.created_at,finished_at:t.finished_at,_ts:ts};
     }
-    webfix={map:map};
+    const cands={};for(const c of (d.candidates||[]))if(c&&c.hostname)cands[String(c.hostname).toLowerCase()]=c;
+    webfix={map:map,cands:cands};
   }catch(e){/* webfix 接口未上线/拉取失败：沿用已有数据；从无数据时退化为仅「web 缺配」灰色标记 */}
   if(fleet.length)renderGrid();
 }
@@ -468,7 +484,8 @@ loadWebfix();setInterval(loadWebfix,15000);
 
 /* ================= 升级管理视图（Upg.* 独立命名空间，不改动设备总览逻辑） =================
  数据契约（后端返工后联调基准）：POST /api/upgrade/jobs {kind,devices,params{version,oss_url,sha256}}、
- GET /api/upgrade/jobs(/<id>)、GET /api/upgrade/events（SSE：{type:'job'|'task'|'log',...}）、
+ GET /api/upgrade/jobs(/<id>)、GET /api/upgrade/events（SSE：{type:'job'|'task'|'log'|'webfix'|'webfix_log',...}，
+ webfix 类事件只驱动设备总览刷新、不进升级视图）、
  GET /api/upgrade/jobs/<id>/log?offset=N[&hostname=]、GET /api/upgrade/packages（包注册表）、
  POST/GET /api/upgrade/sha256（服务端一次性拉包算哈希，异步轮询）。旧 /api/packages 整套已不再依赖。
  字段解析全部做了兼容容错，后端未上线时各区城优雅空态；最终契约以胡磊涛完成评论为准。 */
@@ -924,6 +941,8 @@ onEvent(name,raw){
  if(s.trim().startsWith('{')){try{m=JSON.parse(s)}catch(e){m=null}}
  if(!m)return;
  const type=String(m.type||name||'').toLowerCase();
+ if(type==='webfix'){loadWebfix();return}   // 补配任务事件（KVWO-19 共流）：只驱动总览刷新，不进升级视图
+ if(type==='webfix_log')return;             // 补配日志增量：升级日志面板不消费
  if(type==='job'||m.job){
   const j=this.normJob(m.job||m);
   if(j.id==null)return;

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """KVWO-18 前端自测桩：托管真实页面（server.INDEX/CSS/JS），伪造 /api/hosts、
-/api/webfix/tasks、/api/webfix/retry、/api/device/* 等接口，供 headless Chrome 验证
+/api/webfix/tasks、/api/webfix/retry、/api/device/* 等接口（按 KVWO-19 定稿契约：
+tasks 每设备最新一行 + candidates；retry 返回 started/skipped），供 headless Chrome 验证
 卡片标记 / 详情行 / 重试按钮链路。用法：
-  python3 verify_webfix_ui.py <port>   # 再用 headless 浏览器访问 /?drive=cards|modal|retry"""
+  python3 verify_webfix_ui.py <port> [skip]   # skip=重试总返回 skipped；再用 headless
+  浏览器访问 /?drive=cards|modal|retry|retry-skip"""
 import json
 import os
 import sys
@@ -33,25 +35,33 @@ DEVICES = {
                       device_id="103", site="站点B"),
 }
 
-TASKS = {
-    "ep-000160": dict(hostname="EP-000160", status="failed",
-                      error="frpc verify 失败: parse error", attempts=1,
-                      trigger_type="auto", created_at="2026-10-16 10:00:00"),
-    "ep-000118": dict(hostname="EP-000118", status="running", error="",
-                      attempts=1, trigger_type="auto", created_at="2026-10-16 11:00:00"),
-    "ep-000101": dict(hostname="EP-000101", status="success", error="",
-                      attempts=1, trigger_type="auto", created_at="2026-10-16 09:00:00"),
+TASKS = {  # 按定稿契约：Unix 秒 created_at / web_port 字段 / 大小写混合 hostname 验证归一
+    "ep-000160": dict(task_id=3, hostname="EP-000160", site="站点A", trigger_type="auto",
+                      status="failed", error="frpc verify 失败: parse error", attempts=1,
+                      web_port=30160, created_at=1776560000.5, finished_at=1776560180.2,
+                      chars=420),
+    "ep-000118": dict(task_id=2, hostname="EP-000118", site="站点A", trigger_type="auto",
+                      status="running", error="", attempts=1, web_port=30118,
+                      created_at=1776561000.0, finished_at=None, chars=100),
+    "ep-000101": dict(task_id=1, hostname="EP-000101", site="站点B", trigger_type="manual",
+                      status="success", error="", attempts=2, web_port=30101,
+                      created_at=1776550000.0, finished_at=1776550060.0, chars=200),
 }
+
+CANDIDATES = [dict(hostname="ep-000160", web_port=30160),
+              dict(hostname="ep-000118", web_port=30118),
+              dict(hostname="ep-000102", web_port=30102)]
 
 DRIVER = """
 <script>
 (function(){
   const mode=new URLSearchParams(location.search).get('drive')||'cards';
+  const dev=new URLSearchParams(location.search).get('dev')||'ep-000160';
   window.__driveDone=false;
   function settle(fn,ms){setTimeout(()=>{try{fn()}catch(e){window.__driveErr=String(e)}window.__driveDone=true},ms)}
   if(mode==='cards')return; // 仅渲染卡片，靠 dump-dom 断言
-  if(mode==='modal'){settle(()=>openDevice('ep-000160'),900);return}
-  if(mode==='retry'){
+  if(mode==='modal'){settle(()=>openDevice(dev),900);return}
+  if(mode==='retry'||mode==='retry-skip'){
     settle(()=>{
       openDevice('ep-000160');
       const waitModal=setInterval(()=>{
@@ -102,7 +112,10 @@ class Handler(BaseHTTPRequestHandler):
                             online=sum(1 for f in fleet if f["online"]),
                             registered=len(fleet), fleet=fleet, sites=[], versions=[]))
         elif path == "/api/webfix/tasks":
-            self._json(dict(enabled=True, tasks=list(TASKS.values())))
+            self._json(dict(enabled=True, auto_enabled=True, port_base=30000,
+                            port_max=30999, verify_timeout=180, candidates=CANDIDATES,
+                            counts=dict(queued=0, running=1, success=1, failed=1),
+                            tasks=list(TASKS.values())))
         elif path == "/api/events":
             self._json(dict(enabled=False, events=[]))
         elif path == "/api/collect-duration":
@@ -131,7 +144,15 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.split("?")[0] == "/api/webfix/retry":
             retry_calls.append(raw)
             print("RETRY_POST:", raw, flush=True)
-            self._json(dict(ok=True, accepted=["ep-000160"]))
+            if SKIP_RETRY:
+                self._json(dict(ok=True, started=[],
+                                skipped=[dict(hostname="ep-000160",
+                                              reason="已有补配任务进行中")]))
+            else:
+                self._json(dict(ok=True,
+                                started=[dict(hostname="ep-000160", task_id=4,
+                                              attempts=2)],
+                                skipped=[]))
         elif self.path.split("?")[0] == "/__calls":
             self._json(dict(calls=retry_calls))
         else:
@@ -140,6 +161,7 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 19200
+    SKIP_RETRY = len(sys.argv) > 2 and sys.argv[2] == "skip"
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     print("mock ready on", port, flush=True)
