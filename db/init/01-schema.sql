@@ -76,3 +76,21 @@ CREATE TABLE IF NOT EXISTS collect_duration (
   pulled_at    DATETIME     NULL,                   -- 最近一次成功写入时间
   UNIQUE KEY uq_host_date (hostname, stat_date)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 6) webfix 补配台账（KVWO-17/19）：缺失 web 代理设备的一次性自动补配 + 手动重试。
+--    每次补配一行；自动触发严格一次的判据 = 存在 trigger_type='auto' 的历史行
+--    （无论成败）；attempts 为该设备累计次数。台账性质，30 天保留满定不清理
+--    （同 devices / collect_duration；启动时也会幂等建表，见 Store._migrate）。
+CREATE TABLE IF NOT EXISTS webfix_tasks (
+  id           INT          NOT NULL PRIMARY KEY,   -- 面板进程重启后从最大 id 续号
+  hostname     VARCHAR(64)  NOT NULL,               -- ep-000160（frps 代理名，小写）
+  trigger_type VARCHAR(8)   NOT NULL,               -- auto（检测引擎，一次性）/ manual（面板重试）
+  status       VARCHAR(16)  NOT NULL DEFAULT 'queued', -- queued / running / success / failed
+  error        VARCHAR(500) NOT NULL DEFAULT '',    -- 失败原因（可读，供面板展示；失败不回滚设备配置）
+  attempts     INT          NOT NULL DEFAULT 1,     -- 该设备累计补配次数
+  log          LONGTEXT     NULL,                   -- 设备端脚本输出（SSH 推送，重启后可回看）
+  created_at   DATETIME     NOT NULL,
+  finished_at  DATETIME     NULL,
+  KEY idx_host (hostname),
+  KEY idx_created (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
