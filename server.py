@@ -1938,9 +1938,11 @@ exit $rc
 '''
 
 SCRIPT_VERIFY = r'''#!/usr/bin/env bash
-# [内嵌自 update/scripts/verify.sh · 2026-10-15，无改动]
+# [内嵌自 update/scripts/verify.sh · 2026-10-15]
 # 设备端升级后验证。成功标准：version=新版本 / service=active / http=200 /
-# api 含新版本 / 4 常驻容器新镜像 / frpc=active（由面板侧比对判分）
+# api 含新版本 / 常驻容器新镜像 / frpc=active（由面板侧比对判分）。
+# 容器判分按机型（面板侧，2026-10-16 KVWO-14）：V1(rk3588)=4 常驻容器全为新版镜像；
+# V0(amd64)=运行中 portal 容器全为新版且 ≥ 核心 2 个（backend+相机模块）。
 set -u
 pw=${DEPLOY_PW:-}
 s() { printf '%s\n' "$pw" | sudo -S -p '' "$@" 2>/dev/null; }
@@ -2616,6 +2618,28 @@ def stage_install(task, ctx):
     return False
 
 
+# 验证容器判据按机型校准（2026-10-16 KVWO-14）：V1（rk3588）常驻栈 4 容器全为新版
+# 镜像；V0（amd64）常驻核心集 = backend + 相机模块（2 个），判据为「运行中的 portal
+# 容器全部为新版镜像，且数量 ≥ 机型核心数」——有旧容器还在跑即判真失败。
+VERIFY_CORE_CONTAINERS = {"rk3588-arm64": 4, "amd64": 2}
+VERIFY_MODEL_BY_ARCH = {"amd64": "V0", "rk3588-arm64": "V1"}
+
+
+def _verify_containers(out, want, arch):
+    """按机型校准容器判分。返回 (ok, 新版数, portal 运行数, 核心数, 机型)。"""
+    core = VERIFY_CORE_CONTAINERS.get(arch, 4)
+    model = VERIFY_MODEL_BY_ARCH.get(arch, arch or "未知机型")
+    # docker ps 输出行形如：ego_portal-backend-1 | registry/…:v0.4.6 | Up 2 minutes
+    portal = [l for l in out.splitlines()
+              if "|" in l and l.split("|", 1)[0].strip().startswith("ego_portal-")]
+    new = sum(1 for l in portal if want and want in l)
+    if arch == "amd64":
+        ok = bool(portal) and new == len(portal) and new >= core
+    else:
+        ok = new >= core
+    return ok, new, len(portal), core, model
+
+
 def stage_verify(task, ctx):
     rc, out = push_script(task, SCRIPT_VERIFY, {}, timeout=180)
     if rc != 0:
@@ -2627,15 +2651,18 @@ def stage_verify(task, ctx):
             if line.startswith(key + "="):
                 s[key] = line.split("=", 1)[1][:160]
     want = ctx.get("version") or ""
-    new_containers = sum(1 for l in out.splitlines() if want and want in l and "|" in l)
+    arch = ctx.get("arch") or "rk3588-arm64"
+    cont_ok, new_containers, portal_total, core, model = _verify_containers(out, want, arch)
     ok = (s.get("service") == "active" and s.get("http") == "200"
           and s.get("frpc") == "active"
           and (not want or s.get("version") == want)
-          and (not want or new_containers >= 4))
+          and (not want or cont_ok))
     task.log(f"[panel] 验证结果 version={s.get('version')} service={s.get('service')} "
-             f"http={s.get('http')} frpc={s.get('frpc')} 新版容器={new_containers}")
+             f"http={s.get('http')} frpc={s.get('frpc')} "
+             f"新版容器={new_containers}/{portal_total}（{model} 核心={core}）")
     if not ok:
-        task.set_status("failed", "验证未全部通过（版本/service/HTTP/frpc/4 容器镜像）")
+        task.set_status("failed", f"验证未全部通过（版本/service/HTTP/frpc/容器镜像："
+                                  f"新版容器 {new_containers}/{portal_total}（{model} 核心={core}））")
     return ok
 
 
@@ -3054,6 +3081,18 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         return json.loads(self.rfile.read(n) or b"{}")
 
+    def _api_refresh(self):
+        """强刷快照缓存（SOP/旧 fleet-panel 的 GET/POST /api/refresh 兼容入口，
+        等价于面板「立即刷新」的 /api/hosts?refresh=1；此前 404 是端点路径不同）。"""
+        try:
+            refresh_snapshot()
+        except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
+            self.send_json(502, {"ok": False, "error": str(exc)})
+            return
+        hosts, ts = get_snapshot()
+        self.send_json(200, {"ok": True, "timestamp": ts,
+                             "total": len(hosts), "online": len(hosts)})
+
     def do_GET(self):
         if not self._authorized():
             self.send_unauthorized()
@@ -3105,6 +3144,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/upgrade/events":
             return self._sse()
+        if path == "/api/refresh":
+            return self._api_refresh()
         if path == "/api/hosts":
             force = "refresh" in parse_qs(urlsplit(self.path).query)
             if force:
@@ -3332,6 +3373,9 @@ class Handler(BaseHTTPRequestHandler):
             out = create_upgrade_job(str(req.get("kind") or ""),
                                      req.get("devices") or [], params)
             return self.send_json(200 if out.get("ok") else 400, out)
+        if path == "/api/refresh":
+            # 与 GET /api/refresh 等价（SOP 工具既有 GET 也有 POST 调法）
+            return self._api_refresh()
         if path == "/api/maintenance/run-cleanup":
             result = run_maintenance(retention=True, backup=False, reason="manual")
             return self.send_json(200, result)
