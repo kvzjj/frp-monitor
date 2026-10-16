@@ -126,7 +126,15 @@ INDEX = """<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=
 <section id=events><h2>最近事件（24 小时）</h2><div id=eventsBody class=elist><p class=eempty>加载中…</p></div></section>
 </section>
 <section id=viewUpgrade hidden>
-<section class=upanel><div class=uhead><h2>① 安装包</h2><div class=uactions><input type=file id=upgFile hidden accept=".tar.gz,.gz"><button type=button id=upgUploadBtn class=listbtn>上传安装包</button><button type=button id=upgPkgRefresh class=listbtn>刷新</button><label class=utarget>目标版本 <select id=upgVerSel></select></label></div></div><div id=upgUpBar class=pbarwrap hidden><div class=pbar><i id=upgUpFill></i></div><span id=upgUpPct></span></div><div class=twrap><table><thead><tr><th>版本</th><th>机型</th><th>大小</th><th>sha256</th><th>状态</th></tr></thead><tbody id=upgPkgBody></tbody></table></div><p class=uhint id=upgPkgHint></p><p class=uhint id=upgShaInfo></p></section>
+<section class=upanel id=upgParamPanel><div class=uhead><h2>① 升级参数</h2><span class=uhint id=upgRegState></span></div>
+<div class=uparam>
+<div class=prow><label for=upgUrl>OSS 签名 URL</label><input id=upgUrl type=text spellcheck=false autocomplete=off placeholder="https://<bucket>.oss-cn-hangzhou.aliyuncs.com/.../ego-portal-v0.4.6-rk3588-arm64.tar.gz?Expires=…&OSSAccessKeyId=…&Signature=…"></div>
+<div class=pmeta id=upgUrlMeta>粘贴后自动识别文件名、版本与机型；签名 URL 属敏感凭据，请勿外传</div>
+<div class=prow><label for=upgSha>sha256 基准</label><input id=upgSha type=text spellcheck=false autocomplete=off placeholder="留空自动匹配包注册表，未命中可手填或点「服务端计算」"><button type=button id=upgShaCompute class=stagebtn title="服务端从 OSS 直连拉取整包计算（约 1G 下载，耗时视服务器出口带宽），结果入注册表缓存">服务端计算</button><span id=upgShaSrc class=shaorigin></span></div>
+<div class=pmeta id=upgShaMeta></div>
+<div class=pmeta id=upgExpiry></div>
+<div id=upgParamSummary class=psummary></div>
+</div></section>
 <section class=upanel><div class=uhead><h2>② 选择目标设备</h2><div class=uselbar id=upgSelBar>已选 0 台</div></div><div id=upgDevGroups><p class=uempty>加载中…</p></div></section>
 <section class=upanel id=upgActPanel><div class=uhead><h2>③ 发起升级</h2></div><div class=ubtns><button type=button id=upgRunAll>▶ 全流程升级所选</button><button type=button class=stagebtn data-kind=precheck>仅预检</button><button type=button class=stagebtn data-kind=download>仅下载</button><button type=button class=stagebtn data-kind=install>仅安装</button><button type=button class=stagebtn data-kind=verify>仅验证</button><button type=button class=stagebtn data-kind=cleanup>仅清理</button></div><p class=uhint id=upgActHint></p></section>
 <section class=upanel><div class=uhead><h2>④ 任务与进度</h2><span id=upgConn class=connchip>未连接</span></div><div id=upgJobSummary><p class=uempty>暂无升级任务</p></div><div id=upgTaskGrid></div></section>
@@ -140,13 +148,9 @@ CSS = """*{box-sizing:border-box}body{margin:0;background:#f4f7fb;color:#172033;
 .vtabs{display:flex;gap:8px;margin:-6px 0 20px}.vtabs button{background:white;border:1px solid #e5eaf1;color:#475569;border-radius:999px;padding:8px 20px;font-size:14px}.vtabs button:hover{border-color:#b9cbdf}.vtabs button.on{background:#2563eb;border-color:#2563eb;color:white}
 .upanel{background:white;border:1px solid #e5eaf1;border-radius:12px;padding:18px 20px;margin-bottom:18px;box-shadow:0 2px 8px #1720330a}.upanel button:disabled{opacity:.5;cursor:not-allowed}
 .uhead{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap}.uhead h2{margin:0;font-size:16px}
-.uactions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-.utarget{color:#667085;font-size:13px;display:inline-flex;gap:6px;align-items:center}.utarget select{padding:6px 10px}
 .uhint{color:#98a2b3;font-size:12px;margin:10px 0 0}.uhint.warn{color:#b45309}.uhint:empty{display:none}
 .shalink{display:inline-flex;align-items:center;gap:6px}.sha{font-family:ui-monospace,monospace;font-size:12px;color:#475569}
 .copymini{padding:2px 8px;font-size:11px;background:#f1f5f9;border:1px solid #cbd5e1;color:#334155}.copymini:hover{background:#e2e8f0}
-.pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;white-space:nowrap}.pill.ok{background:#dcfce7;color:#15803d}.pill.wait{background:#fef3c7;color:#b45309}
-.pbarwrap{display:flex;align-items:center;gap:10px;margin:10px 0}.pbar{flex:1;height:8px;background:#eef2f7;border-radius:999px;overflow:hidden}.pbar i{display:block;height:100%;width:0;background:#2563eb;border-radius:999px;transition:width .2s}.pbarwrap span{font-size:12px;color:#667085;white-space:nowrap}
 .uselbar{color:#475569;font-size:13px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}.uselbar b{color:#2563eb}
 .minibtn{padding:3px 10px;font-size:11px;background:#f1f5f9;border:1px solid #cbd5e1;color:#667085;border-radius:999px}.minibtn:hover{background:#e2e8f0}
 .vgroup{border:1px solid #e5eaf1;border-radius:10px;margin-bottom:12px;overflow:hidden}.vghead{display:flex;align-items:center;gap:10px;padding:9px 14px;background:#f8fafc;border-bottom:1px solid #eef2f7;font-size:13px;flex-wrap:wrap}.vghead .vgt{font-weight:600}.vghead .vgn{color:#98a2b3}.vghead .grpbtn{margin-left:auto;padding:4px 12px;font-size:12px;background:#f1f5f9;border:1px solid #cbd5e1;color:#334155}.vghead .grpbtn:hover{background:#e2e8f0}.vghead input,.vrow input[type=checkbox]{width:15px;height:15px;accent-color:#2563eb;flex:none}
@@ -167,7 +171,13 @@ CSS = """*{box-sizing:border-box}body{margin:0;background:#f4f7fb;color:#172033;
 .ulog{background:#0f172a;color:#e2e8f0;border-radius:8px;padding:10px 12px;font:11px/1.55 ui-monospace,monospace;max-height:260px;overflow:auto;white-space:pre-wrap;word-break:break-all;margin:0}
 .uempty{border:1px dashed #cbd5e1;border-radius:10px;padding:26px;text-align:center;color:#718096;font-size:13px;margin:0}
 .uwarn{background:#fffbeb;border:1px solid #fde68a;color:#92400e;border-radius:8px;padding:10px 12px;font-size:13px;margin:12px 0 0}
-@media(max-width:640px){.vrows{grid-template-columns:1fr}.ucardgrid{grid-template-columns:1fr}.stepper{flex-wrap:wrap}.step{flex:1 1 30%}}"""
+.ossban{background:#fef2f2;border:1px solid #fecaca;color:#b91c1c;border-radius:8px;padding:10px 14px;font-size:13px;font-weight:600;margin-bottom:10px}
+.uparam .prow{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px}.prow label{width:96px;flex:none;text-align:right;color:#667085;font-size:13px}.prow input[type=text]{flex:1;min-width:280px;font-family:ui-monospace,monospace;font-size:12px;padding:8px 10px}.prow .stagebtn{flex:none}
+.pmeta{font-size:12px;color:#718096;margin:0 0 8px 106px;min-height:0}.pmeta:empty{display:none;margin:0}.pmeta.bad{color:#b91c1c}.pmeta.warn{color:#b45309}
+.shaorigin{font-size:12px;padding:2px 10px;border-radius:999px;background:#f1f5f9;color:#667085;white-space:nowrap}.shaorigin.registry{background:#dcfce7;color:#15803d}.shaorigin.manual{background:#dbeafe;color:#1d4ed8}.shaorigin.server{background:#ccfbf1;color:#0f766e}
+.psummary{display:flex;gap:14px;flex-wrap:wrap;align-items:center;background:#f8fafc;border:1px solid #e5eaf1;border-radius:8px;padding:10px 12px;margin-top:10px;font-size:13px;color:#475569}.psummary:empty{display:none}.psummary b{color:#172033}.psummary .shalink{gap:4px}
+.mism{font-size:11px;padding:1px 8px;border-radius:999px;background:#fef3c7;color:#b45309;border:1px solid #fde68a;white-space:nowrap}
+@media(max-width:640px){.vrows{grid-template-columns:1fr}.ucardgrid{grid-template-columns:1fr}.stepper{flex-wrap:wrap}.step{flex:1 1 30%}.prow label{width:auto;text-align:left}.pmeta{margin-left:0}}"""
 JS = """const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
 const ETAGS={online:'上线',offline:'掉线',version_change:'版本变更',first_seen:'新设备'};
@@ -355,17 +365,21 @@ async function loadCollectDuration(){
 loadCollectDuration();setInterval(loadCollectDuration,300000);
 
 /* ================= 升级管理视图（Upg.* 独立命名空间，不改动设备总览逻辑） =================
- 数据契约（后端联调基准）：GET /api/packages、POST /api/upgrade/jobs、GET /api/upgrade/jobs(/<id>)、
- GET /api/upgrade/events（SSE：{type:'job'|'task'|'log',...}）、GET /api/upgrade/jobs/<id>/log?offset=N[&hostname=]。
- 字段解析全部做了兼容容错，后端未上线时各区城优雅空态。 */
+ 数据契约（后端返工后联调基准）：POST /api/upgrade/jobs {kind,devices,params{version,oss_url,sha256}}、
+ GET /api/upgrade/jobs(/<id>)、GET /api/upgrade/events（SSE：{type:'job'|'task'|'log',...}）、
+ GET /api/upgrade/jobs/<id>/log?offset=N[&hostname=]、GET /api/upgrade/packages（包注册表）、
+ POST/GET /api/upgrade/sha256（服务端一次性拉包算哈希，异步轮询）。旧 /api/packages 整套已不再依赖。
+ 字段解析全部做了兼容容错，后端未上线时各区城优雅空态；最终契约以胡磊涛完成评论为准。 */
 const Upg={
 STAGES:['precheck','download','prepare','install','verify','cleanup'],
 STAGE_LBL:{precheck:'预检',download:'下载',prepare:'准备',install:'安装',verify:'验证',cleanup:'清理'},
 KIND_LBL:{upgrade:'全流程升级',precheck:'仅预检',download:'仅下载',prepare:'仅准备',install:'仅安装',verify:'仅验证',cleanup:'仅清理'},
 STAT_LBL:{running:'进行中',success:'成功',failed:'失败',blocked:'已阻断',pending:'等待中'},
-packages:[],fleet:[],selected:new Set(),selTouched:false,targetVersion:'',pkgFail:0,
+fleet:[],selected:new Set(),selTouched:false,targetVersion:'',reg:[],regFail:false,
+param:{url:'',ok:false,filename:'',version:'',arch:'',expiresAt:null,sha256:'',shaSrc:'',size:null},
+shaComputing:false,shaPollT:null,shaPollN:0,urlTimer:null,
 job:null,tasks:[],logs:{},logOff:{},follow:{},expanded:null,fromSnap:{},
-es:null,pollT:null,connState:'off',view:'overview',upXhr:null,
+es:null,pollT:null,connState:'off',view:'overview',stickyNote:null,
 gid(i){return document.getElementById(i)},
 normStatus(s){s=String(s==null?'':s).toLowerCase();
  if(['success','done','ok','complete','completed','finished'].includes(s))return 'success';
@@ -384,11 +398,12 @@ init(){
  const tabs=this.gid('viewTabs');
  tabs.addEventListener('click',e=>{const b=e.target.closest('button[data-view]');if(b)this.setView(b.dataset.view)});
  window.addEventListener('hashchange',()=>{const v=new URLSearchParams(location.hash.slice(1)).get('view')==='upgrade'?'upgrade':'overview';if(v!==this.view)this.setView(v,true)});
- this.gid('upgUploadBtn').onclick=()=>this.gid('upgFile').click();
- this.gid('upgFile').onchange=e=>{const f=e.target.files&&e.target.files[0];if(f)this.upload(f);e.target.value=''};
- this.gid('upgPkgRefresh').onclick=()=>this.loadPkgs();
- this.gid('upgVerSel').onchange=e=>{this.targetVersion=e.target.value;this.renderPkgs();this.updateSelBar();this.updateActions()};
- this.gid('upgPkgBody').addEventListener('click',async e=>{const b=e.target.closest('button[data-sha]');if(!b)return;b.textContent='…';const ok=await copyText(b.dataset.sha);b.textContent=ok?'已复制':'失败';setTimeout(()=>b.textContent='复制',1500)});
+ const urlIn=this.gid('upgUrl'),shaIn=this.gid('upgSha');
+ urlIn.addEventListener('input',()=>{clearTimeout(this.urlTimer);this.urlTimer=setTimeout(()=>this.onUrlInput(),400)});
+ urlIn.addEventListener('change',()=>{clearTimeout(this.urlTimer);this.onUrlInput()});
+ shaIn.addEventListener('input',()=>{const v=shaIn.value.trim().toLowerCase();this.param.sha256=/^[0-9a-f]{64}$/.test(v)?v:'';this.param.shaSrc=this.param.sha256?'manual':'';this.renderParam()});
+ this.gid('upgShaCompute').onclick=()=>this.computeSha();
+ this.gid('upgParamSummary').addEventListener('click',async e=>{const b=e.target.closest('button[data-sha]');if(!b)return;b.textContent='…';const ok=await copyText(b.dataset.sha);b.textContent=ok?'已复制':'失败';setTimeout(()=>b.textContent='复制',1500)});
  const dg=this.gid('upgDevGroups');
  dg.addEventListener('change',e=>{const el=e.target;
   if(el.dataset.h!==undefined&&el.type==='checkbox'){this.selTouched=true;if(el.checked)this.selected.add(el.dataset.h);else this.selected.delete(el.dataset.h);this.renderDevs();this.updateSelBar();this.updateActions()}
@@ -405,7 +420,6 @@ init(){
  document.addEventListener('keydown',e=>{if(e.key==='Escape')this.closeConfirm()});
  this.route();
  setInterval(()=>{if(this.view==='upgrade')this.loadFleet()},15000);
- setInterval(()=>{if(this.view==='upgrade'&&this.packages.some(p=>!p.ready))this.loadPkgs()},15000);
 },
 setView(v,skipHash){
  if(v!=='upgrade')v='overview';
@@ -417,65 +431,161 @@ setView(v,skipHash){
  if(v==='upgrade')this.enter();
 },
 route(){const v=new URLSearchParams(location.hash.slice(1)).get('view')==='upgrade'?'upgrade':'overview';this.setView(v,true)},
-enter(){this.loadPkgs();this.loadFleet();this.loadJobs();this.updateSelBar();this.updateActions()},
-setPkgHint(msg,warn){const el=this.gid('upgPkgHint');el.textContent=msg||'';el.className='uhint'+(warn?' warn':'')},
+enter(){this.loadRegistry();this.loadFleet();this.loadJobs();this.renderParam();this.updateSelBar();this.updateActions()},
 setActHint(msg,warn){const el=this.gid('upgActHint');el.textContent=msg||'';el.className='uhint'+(warn?' warn':'')},
-normPkg(p){
- const fn=String(p.filename||p.name||'');
- let ver=p.version||p.ver||'';if(!ver){const m=fn.match(/v\\d+\\.\\d+(\\.\\d+)*/i);ver=m?m[0].toLowerCase():(fn||'未知版本')}
- let arch=p.arch||p.platform||p.machine||'';
- if(!arch){if(/rk3588|arm64|aarch64/i.test(fn))arch='rk3588-arm64';else if(/amd64|x86/i.test(fn))arch='amd64';else arch=''}
- const sha=String(p.sha256||p.hash||'');
- return{filename:fn,version:ver,arch:arch||'未知机型',size:p.size!=null?p.size:p.bytes,sha256:sha,ready:!!sha&&p.ready!==false}
+parseOssUrl(u){
+ u=String(u||'').trim();
+ const out={url:u,ok:false,filename:'',version:'',arch:'',expiresAt:null,err:'',sha256:'',shaSrc:'',size:null};
+ if(!u)return out;
+ let p=null;try{p=new URL(u)}catch(e){out.err='URL 格式无法解析';return out}
+ out.ok=true;
+ const segs=p.pathname.split('/').filter(Boolean);
+ try{out.filename=decodeURIComponent(segs[segs.length-1]||'')}catch(e){out.filename=segs[segs.length-1]||''}
+ const vm=out.filename.match(/v\\d+\\.\\d+(\\.\\d+)*/i);out.version=vm?vm[0].toLowerCase():'';
+ if(/rk3588|arm64|aarch64/i.test(out.filename))out.arch='rk3588-arm64';
+ else if(/amd64|x86/i.test(out.filename))out.arch='amd64';
+ const v1=parseInt(p.searchParams.get('Expires')||'',10);
+ if(!isNaN(v1)&&v1>1000000)out.expiresAt=v1*1000;
+ else{
+  const d=p.searchParams.get('x-oss-date')||'',dur=parseInt(p.searchParams.get('x-oss-expires')||'',10);
+  const m=d.match(/^(\\d{4})(\\d{2})(\\d{2})T(\\d{2})(\\d{2})(\\d{2})Z$/);
+  if(m&&!isNaN(dur)){const t=Date.parse(m[1]+'-'+m[2]+'-'+m[3]+'T'+m[4]+':'+m[5]+':'+m[6]+'Z');if(!isNaN(t))out.expiresAt=t+dur*1000}
+ }
+ return out;
 },
-async loadPkgs(){
+fmtRemain(ms){
+ if(ms==null||isNaN(ms))return '—';
+ if(ms<=0)return '已过期';
+ const h=ms/3600000;
+ if(h>=48)return Math.floor(h/24)+' 天';
+ if(h>=1)return h.toFixed(1)+' 小时';
+ return Math.max(1,Math.round(ms/60000))+' 分钟';
+},
+estMs(){return Math.max(1,Math.ceil((this.selected.size||1)/6))*12*60000},
+onUrlInput(){
+ const url=this.gid('upgUrl').value;
+ const prev=this.param.filename;
+ this.param=this.parseOssUrl(url);
+ this.targetVersion=this.param.version;
+ this.shaComputing=false;this.stopShaPoll();
+ if(this.param.ok&&this.param.filename&&prev!==this.param.filename){
+  if(this.reg.length)this.matchRegistry();
+  else this.loadRegistry();
+ }
+ this.renderParam();
+},
+async loadRegistry(){
  try{
-  const r=await fetch('/api/packages',{cache:'no-store'});const d=await r.json();
+  const r=await fetch('/api/upgrade/packages',{cache:'no-store'});
+  const d=await r.json();
   if(!r.ok)throw Error(d.error||('HTTP '+r.status));
-  const list=d.packages||d.items||(Array.isArray(d)?d:[]);
-  this.packages=list.map(p=>this.normPkg(p));this.pkgFail=0;this.renderPkgs();
- }catch(e){this.pkgFail++;this.renderPkgs()}
+  this.reg=d.packages||d.items||(Array.isArray(d)?d:[]);
+  this.regFail=false;
+  if(this.param.filename&&this.param.shaSrc!=='server')this.matchRegistry();
+ }catch(e){this.reg=[];this.regFail=true}
+ this.renderParam();
 },
-renderPkgs(){
- const tb=this.gid('upgPkgBody');
- if(this.pkgFail){tb.innerHTML='<tr><td colspan=5 class=eempty>安装包接口不可用（后端未上线或服务异常），可点「刷新」重试</td></tr>';this.setPkgHint('GET /api/packages 请求失败：稍后自动重试或手动刷新',true)}
- else if(!this.packages.length){tb.innerHTML='<tr><td colspan=5 class=eempty>暂无安装包：可点「上传安装包」，或由 ops 将包 scp 到服务器包目录后点「刷新」</td></tr>';this.setPkgHint('')}
- else{tb.innerHTML=this.packages.map(p=>{
-  const shaCell=p.sha256?`<span class=shalink><span class=sha title="${esc(p.sha256)}">${esc(p.sha256.slice(0,14))}…</span><button type=button class=copymini data-sha="${esc(p.sha256)}">复制</button></span>`:'<span class=sha>—</span>';
-  const st=p.ready?'<span class="pill ok">就绪</span>':'<span class="pill wait">哈希计算中…</span>';
-  return `<tr><td>${esc(p.version)}</td><td>${esc(p.arch)}</td><td>${this.fmtB(p.size)}</td><td>${shaCell}</td><td>${st}</td></tr>`}).join('');this.setPkgHint('')}
- const sel=this.gid('upgVerSel');
- const vers=[...new Set(this.packages.map(p=>p.version))].sort((a,b)=>this.verCmp(b,a));
- sel.innerHTML=vers.length?vers.map(v=>`<option value="${esc(v)}">${esc(v)}</option>`).join(''):'<option value="">（暂无版本）</option>';
- if(!vers.includes(this.targetVersion)){
-  const ready=[...new Set(this.packages.filter(p=>p.ready).map(p=>p.version))].sort((a,b)=>this.verCmp(b,a));
-  this.targetVersion=ready[0]||vers[0]||''}
- if(this.targetVersion)sel.value=this.targetVersion;
- this.renderShaInfo();
- this.updateSelBar();this.updateActions();
+matchRegistry(){
+ const fn=this.param.filename;
+ let hit=this.reg.find(x=>String(x.filename||x.name||'')===fn);
+ if(!hit&&this.param.version)hit=this.reg.find(x=>x.version===this.param.version&&(!this.param.arch||x.arch===this.param.arch));
+ if(hit&&hit.sha256){
+  this.param.sha256=String(hit.sha256).toLowerCase();
+  this.param.shaSrc='registry';
+  this.param.size=hit.size!=null?hit.size:null;
+  return true;
+ }
+ return false;
 },
-renderShaInfo(){
- const el=this.gid('upgShaInfo');
- if(!this.targetVersion){el.textContent='';return}
- const pkgs=this.packages.filter(p=>p.version===this.targetVersion);
- if(!pkgs.length){el.textContent='';return}
- const parts=pkgs.map(p=>`${p.ready?p.arch+'：'+this.fmtB(p.size)+' · sha256 '+p.sha256.slice(0,16)+'…（就绪）':p.arch+'：'+this.fmtB(p.size)+' · 哈希计算中…'}`);
- el.textContent='目标版本 '+this.targetVersion+' 已关联 '+parts.join('；')+'，发起时自动校验设备端下载哈希';
- el.className='uhint'+(pkgs.some(p=>!p.ready)?' warn':'');
+renderExpiry(){
+ const el=this.gid('upgExpiry');if(!el)return;
+ if(!this.param.ok||!this.param.url){el.textContent='';el.className='pmeta';return}
+ if(this.param.expiresAt==null){el.textContent='⚠ 未识别到有效期参数（Expires / x-oss-expires），请自行确认链接时效';el.className='pmeta warn';return}
+ const rem=this.param.expiresAt-Date.now();
+ const left=this.fmtRemain(rem);
+ const until='至 '+new Date(this.param.expiresAt).toLocaleString('zh-CN',{hour12:false});
+ if(rem<=0){el.textContent='链接已过期（'+until+'），请重新生成签名 URL 后粘贴';el.className='pmeta bad'}
+ else if(rem<this.estMs()){el.textContent='有效期约剩 '+left+'（'+until+'）——低于预估批量时长 '+this.fmtRemain(this.estMs())+'（'+this.selected.size+' 台 · 6 并行），批量中途可能过期';el.className='pmeta warn'}
+ else{el.textContent='有效期约剩 '+left+'（'+until+'）· 预估批量时长 '+this.fmtRemain(this.estMs());el.className='pmeta'}
 },
-upload(file){
- if(this.upXhr)return;
- const fd=new FormData();fd.append('file',file);
- const x=new XMLHttpRequest();this.upXhr=x;
- const bar=this.gid('upgUpBar'),fill=this.gid('upgUpFill'),pct=this.gid('upgUpPct');
- bar.hidden=false;fill.style.width='0%';pct.textContent='上传中 0%';
- x.open('POST','/api/packages/upload');
- x.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(e.loaded/e.total*100);fill.style.width=p+'%';pct.textContent='上传中 '+p+'%（'+this.fmtB(e.loaded)+' / '+this.fmtB(e.total)+'）'}};
- x.onload=()=>{this.upXhr=null;bar.hidden=true;let d={};try{d=JSON.parse(x.responseText)}catch(e){}
-  if(x.status>=200&&x.status<300){this.setPkgHint('已上传 '+file.name+'，正在刷新包列表…');this.loadPkgs()}
-  else this.setPkgHint('上传失败：'+(d.error||('HTTP '+x.status)),true)};
- x.onerror=()=>{this.upXhr=null;bar.hidden=true;this.setPkgHint('上传失败：网络错误',true)};
- x.send(fd);
+renderParam(){
+ const urlMeta=this.gid('upgUrlMeta'),shaMeta=this.gid('upgShaMeta'),srcEl=this.gid('upgShaSrc'),sumEl=this.gid('upgParamSummary'),regEl=this.gid('upgRegState');
+ if(!urlMeta)return;
+ if(this.regFail)regEl.textContent='包注册表接口不可用（后端未上线？），sha256 可手填';
+ else regEl.textContent=this.reg.length?'注册表已加载 '+this.reg.length+' 条':'';
+ if(!this.param.url){urlMeta.textContent='粘贴后自动识别文件名、版本与机型；签名 URL 属敏感凭据，请勿外传';urlMeta.className='pmeta'}
+ else if(!this.param.ok){urlMeta.textContent='URL 格式无法解析，请检查后重新粘贴';urlMeta.className='pmeta bad'}
+ else{
+  urlMeta.textContent='文件名 '+(this.param.filename||'未识别')+' · 版本 '+(this.param.version||'未识别')+' · 机型 '+(this.param.arch||'未识别');
+  urlMeta.className='pmeta'+(this.param.version&&this.param.arch?'':' warn');
+ }
+ const shaIn=this.gid('upgSha');
+ if(this.param.shaSrc!=='manual'&&shaIn.value!==(this.param.sha256||''))shaIn.value=this.param.sha256||'';
+ srcEl.textContent=this.param.shaSrc==='registry'?'注册表命中':this.param.shaSrc==='manual'?'手动填写':this.param.shaSrc==='server'?'服务端计算':'';
+ srcEl.className='shaorigin '+(this.param.shaSrc||'');
+ if(this.shaComputing){shaMeta.textContent='服务端计算中：正在从 OSS 直连拉取整包（约 1G，耗时视出口带宽），完成后自动填入并缓存进注册表…';shaMeta.className='pmeta'}
+ else if(this.param.sha256||this.param.shaSrc==='manual'){shaMeta.textContent='';shaMeta.className='pmeta'}
+ else if(this.param.ok&&this.param.filename){shaMeta.textContent=this.regFail?'注册表不可用且未填 sha256，可手填':'注册表未命中，可手填或点「服务端计算」';shaMeta.className='pmeta'}
+ else{shaMeta.textContent='';shaMeta.className='pmeta'}
+ this.renderExpiry();
+ if(!this.param.ok||!this.param.filename)sumEl.innerHTML='';
+ else sumEl.innerHTML='<span>目标版本 <b>'+esc(this.param.version||'—')+'</b></span><span>机型 <b>'+esc(this.param.arch||'—')+'</b></span>'+(this.param.size!=null?'<span>大小 <b>'+this.fmtB(this.param.size)+'</b></span>':'')+(this.param.sha256?'<span class=shalink>sha256 <span class=sha title="'+esc(this.param.sha256)+'">'+esc(this.param.sha256.slice(0,16))+'…</span><button type=button class=copymini data-sha="'+esc(this.param.sha256)+'">复制</button></span>':'');
+ this.renderDevs();this.updateSelBar();this.updateActions();
+},
+async computeSha(){
+ if(this.shaComputing)return;
+ if(!this.param.ok||!this.param.url){this.setActHint('请先粘贴有效的 OSS 签名 URL',true);return}
+ this.shaComputing=true;this.renderParam();
+ try{
+  const r=await fetch('/api/upgrade/packages/hash',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({oss_url:this.param.url})});
+  const d=await r.json().catch(()=>({}));
+  if(!r.ok){
+   if(d.error_code==='oss_expired'){this.shaComputing=false;const m=this.gid('upgShaMeta');if(m){m.textContent='服务端计算失败：'+(d.error||'链接已过期')+'，请重新生成签名 URL';m.className='pmeta bad'}return}
+   throw Error(d.error||('HTTP '+r.status));
+  }
+  if(d.status==='done'&&(d.entry||{}).sha256){
+   this.param.sha256=String(d.entry.sha256).toLowerCase();this.param.shaSrc='server';
+   if(d.entry.size!=null)this.param.size=d.entry.size;
+   this.shaComputing=false;this.loadRegistry();
+  }else this.startShaPoll();
+ }catch(e){
+  this.shaComputing=false;
+  const m=this.gid('upgShaMeta');if(m){m.textContent='服务端计算失败：'+e.message+'（可手填）';m.className='pmeta bad'}
+ }
+},
+regEntry(){return this.reg.find(x=>x.version===this.param.version&&x.arch===this.param.arch)||this.reg.find(x=>String(x.filename||'')===this.param.filename&&x.filename)},
+async pollShaTick(){
+ try{
+  const r=await fetch('/api/upgrade/packages',{cache:'no-store'});
+  const d=await r.json();
+  if(!r.ok)return;
+  this.reg=d.packages||d.items||(Array.isArray(d)?d:[]);
+  this.regFail=false;
+ }catch(e){return}
+ const e=this.regEntry();
+ if(e&&e.sha256){this.stopShaPoll();this.shaComputing=false;this.param.sha256=String(e.sha256).toLowerCase();this.param.shaSrc='server';if(e.size!=null)this.param.size=e.size;this.renderParam();return}
+ if(e&&e.hash_status==='failed'){this.stopShaPoll();this.shaComputing=false;const m=this.gid('upgShaMeta');if(m){m.textContent='服务端计算失败：'+(e.error||e.error_code||'未知原因')+'（可手填）';m.className='pmeta bad'}return}
+ if(e&&e.hash_status==='computing'){
+  const m=this.gid('upgShaMeta');
+  if(m){m.className='pmeta';m.textContent=e.total>0?('服务端计算中：已从 OSS 拉取 '+Math.min(100,Math.round((e.downloaded||0)/e.total*100))+'%（'+this.fmtB(e.downloaded||0)+' / '+this.fmtB(e.total)+'），完成后自动填入并缓存进注册表…'):'服务端计算中：正在从 OSS 直连拉取整包（约 1G，耗时视出口带宽），完成后自动填入并缓存进注册表…'}
+ }
+ const rs=this.gid('upgRegState');
+ if(rs&&!this.regFail)rs.textContent=this.reg.length?('注册表已加载 '+this.reg.length+' 条'+(this.reg.some(x=>x.hash_status==='computing')?' · '+this.reg.filter(x=>x.hash_status==='computing').length+' 个计算中':'')):'';
+},
+startShaPoll(){
+ this.stopShaPoll();this.shaPollN=0;
+ this.pollShaTick();
+ this.shaPollT=setInterval(()=>{
+  this.shaPollN++;
+  if(this.shaPollN>150){this.stopShaPoll();this.shaComputing=false;const m=this.gid('upgShaMeta');if(m){m.textContent='服务端计算超时（>10 分钟仍未完成），可稍后重试或手填';m.className='pmeta bad'}return}
+  this.pollShaTick()},4000);
+},
+stopShaPoll(){if(this.shaPollT){clearInterval(this.shaPollT);this.shaPollT=null}},
+isOssErr(t,code){
+ if(String(code||'').toLowerCase()==='oss_expired')return true;
+ t=String(t||'');
+ if(!t)return false;
+ return /(^|[^0-9])403([^0-9]|$)/i.test(t)||/access ?denied|oss_expired|forbidden/i.test(t)||/链接?过期|重新生成/.test(t);
 },
 devRows(){return this.fleet.filter(f=>!f.retired).map(f=>({h:f.hostname,site:f.site||'',online:!!f.online,ver:(f.version||'').trim()||'未获取',arch:this.archOf(f),hw:f.hardware||f.hw_model||''}))},
 async loadFleet(){
@@ -503,51 +613,67 @@ renderDevs(){
   h+=`<div class=vgroup><div class=vghead><input type=checkbox data-grp="${esc(k)}" ${on.length&&selN===on.length?'checked':''} ${on.length?'':'disabled'}><span class=vgt>${esc(k)}</span><span class=vgn>${on.length}/${g.length} 在线${selN?' · 已选 '+selN:''}</span><button type=button class=grpbtn data-grpup="${esc(k)}">全组升级</button></div><div class=vrows>`;
   for(const r of g){
    const tag=r.site?`<span class="stag vsite" style="--c:${siteColor(r.site)}">${esc(r.site)}</span>`:'';
-   h+=`<label class="vrow${r.online?'':' off'}" title="${r.online?'':'离线设备不可选'}"><input type=checkbox data-h="${esc(r.h)}" ${this.selected.has(r.h)?'checked':''} ${r.online?'':'disabled'}><span class=bh>${esc(r.h)}</span><small>${esc(r.arch||r.hw||'')}</small>${tag}</label>`}
+   const mism=(this.param.arch&&r.arch&&r.arch!==this.param.arch)?'<span class=mism title="机型与目标包（'+esc(this.param.arch)+'）不符">机型不符</span>':'';
+   h+=`<label class="vrow${r.online?'':' off'}" title="${r.online?'':'离线设备不可选'}"><input type=checkbox data-h="${esc(r.h)}" ${this.selected.has(r.h)?'checked':''} ${r.online?'':'disabled'}><span class=bh>${esc(r.h)}</span><small>${esc(r.arch||r.hw||'')}</small>${mism}${tag}</label>`}
   h+='</div></div>'
  }
  wrap.innerHTML=h;
 },
 updateSelBar(){
  const n=this.selected.size;const el=this.gid('upgSelBar');
- el.innerHTML=`已选 <b>${n}</b> 台 · 预计目标版本 <b>${esc(this.targetVersion||'—')}</b>${n?' <button type=button class=minibtn data-clr>清空选择</button>':''}`;
+ const vers=new Set();
+ for(const h of this.selected){const f=this.fleet.find(x=>x.hostname===h);vers.add(((f&&f.version)||'').trim()||'未获取')}
+ const cur=n?(vers.size===1?[...vers][0]:'多版本'):'—';
+ el.innerHTML=`已选 <b>${n}</b> 台 · 当前版本 ${esc(cur)} → 目标版本 <b>${esc(this.targetVersion||'—')}</b>${n?' <button type=button class=minibtn data-clr>清空选择</button>':''}`;
+ this.renderExpiry();
 },
-canLaunch(){return !this.active()&&!!this.targetVersion&&this.selected.size>0},
+canLaunch(){return !this.active()&&this.param.ok&&!!this.param.version&&this.selected.size>0},
 updateActions(){
- const busy=this.active();const noVer=!this.targetVersion;const noSel=!this.selected.size;
- let warnArches=[];
- if(this.targetVersion&&this.selected.size){
-  const ready=new Set(this.packages.filter(p=>p.ready&&p.version===this.targetVersion).map(p=>p.arch));
-  const need=new Set();
-  for(const h of this.selected){const f=this.fleet.find(x=>x.hostname===h);const a=f&&this.archOf(f);if(a&&!ready.has(a))need.add(a)}
-  warnArches=[...need]
- }
+ const busy=this.active();
+ const noUrl=!this.param.ok||!this.param.url;
+ const noVer=!this.param.version;
+ const noSel=!this.selected.size;
+ const expired=this.param.expiresAt!=null&&this.param.expiresAt-Date.now()<=0;
+ const lowTime=this.param.expiresAt!=null&&!expired&&this.param.expiresAt-Date.now()<this.estMs();
+ const noSha=!this.param.sha256;
+ let mism=0;
+ if(this.param.arch)for(const h of this.selected){const f=this.fleet.find(x=>x.hostname===h);const a=f&&this.archOf(f);if(a&&a!==this.param.arch)mism++}
  let hint='',warn=false;
  if(busy)hint='有升级任务进行中（#'+this.job.id+'），任务结束后才能发起新任务（后端并发护栏兜底）';
- else if(warnArches.length){hint='⚠ 目标版本 '+this.targetVersion+' 缺少 '+warnArches.join('、')+' 机型的就绪安装包（未上传或哈希未完成），下载/安装类操作暂不可发起';warn=true}
- else if(noVer)hint='请先在「① 安装包」区选择目标版本（选中后自动关联 sha256 基准）';
+ else if(expired)hint='OSS 链接已过期，请重新生成签名 URL 后粘贴';
+ else if(noUrl)hint='请先在「① 升级参数」粘贴 OSS 签名 URL（自动识别版本/机型）';
+ else if(noVer)hint='URL 中未识别出版本号（文件名需形如 ego-portal-v0.4.6-rk3588-arm64.tar.gz）',warn=true;
  else if(noSel)hint='请至少勾选一台在线设备（默认已勾选全部在线设备，离线设备不可选）';
- const heavy=busy||noVer||noSel||warnArches.length>0;
+ else if(mism)hint='⚠ 所选设备中 '+mism+' 台机型与目标包（'+this.param.arch+'）不符，下载/安装类操作不可发起；请改选相符机型设备，或更换对应机型的包链接',warn=true;
+ else if(noSha)hint='⚠ 尚无 sha256 基准：下载/安装类操作不可发起（注册表未命中时请手填或点「服务端计算」）；仅预检/验证/清理可发起',warn=true;
+ else if(lowTime)hint='⚠ 链接剩余有效期低于预估批量时长（'+this.fmtRemain(this.estMs())+'），批量中途可能过期，建议重新生成更长时效链接',warn=true;
+ if(busy&&this.stickyNote&&Date.now()<this.stickyNote.until){hint=this.stickyNote.text;warn=this.stickyNote.warn}
+ else if(!busy)this.stickyNote=null;
+ const heavy=busy||noUrl||noVer||noSel||expired||mism>0||noSha;
+ const light=busy||noUrl||noVer||noSel||expired;
  this.gid('upgRunAll').disabled=heavy;
- document.querySelectorAll('.stagebtn[data-kind]').forEach(b=>{const k=b.dataset.kind;b.disabled=(k==='download'||k==='install')?heavy:(busy||noVer||noSel)});
+ document.querySelectorAll('.stagebtn[data-kind]').forEach(b=>{const k=b.dataset.kind;b.disabled=(k==='download'||k==='install')?heavy:light});
  this.setActHint(hint,warn);
 },
 closeConfirm(){const m=this.gid('upgModal');if(m)m.classList.remove('show')},
 showConfirm(){
  const n=this.selected.size;const vs=this.targetVersion;
- const archSplit={};for(const h of this.selected){const f=this.fleet.find(x=>x.hostname===h);const a=(f&&this.archOf(f))||'未知机型';archSplit[a]=(archSplit[a]||0)+1}
+ const archSplit={};let mism=0;
+ for(const h of this.selected){const f=this.fleet.find(x=>x.hostname===h);const a=(f&&this.archOf(f))||'未知机型';if(this.param.arch&&a!=='未知机型'&&a!==this.param.arch){mism++;archSplit['机型不符']=(archSplit['机型不符']||0)+1}else archSplit[a]=(archSplit[a]||0)+1}
  const archTxt=Object.entries(archSplit).map(([a,c])=>esc(a)+' × '+c).join('、');
  const list=[...this.selected].sort((a,b)=>a.localeCompare(b,undefined,{numeric:true}));
  const preview=esc(list.length>12?list.slice(0,12).join('、')+' 等 '+n+' 台':list.join('、'));
+ const remTxt=this.param.expiresAt==null?'未识别（请自行确认链接时效）':((this.param.expiresAt-Date.now()>0?'约剩 ':'')+this.fmtRemain(this.param.expiresAt-Date.now())+(this.param.expiresAt-Date.now()>0?'（至 '+new Date(this.param.expiresAt).toLocaleString('zh-CN',{hour12:false})+'）':''));
  const m=this.gid('upgModalBody');
  m.innerHTML=`<header><div><span class=name>确认发起全流程升级</span></div><button type=button class="x" id=upgConfirmClose>✕</button></header>
  <div class=mgrid>
-  <span>目标版本</span><b>${esc(vs)}</b>
-  <span>设备数量</span><b>${n} 台（${archTxt}）</b>
+  <span>目标版本</span><b>${esc(vs)}（${esc(this.param.arch||'机型未识别')} · ${esc(this.param.filename||'文件名未识别')}）</b>
+  <span>设备数量</span><b>${n} 台（${archTxt}${mism?'，其中 '+mism+' 台机型不符':''}）</b>
   <span>设备清单</span><b>${preview}</b>
-  <span>执行流程</span><b>预检 → 下载 → 准备 → 安装 → 验证 → 清理</b>
+  <span>链接有效期</span><b>${esc(remTxt)}</b>
+  <span>执行流程</span><b>预检 → 下载 → 准备 → 安装 → 验证 → 清理（设备直连 OSS 下载，sha256 基准校验）</b>
  </div>
- <p class=uwarn>⚠ 升级将覆盖设备上的程序，过程不可逆；单台失败不影响其他设备，安装器失败时会自动回滚兜底。请确认目标版本与设备清单无误后再发起。</p>
+ <p class=uwarn>⚠ 升级将覆盖设备上的程序，过程不可逆；单台失败不影响其他设备，安装器失败时会自动回滚兜底。请确认目标版本、机型与设备清单无误后再发起。</p>
  <div class=ubtns style="justify-content:flex-end;margin-top:16px"><button type=button class=stagebtn id=upgConfirmNo>取消</button><button type=button id=upgConfirmYes>确认发起升级</button></div>`;
  this.gid('upgModal').classList.add('show');
  this.gid('upgConfirmClose').onclick=this.gid('upgConfirmNo').onclick=()=>this.closeConfirm();
@@ -557,19 +683,29 @@ async launch(kind){
  const devices=[...this.selected];
  this.setActHint('正在创建任务…');
  try{
-  const r=await fetch('/api/upgrade/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind,devices,params:{version:this.targetVersion}})});
+  const r=await fetch('/api/upgrade/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind,devices,params:{version:this.targetVersion,oss_url:this.param.url,sha256:this.param.sha256||undefined}})});
   const d=await r.json().catch(()=>({}));
-  if(!r.ok)throw Error(d.error||('HTTP '+r.status));
+  if(!r.ok){
+   if(d.error_code==='oss_expired'){this.param.expiresAt=Date.now()-1000;this.renderParam();throw Error((d.error||'OSS 链接已过期')+'（后端校验拒绝）')}
+   if(d.error_code==='sha_missing')throw Error(d.error||'缺少 sha256 基准');
+   throw Error(d.error||('HTTP '+r.status));
+  }
   const j=d.job||d;const id=j.id!=null?j.id:j.job_id;
-  if(id==null)throw Error('响应缺少任务 id');
+  if(id==null)throw Error('响应缺少任务 id（job_id）');
+  if(d.expires_at!=null){const t=this.parseTs(d.expires_at);if(t)this.param.expiresAt=t}
   this.fromSnap={};for(const h of devices){const f=this.fleet.find(x=>x.hostname===h);if(f)this.fromSnap[h]=f.version||''}
-  this.adoptJob({id:id,kind:j.kind||kind,version:j.version||this.targetVersion,status:j.status||'running',created_at:j.created_at||new Date().toISOString(),finished_at:j.finished_at||null,devices:devices});
-  this.setActHint('任务 #'+id+' 已创建');
+  const effective=(Array.isArray(d.devices)&&d.devices.length)?d.devices:devices;
+  this.adoptJob({id:id,kind:j.kind||kind,version:j.version||this.targetVersion,filename:j.filename||this.param.filename||'',status:j.status||'running',created_at:j.created_at||new Date().toISOString(),finished_at:j.finished_at||null,devices:effective});
+  let note='任务 #'+id+' 已创建';
+  if(Array.isArray(d.skipped)&&d.skipped.length)note+='；'+d.skipped.length+' 台被跳过：'+d.skipped.map(s=>esc(s.hostname)+'（'+esc(s.reason||s.error||'原因未说明')+'）').join('、');
+  if(Array.isArray(d.warnings)&&d.warnings.length)note+='；⚠ '+d.warnings.map(w=>esc(typeof w==='string'?w:(w.message||w.msg||''))).join('；');
+  this.stickyNote={text:note,warn:!!(d.warnings&&d.warnings.length),until:Date.now()+20000};
+  this.setActHint(this.stickyNote.text,this.stickyNote.warn);
   this.loadJobDetail(id);this.subscribe();
  }catch(e){this.setActHint('发起失败：'+e.message,true)}
 },
-normJob(j){return{id:j.id!=null?j.id:j.job_id,kind:j.kind||'',version:j.version||(j.params&&j.params.version)||'',status:j.status||'running',created_at:j.created_at||j.createdAt||null,finished_at:j.finished_at||j.finishedAt||null,devices:j.devices||[],summary:j.summary||null}},
-normTask(t){return{hostname:t.hostname||t.host||'',stage:String(t.stage||'').toLowerCase(),status:this.normStatus(t.status),error:t.error||t.reason||'',started_at:t.started_at||t.startedAt||null,finished_at:t.finished_at||t.finishedAt||null,from_version:t.from_version||t.version_before||''}},
+normJob(j){return{id:j.id!=null?j.id:j.job_id,kind:j.kind||'',version:j.version||(j.params&&j.params.version)||'',filename:j.filename||'',oss_url_expires:j.oss_url_expires!=null?j.oss_url_expires:null,error:j.error||j.error_code||'',error_code:j.error_code||'',status:j.status||'running',created_at:j.created_at||j.createdAt||null,finished_at:j.finished_at||j.finishedAt||null,devices:j.devices||[],summary:j.summary||null}},
+normTask(t){return{hostname:t.hostname||t.host||'',stage:String(t.stage||'').toLowerCase(),status:this.normStatus(t.status),error:t.error||t.reason||'',error_code:t.error_code||'',started_at:t.started_at||t.startedAt||null,finished_at:t.finished_at||t.finishedAt||null,from_version:t.from_version||t.version_before||''}},
 adoptJob(j){this.job=j;this.tasks=(j.devices||[]).map(h=>({hostname:h,stage:'',status:'pending',error:'',from_version:this.fromSnap[h]||''}));this.logs={};this.logOff={};this.expanded=null;this.renderJob()},
 async loadJobs(){
  try{
@@ -609,7 +745,10 @@ renderJob(){
  const created=this.parseTs(j.created_at);const fin=this.parseTs(j.finished_at);
  const end=fin||(st==='running'?Date.now():null);
  const el=(created&&end)?(end-created)/1000:null;
- sumEl.innerHTML=`<b>#${esc(j.id)}</b><span>${esc(this.KIND_LBL[j.kind]||j.kind||'任务')} → <b>${esc(j.version||'—')}</b></span><span class="tstat ${st}">${this.STAT_LBL[st]||esc(st)}</span><span>共 <b>${total}</b> 台</span><span>成功 <b style="color:#15803d">${cnt.success}</b></span><span>失败 <b style="color:#b91c1c">${cnt.failed}</b></span><span>阻断 <b style="color:#b45309">${cnt.blocked}</b></span><span>进行中 <b style="color:#1d4ed8">${cnt.running}</b></span><span>等待 <b>${cnt.pending}</b></span>${el!=null?`<span>耗时 <b>${this.fmtDur2(el)}</b></span>`:''}${created?`<span>发起于 ${esc(this.fmtClock(created))}</span>`:''}`;
+ let oss=false;
+ if(this.isOssErr(j.error,j.error_code))oss=true;
+ if(!oss)for(const t of this.tasks){if(t.status==='failed'&&this.isOssErr(t.error,t.error_code)){oss=true;break}}
+ sumEl.innerHTML=(oss?'<div class=ossban>⚠ OSS 链接已过期（403），设备下载被拒——请重新生成签名 URL 并新建任务</div>':'')+`<b>#${esc(j.id)}</b><span>${esc(this.KIND_LBL[j.kind]||j.kind||'任务')} → <b>${esc(j.version||'—')}</b></span><span class="tstat ${st}">${this.STAT_LBL[st]||esc(st)}</span><span>共 <b>${total}</b> 台</span><span>成功 <b style="color:#15803d">${cnt.success}</b></span><span>失败 <b style="color:#b91c1c">${cnt.failed}</b></span><span>阻断 <b style="color:#b45309">${cnt.blocked}</b></span><span>进行中 <b style="color:#1d4ed8">${cnt.running}</b></span><span>等待 <b>${cnt.pending}</b></span>${el!=null?`<span>耗时 <b>${this.fmtDur2(el)}</b></span>`:''}${created?`<span>发起于 ${esc(this.fmtClock(created))}</span>`:''}${j.oss_url_expires?`<span>链接有效期 ${esc(this.fmtRemain(j.oss_url_expires*1000-Date.now()))}</span>`:''}`;
  grid.innerHTML=this.tasks.length?this.tasks.map(t=>this.cardHtml(t)).join(''):(this.active()?'<p class=uempty>任务已创建，等待设备状态上报…</p>':'');
 },
 cardHtml(t){
@@ -689,6 +828,12 @@ onEvent(name,raw){
   if(!this.job||this.job.id!==j.id)this.adoptJob(j);else{this.job=j}
   this.renderJob();
   if(!this.active()){this.teardown();this.loadJobDetail(j.id)}
+  return}
+ if(type==='pkg'){
+  if(this.shaComputing&&m.version!=null&&String(m.version)===String(this.param.version)&&(!m.arch||String(m.arch)===String(this.param.arch))){
+   if(m.status==='ok'&&m.sha256){this.stopShaPoll();this.shaComputing=false;this.param.sha256=String(m.sha256).toLowerCase();this.param.shaSrc='server';if(m.size!=null)this.param.size=m.size;this.renderParam()}
+   else this.pollShaTick();
+  }else if(m.status==='ok')this.loadRegistry();
   return}
  if(type==='task'||m.task){this.applyTask(this.normTask(m.task||m));return}
  if(type==='log'||m.text||m.chunk||m.lines){
