@@ -2913,16 +2913,21 @@ def _run_db_backup():
             fh.write(f"port={DB_PORT}\n")
         os.chmod(defaults, 0o600)
         with open(dest, "wb") as out:
-            proc = subprocess.run(
+            dumper = subprocess.Popen(
                 ["mysqldump", f"--defaults-extra-file={defaults}", "--single-transaction",
                  "--routines", "--triggers", DB_NAME],
-                stdout=out, stderr=subprocess.PIPE, timeout=1800)
-        if proc.returncode != 0:
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            zipper = subprocess.Popen(["gzip", "-6"], stdin=dumper.stdout, stdout=out)
+            dumper.stdout.close()  # gzip 先退出时让 mysqldump 收到 SIGPIPE
+            dump_rc = dumper.wait(timeout=1800)
+            zip_rc = zipper.wait(timeout=600)
+            dump_err = dumper.stderr.read().decode("utf-8", "replace")[:300]
+        if dump_rc != 0 or zip_rc != 0:
             try:
                 os.remove(dest)
             except OSError:
                 pass
-            return {"ok": False, "error": _sanitize(proc.stderr.decode("utf-8", "replace")[:300])}
+            return {"ok": False, "error": _sanitize(dump_err or f"mysqldump rc={dump_rc}, gzip rc={zip_rc}")}
     except OSError as exc:
         return {"ok": False, "error": str(exc)}
     finally:
