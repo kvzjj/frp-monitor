@@ -50,9 +50,9 @@ const ctx = { document, window, location, history, fetch: fetchMock, setInterval
   navigator: { clipboard: { writeText: async () => true } } };
 ctx.globalThis = ctx;
 vm.createContext(ctx);
-vm.runInContext(js + "\n;globalThis.__T={Assets:Assets,Upg:Upg};", ctx);
+vm.runInContext(js + "\n;globalThis.__T={Assets:Assets,Upg:Upg,Rep:Rep};", ctx);
 
-const A = ctx.__T.Assets, UpgT = ctx.__T.Upg;
+const A = ctx.__T.Assets, UpgT = ctx.__T.Upg, R = ctx.__T.Rep;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const ok = (name, cond) => { if (!cond) { console.error('FAIL: ' + name); process.exitCode = 1; } else console.log('ok - ' + name); };
 
@@ -107,11 +107,12 @@ const ok = (name, cond) => { if (!cond) { console.error('FAIL: ' + name); proces
   ok('360°：台账信息 + 维修记录 + 处理流水 + 配件核对', ['台账信息', '维修记录', '处理流水', '配件核对'].every(s => m.includes(s)));
   ok('360°：设备编号大写 + 修改人', m.includes('EP-000031') && m.includes('修改人'));
   ok('360°：缺省字段显示 —', m.includes('—'));
-  // 未完结维修跳维修看板
+  // 未完结维修跳维修看板（KVWO-80 已并入：真实 Rep 看板替代占位，KVWO-88）
   const dev = A.devices.find(d => d.openRepairs > 0);
   A.go('repairs', { q: dev.code });
-  ok('未完结维修点击 → 维修子页签 + 待筛选编号', A.tab === 'repairs' && el('asRepairsSlot').innerHTML.includes(dev.code.toUpperCase()) && el('asRepairsSlot').innerHTML.includes('KVWO-80'));
-  ok('维修占位说明契约来源', el('asRepairsSlot').innerHTML.includes('7 阶段'));
+  ok('未完结维修点击 → 维修子页签 + Rep 搜索联动', A.tab === 'repairs' && !el('atabRepairs').hidden && R.q === dev.code && el('repQ').value === dev.code);
+  await sleep(150); // 等 Rep.loadStats/loadList（fetch mock 404 → 降级）
+  ok('维修看板接口降级横幅（404 明示不冒充）', !el('repBanner').hidden && el('repBanner').innerHTML.includes('404'));
   // 模块 4：版本
   A.go('versions');
   const vb = el('asVersionBody').innerHTML;
