@@ -218,6 +218,19 @@ CSS = """*{box-sizing:border-box}body{margin:0;background:#f4f7fb;color:#172033;
 .shaorigin{font-size:12px;padding:2px 10px;border-radius:999px;background:#f1f5f9;color:#667085;white-space:nowrap}.shaorigin.registry{background:#dcfce7;color:#15803d}.shaorigin.manual{background:#dbeafe;color:#1d4ed8}.shaorigin.server{background:#ccfbf1;color:#0f766e}
 .psummary{display:flex;gap:14px;flex-wrap:wrap;align-items:center;background:#f8fafc;border:1px solid #e5eaf1;border-radius:8px;padding:10px 12px;margin-top:10px;font-size:13px;color:#475569}.psummary:empty{display:none}.psummary b{color:#172033}.psummary .shalink{gap:4px}
 .mism{font-size:11px;padding:1px 8px;border-radius:999px;background:#fef3c7;color:#b45309;border:1px solid #fde68a;white-space:nowrap}
+/* ---- web 代理补配标记（KVWO-18）：卡片小标 + 详情重试 ---- */
+.wfix{display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:2px 9px;border-radius:999px;background:#f1f5f9;color:#667085;border:1px solid #cbd5e1;white-space:nowrap}
+.wfix.running{background:#dbeafe;color:#1d4ed8;border-color:#bfdbfe}
+.wfix.failed{background:#fee2e2;color:#b91c1c;border-color:#fecaca;cursor:help}
+.wspin{display:inline-block;width:9px;height:9px;border:2px solid #93c5fd;border-top-color:transparent;border-radius:50%;animation:wspin .8s linear infinite;vertical-align:-1px}
+@keyframes wspin{to{transform:rotate(360deg)}}
+.wfixbar{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin:-4px 0 10px}
+.wfixbar small{color:#98a2b3}
+.wfixbar button{padding:6px 16px;font-size:12px;background:#dc2626}
+.wfixbar button:hover:not(:disabled){background:#b91c1c}
+.wfixbar button.arm{background:#b45309}
+.wfixbar button.arm:hover:not(:disabled){background:#92400e}
+.wfixbar button.err{background:#475569;color:#fff;cursor:default;overflow:hidden;text-overflow:ellipsis;max-width:100%}
 @media(max-width:640px){.vrows{grid-template-columns:1fr}.ucardgrid{grid-template-columns:1fr}.stepper{flex-wrap:wrap}.step{flex:1 1 30%}.prow label{width:auto;text-align:left}.pmeta{margin-left:0}}"""
 JS = """const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
@@ -234,6 +247,7 @@ function fmtDuration(m){if(m==null||isNaN(m))return '—';m=Math.round(m);if(m<=
 function fmtHours(m){return m==null||isNaN(m)?'—':(m/60).toFixed(1)+'h'}
 let fleet=[],sites=[],versions=[],sshHint={},q='',siteFilter='',verFilter='',targetVer='',pendingOnly=false,statusFilter='online',refreshInterval=15;
 let collectDur={enabled:false,map:{}};
+let webfix={map:{},cands:{}};
 function matches(f){
   if(siteFilter&&(f.site||'未登记')!==siteFilter)return false;
   if(verFilter&&(f.version||'未获取')!==verFilter)return false;
@@ -286,11 +300,43 @@ function renderTargetSel(){
   if(!targetVer||!opts.includes(targetVer))targetVer=opts.find(v=>v!=='未获取')||opts[0]||'';
   sel.value=targetVer;
 }
+/* ---- web 代理补配状态（KVWO-18，契约按 KVWO-19 feat/auto-webfix 定稿对齐）----
+ GET /api/webfix/tasks → {enabled,auto_enabled,port_base,port_max,verify_timeout,
+ candidates:[{hostname,web_port}],counts,tasks:[{task_id,hostname,site,trigger_type,
+ status queued|running|success|failed,error,attempts,web_port,created_at(Unix 秒),
+ finished_at,chars}]}（tasks 为每设备最新一行；candidates 为当前缺配候选）。
+ POST /api/webfix/retry {devices:[...]} → {ok,started:[{hostname,task_id,attempts}],
+ skipped:[{hostname,reason}]}（skipped 必须向用户呈现原因）；SSE 复用
+ /api/upgrade/events：type=webfix（task 同上字段）/ webfix_log（日志增量，总览不消费）。
+ 与 /api/hosts 的 web_port 组合判定：有 web_port → 正常（无标记）；在线 + 有 ssh_port + 无
+ web_port → 缺配候选，再叠加最新任务状态：queued/running → 补配中，failed → 失败（悬停看
+ error），success → 标记消失（版本随下次 /api/hosts 刷新恢复显示）。
+ 接口未上线（404）或拉取失败时优雅降级：沿用上次数据，从无数据时仅按 web_port 显示灰色
+「web 缺配」标记，不显示进行中/失败态。字段解析保留容错（数组/字典形态、ISO/Unix 时间）。 */
+function webfixTask(f){return (webfix.map||{})[String((f&&(f.hostname||f.host))||'').toLowerCase()]||null}
+function webfixState(f){
+  const t=webfixTask(f);
+  if(f&&f.web_port)return{code:'normal',task:t};
+  if(!(f&&f.online&&f.ssh_port))return{code:'',task:t};
+  const s=t?String(t.status||'').toLowerCase():'';
+  if(s==='success'||s==='done'||s==='ok')return{code:'',task:t};
+  if(s==='queued'||s==='running'||s==='pending')return{code:'running',task:t};
+  if(s==='failed'||s==='fail'||s==='error')return{code:'failed',title:(t&&t.error)||'补配失败（未返回原因）',task:t};
+  return{code:'missing',task:t};
+}
+function webfixBadge(f){
+  const st=webfixState(f);
+  if(st.code==='running')return '<span class="wfix running" title="web 代理补配进行中…"><i class="wspin"></i>补配中…</span>';
+  if(st.code==='failed')return `<span class="wfix failed" title="${esc(st.title)}">补配失败</span>`;
+  if(st.code==='missing')return '<span class="wfix" title="未检测到 web 代理（ep-编号-web），等待自动补配">web 缺配</span>';
+  return '';
+}
 function card(f){
   const tag=f.site?`<span class="stag" style="--c:${siteColor(f.site)}">${esc(f.site)}</span>`:'';
+  const wtag=webfixBadge(f);
   const cd=collectDur.enabled?collectDur.map[(f.hostname||'').toLowerCase()]:null;
   if(f.online){
-    return `<article class="card online" data-h="${esc(f.hostname)}"><div class="top"><span class="name"><i class="dot"></i>${esc(f.hostname)}</span>${tag}</div>
+    return `<article class="card online" data-h="${esc(f.hostname)}"><div class="top"><span class="name"><i class="dot"></i>${esc(f.hostname)}</span>${tag}${wtag}</div>
     <div class="row"><span>版本</span><span class="value">${esc(f.version||'未获取')}${f.version_error?` <small title="${esc(f.version_error)}">(读取失败)</small>`:''}</span></div>
     <div class="row"><span>硬件</span><span class="value">${esc(f.hardware||'—')}${f.hw_model?` · ${esc(f.hw_model)}`:''}</span></div>
     <div class="row"><span>IP</span><span class="value">${esc(f.ip||'—')}</span></div>
@@ -338,6 +384,15 @@ async function openDevice(h){
     const evRows=(d.events||[]).map(e=>`<div class="erow"><span class="etag ${esc(e.event_type)}">${ETAGS[e.event_type]||esc(e.event_type)}</span><b>${esc(e.ts||'')}</b><span class="edetail">${esc(e.new_value||e.detail||'')}${e.old_value&&e.new_value?' ← '+esc(e.old_value):''}</span></div>`).join('')||'<p class="eempty">暂无事件</p>';
     const stRows=(d.status||[]).map(s=>`<tr><td>${esc(s.ts)}</td><td>${s.online?'<span style="color:#16a34a">在线</span>':'<span style="color:#dc2626">离线</span>'}</td><td>${esc(s.release_version||'—')}</td><td>${s.connections!=null?s.connections:'—'}</td></tr>`).join('');
     const cmd=d.ssh_port?`ssh -J ${hint.jump||'ubuntu@124.222.147.63'} -p ${d.ssh_port} ${hint.user||'orangepi'}@127.0.0.1`:'';
+    const wf=webfixState(d);
+    const wfc=(webfix.cands||{})[String(d.hostname||d.host||'').toLowerCase()]||null;
+    const wfExp=(wfc&&wfc.web_port)||(wf.task&&wf.task.web_port)||null;
+    const wfRow=wf.code==='normal'?`${d.web_port||'—'} / <span style="color:#16a34a">正常</span>`
+      :wf.code==='running'?`${d.web_port||'—'} / <span style="color:#1d4ed8"><i class="wspin"></i> 补配中</span>`
+      :wf.code==='failed'?`${d.web_port||'—'} / <span style="color:#dc2626" title="${esc(wf.title)}">失败：${esc(wf.title)}</span>`
+      :wf.code==='missing'?`${d.web_port||'—'} / <span style="color:#667085" title="未检测到 web 代理（ep-编号-web），等待自动补配">${wfExp?`缺配（补配后 ${esc(String(wfExp))}）`:'缺配'}</span>`
+      :`${d.web_port||'—'} / <span style="color:#98a2b3" title="设备未在线或无 SSH 隧道时不判定缺配">—</span>`;
+    const wfBar=wf.code==='failed'&&d.online&&d.ssh_port?`<div class="wfixbar"><small>自动补配仅触发一次；重试将重新推送 frpc 配置并重启该机 frpc（隧道秒级闪断）</small><button type="button" id="webfixRetry">重试补配</button></div>`:'';
     $('#modalBody').innerHTML=`
       <header><div><span class="name"><i class="dot${d.online?'':' off'}"></i>${esc(d.hostname)}</span>${d.site?` <span class="stag" style="--c:${siteColor(d.site)}">${esc(d.site)}</span>`:''}</div><button class="x" id="mClose">✕</button></header>
       <div class="mgrid">
@@ -348,16 +403,37 @@ async function openDevice(h){
         <span>当前状态</span><b>${d.online?'在线':'未上线（最后在线 '+(d.last_seen?esc(d.last_seen):'从未')+'）'}</b>
         <span>版本</span><b>${esc(d.release_version||'未获取')}</b>
         <span>SSH / Web 端口</span><b>${d.ssh_port||'—'} / ${d.web_port||'—'}</b>
+        <span>web 代理</span><b>${wfRow}</b>
         <span>首次 / 最后在线</span><b>${esc(d.first_seen||'—')} / ${esc(d.last_seen||'从未')}</b>
         <span>在线率 24h / 7d</span><b>${pct(d.uptime_24h)} / ${pct(d.uptime_7d)}</b>
         <span>采集时长</span><b>${fmtDuration(cd?cd.today_minutes:null)}</b>
       </div>
+      ${wfBar}
       ${cmd?`<div class="cmd"><code id="sshCmd">${esc(cmd)}</code><button id="copyBtn">复制跳板命令</button></div>`:''}
       <h3>近 7 天采集时长</h3><div class="twrap"><table><tr><th>日期</th><th>时长</th></tr>${cdRows||`<tr><td colspan=2 class="eempty">${collectDur.enabled?'暂无采集记录':'采集时长统计未启用'}</td></tr>`}</table></div>
       <h3>最近快照（5 分钟一条）</h3><div class="twrap"><table><tr><th>时间</th><th>状态</th><th>版本</th><th>连接</th></tr>${stRows||'<tr><td colspan=4 class="eempty">暂无快照</td></tr>'}</table></div>
       <h3>最近事件</h3><div class="elist">${evRows}</div>`;
     $('#mClose').onclick=closeModal;
     const cb=$('#copyBtn');if(cb)cb.onclick=async()=>{if(await copyText(cmd)){cb.textContent='已复制 ✓';setTimeout(()=>cb.textContent='复制跳板命令',1500)}else alert(cmd)};
+    const rb=$('#webfixRetry');
+    if(rb)rb.onclick=async()=>{
+      if(rb.dataset.arm!=='1'){rb.dataset.arm='1';rb.classList.add('arm');rb.textContent='确认重试？';setTimeout(()=>{if(rb.isConnected&&rb.dataset.arm==='1'){rb.dataset.arm='';rb.classList.remove('arm');rb.textContent='重试补配'}},4000);return}
+      rb.dataset.arm='';rb.classList.remove('arm');
+      rb.disabled=true;rb.textContent='发起中…';
+      const wfail=msg=>{rb.disabled=false;rb.classList.remove('arm');rb.classList.add('err');rb.textContent='未发起：'+msg;setTimeout(()=>{if(rb.isConnected&&!rb.disabled){rb.classList.remove('err');rb.textContent='重试补配'}},8000)};
+      try{
+        const r=await fetch('/api/webfix/retry',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({devices:[d.hostname]})});
+        const j=await r.json().catch(()=>({}));
+        if(!r.ok||j.ok===false)throw Error(j.error||('HTTP '+r.status));
+        const wnorm=x=>String((x&&(x.hostname||x.host))||'').toLowerCase();
+        const me=String(d.hostname||'').toLowerCase();
+        const wstarted=(j.started||[]).some(x=>wnorm(x)===me);
+        const wskip=(j.skipped||[]).find(x=>wnorm(x)===me);
+        if(!wstarted)throw Error(String((wskip&&(wskip.reason||wskip.error))||'服务端未确认该设备（响应无 started 记录）'));
+        rb.classList.remove('arm');rb.textContent='已发起重试 ✓';
+        setTimeout(()=>{loadWebfix();if($('#modal').classList.contains('show'))openDevice(d.hostname)},900);
+      }catch(e){wfail(String(e.message||e))}
+    };
   }catch(e){$('#modalBody').innerHTML='<p class="eempty">'+esc(String(e))+'</p>'}
 }
 $('#refresh').onclick=()=>load(true);
@@ -404,10 +480,32 @@ async function loadCollectDuration(){
   if(fleet.length)renderGrid();
 }
 loadCollectDuration();setInterval(loadCollectDuration,300000);
+async function loadWebfix(){
+  try{
+    const r=await fetch('/api/webfix/tasks',{cache:'no-store'});
+    const d=await r.json();
+    if(!r.ok)throw Error(d.error||('HTTP '+r.status));
+    let arr=Array.isArray(d)?d:(d.tasks||d.items||d.devices||d.list||[]);
+    if(!Array.isArray(arr)&&arr&&typeof arr==='object')arr=Object.entries(arr).map(([h,t])=>Object.assign({hostname:h},(t&&typeof t==='object')?t:{status:t}));
+    const tsOf=v=>{if(typeof v==='number')return v>1e12?v:Math.round(v*1000);const p=Date.parse(String(v==null?'':v).replace(' ','T'));return isNaN(p)?0:p};
+    const map={};
+    for(const t of (arr||[])){
+      const h=String((t&&(t.hostname||t.host))||'').toLowerCase();if(!h)continue;
+      const ts=tsOf(t&&(t.created_at||t.created));
+      const old=map[h];if(old&&ts<old._ts)continue;
+      map[h]={hostname:h,status:t.status,error:t.error,attempts:t.attempts,trigger_type:t.trigger_type,web_port:t.web_port,created_at:t.created_at,finished_at:t.finished_at,_ts:ts};
+    }
+    const cands={};for(const c of (d.candidates||[]))if(c&&c.hostname)cands[String(c.hostname).toLowerCase()]=c;
+    webfix={map:map,cands:cands};
+  }catch(e){/* webfix 接口未上线/拉取失败：沿用已有数据；从无数据时退化为仅「web 缺配」灰色标记 */}
+  if(fleet.length)renderGrid();
+}
+loadWebfix();setInterval(loadWebfix,15000);
 
 /* ================= 升级管理视图（Upg.* 独立命名空间，不改动设备总览逻辑） =================
  数据契约（后端返工后联调基准）：POST /api/upgrade/jobs {kind,devices,params{version,oss_url,sha256}}、
- GET /api/upgrade/jobs(/<id>)、GET /api/upgrade/events（SSE：{type:'job'|'task'|'log',...}）、
+ GET /api/upgrade/jobs(/<id>)、GET /api/upgrade/events（SSE：{type:'job'|'task'|'log'|'webfix'|'webfix_log',...}，
+ webfix 类事件只驱动设备总览刷新、不进升级视图）、
  GET /api/upgrade/jobs/<id>/log?offset=N[&hostname=]、GET /api/upgrade/packages（包注册表）、
  POST/GET /api/upgrade/sha256（服务端一次性拉包算哈希，异步轮询）。旧 /api/packages 整套已不再依赖。
  字段解析全部做了兼容容错，后端未上线时各区城优雅空态；最终契约以胡磊涛完成评论为准。 */
@@ -863,6 +961,8 @@ onEvent(name,raw){
  if(s.trim().startsWith('{')){try{m=JSON.parse(s)}catch(e){m=null}}
  if(!m)return;
  const type=String(m.type||name||'').toLowerCase();
+ if(type==='webfix'){loadWebfix();return}   // 补配任务事件（KVWO-19 共流）：只驱动总览刷新，不进升级视图
+ if(type==='webfix_log')return;             // 补配日志增量：升级日志面板不消费
  if(type==='job'||m.job){
   const j=this.normJob(m.job||m);
   if(j.id==null)return;
