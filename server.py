@@ -157,7 +157,7 @@ def ssh_user_for_device(hardware="", hw_model=""):
 
 INDEX = """<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>EGO 设备面板</title><style>{css}</style></head><body><main>
 <header><div><h1>EGO 设备面板</h1><p id=sub>正在加载…</p></div><button id=refresh>立即刷新</button></header>
-<nav id=viewTabs class=vtabs><button type=button data-view=overview class=on>设备总览</button><button type=button data-view=upgrade>升级</button></nav>
+<nav id=viewTabs class=vtabs><button type=button data-view=overview class=on>设备总览</button><button type=button data-view=upgrade>升级</button><button type=button data-view=repairs>维修</button></nav>
 <section id=viewOverview>
 <section class=summary><div><b id=online>0</b><span>在线设备</span></div><div><b id=registered>0</b><span>登记设备</span></div><div><b id=pendingN>0</b><span id=targetLbl>待升级</span></div><div><b id=sitesN>0</b><span>站点</span></div><div><b id=missingN>0</b><span>未上线</span></div></section>
 <div class=toolbar><input id=q placeholder="搜索 hostname / device_id / 设备名 / IP"><select id=statusFilter><option value=all>全部状态</option><option value=online selected>仅在线</option><option value=offline>仅未上线</option></select><select id=targetSel title="升级目标版本"></select><button id=copyPending class=listbtn title="按当前筛选（站点/状态/版本/搜索）复制：设备号 站点 IP SSH端口 device_id 当前版本">复制待升级清单</button><button id=copyCmds class=listbtn title="按当前筛选复制 SSH 跳板登录命令">复制跳板命令</button><button id=copyList class=listbtn title="按当前筛选复制设备编号">复制编号</button></div>
@@ -180,9 +180,21 @@ INDEX = """<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=
 <section class=upanel id=upgActPanel><div class=uhead><h2>③ 发起升级</h2></div><div class=ubtns><button type=button id=upgRunAll>▶ 全流程升级所选</button><button type=button class=stagebtn data-kind=precheck>仅预检</button><button type=button class=stagebtn data-kind=download>仅下载</button><button type=button class=stagebtn data-kind=install>仅安装</button><button type=button class=stagebtn data-kind=verify>仅验证</button><button type=button class=stagebtn data-kind=cleanup>仅清理</button></div><p class=uhint id=upgActHint></p></section>
 <section class=upanel><div class=uhead><h2>④ 任务与进度</h2><span id=upgConn class=connchip>未连接</span></div><div id=upgJobSummary><p class=uempty>暂无升级任务</p></div><div id=upgTaskGrid></div></section>
 </section>
+<section id=viewRepairs hidden>
+<section class=summary><div><b id=repActive>—</b><span>未完结维修</span></div><div><b id=repTotal>—</b><span>维修记录</span></div><div><b id=repDoneN>—</b><span>已完结</span></div><div><b id=repSync>—</b><span>最后同步</span></div></section>
+<div id=repBanner class=rbanner hidden></div>
+<nav id=repStageStats class=sitesbar></nav>
+<div class=toolbar><input id=repQ placeholder="搜索设备编号 / 问题描述" spellcheck=false autocomplete=off><select id=repStageF title="按流转阶段筛选（仅列表视图）"><option value=all>全部阶段</option></select><select id=repTypeF><option value=all>全部类型</option></select><select id=repUnitF><option value=all>全部单位</option></select><select id=repOwnerF><option value=all>全部负责人</option></select><button id=repReload class=listbtn title="重新拉取维修列表与统计（后端默认每 5 分钟从飞书表同步一次）">重新加载</button><span class=rvswitch><button type=button id=repVKanban class=on>看板</button><button type=button id=repVList>列表</button></span></div>
+<div id=repKanban class=rkan><p class="uempty rkanhint">加载中…</p></div>
+<div id=repListWrap hidden>
+<div class=twrap><table class=rtable><thead><tr><th>设备编号</th><th>类型</th><th>阶段</th><th>所属单位</th><th>问题描述</th><th>负责人</th><th>最后跟进</th><th>台账</th></tr></thead><tbody id=repTbody></tbody></table></div>
+<div id=repDoneWrap class=rdonewrap hidden><button type=button id=repDoneToggle class=listbtn>已完结记录</button><div class=twrap id=repDoneTable hidden><table class=rtable><thead><tr><th>设备编号</th><th>类型</th><th>阶段</th><th>所属单位</th><th>问题描述</th><th>负责人</th><th>最后跟进</th><th>台账</th></tr></thead><tbody id=repDoneTbody></tbody></table></div></div>
+</div>
+</section>
 </main>
 <div id=modal class=modal><div id=modalBody class=mbody></div></div>
 <div id=upgModal class=modal><div id=upgModalBody class=mbody></div></div>
+<div id=repModal class=modal><div id=repModalBody class=mbody></div></div>
 <script>{js}</script></body></html>"""
 CSS = """*{box-sizing:border-box}body{margin:0;background:#f4f7fb;color:#172033;font:14px system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif}main{max-width:1100px;margin:0 auto;padding:32px 20px}header{display:flex;justify-content:space-between;align-items:center;margin-bottom:22px}h1{margin:0 0 7px;font-size:28px}p{margin:0;color:#718096}button{border:0;border-radius:8px;padding:10px 16px;background:#2563eb;color:white;cursor:pointer;font-size:14px}input,select{font:inherit;padding:9px 12px;border:1px solid #cbd5e1;border-radius:8px;background:white;color:#172033;outline:none}input:focus,select:focus{border-color:#2563eb}.summary{display:flex;gap:14px;margin-bottom:18px;flex-wrap:wrap}.summary div{background:white;border:1px solid #e5eaf1;border-radius:12px;padding:14px 22px;min-width:120px;box-shadow:0 2px 8px #1720330a}.summary b{display:block;font-size:26px}.summary span{color:#718096;font-size:12px}.toolbar{display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap}.toolbar input{flex:1;min-width:180px}.listbtn{background:#f1f5f9;color:#334155;border:1px solid #cbd5e1;white-space:nowrap}.listbtn:hover{background:#e2e8f0}.sitesbar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px}.chip{border:1px solid #e5eaf1;background:white;color:#334155;border-radius:999px;padding:6px 14px;font-size:13px;cursor:pointer}.chip b{color:var(--c,#2563eb)}.chip.on{background:var(--c,#2563eb);border-color:var(--c,#2563eb);color:white}.chip.on b{color:white}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:14px}.card{background:white;border:1px solid #e5eaf1;border-radius:12px;padding:16px;box-shadow:0 2px 8px #1720330a;cursor:pointer;transition:transform .08s}.card:hover{transform:translateY(-1px);border-color:#b9cbdf}.card.offline{opacity:.72;background:#fafbfc}.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;gap:6px}.name{font-weight:700;font-size:16px;word-break:break-all}.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px;background:#16a34a}.dot.off{background:#dc2626}.stag{font-size:11px;padding:2px 9px;border-radius:999px;background:color-mix(in srgb,var(--c,#64748b) 12%,white);color:var(--c,#64748b);border:1px solid color-mix(in srgb,var(--c,#64748b) 35%,white);white-space:nowrap}.row{display:flex;justify-content:space-between;color:#667085;padding-top:7px;font-size:13px;gap:8px}.value{font-family:monospace;color:#344054;text-align:right;word-break:break-all}.value.bad{color:#dc2626}small{color:#98a2b3}.empty{grid-column:1/-1;background:white;border:1px dashed #cbd5e1;border-radius:12px;padding:30px;text-align:center;color:#718096}#events{margin-top:26px;background:white;border:1px solid #e5eaf1;border-radius:12px;padding:18px 20px}#events h2{margin:0 0 10px;font-size:16px}#events .elist{max-height:320px;overflow:auto}.erow{display:flex;gap:10px;align-items:baseline;padding:7px 0;border-bottom:1px dashed #eef2f7;font-size:13px}.erow:last-child{border-bottom:0}.erow b{font-family:monospace}.etag{display:inline-block;min-width:64px;text-align:center;padding:2px 8px;border-radius:999px;font-size:12px;white-space:nowrap}.etag.online,.etag.first_seen{background:#dcfce7;color:#15803d}.etag.offline{background:#fee2e2;color:#b91c1c}.etag.version_change{background:#dbeafe;color:#1d4ed8}.edetail{color:#475569;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.erow time{color:#98a2b3;font-size:12px;white-space:nowrap}.eempty{color:#718096;margin:6px 0}.modal{display:none;position:fixed;inset:0;background:#0f172ac9;z-index:50;padding:24px;overflow:auto}.modal.show{display:flex;align-items:flex-start;justify-content:center}.mbody{width:min(760px,100%);background:white;border-radius:14px;padding:22px 24px;box-shadow:0 30px 90px #0006}.mbody header{margin-bottom:6px}.mbody .name{font-size:19px}.mbody .x{background:#f1f5f9;color:#475569;padding:6px 12px;font-size:15px}.mbody h3{margin:18px 0 8px;font-size:14px;color:#334155}.mgrid{display:grid;grid-template-columns:auto 1fr;gap:6px 16px;margin:12px 0;font-size:13px}.mgrid span{color:#718096}.mgrid b{font-family:ui-monospace,monospace;font-weight:600;word-break:break-all}.cmd{display:flex;gap:8px;align-items:center;background:#0f172a;border-radius:8px;padding:10px 12px;margin:10px 0}.cmd code{flex:1;color:#7dd3fc;font-size:12px;font-family:ui-monospace,monospace;word-break:break-all}.cmd button{padding:7px 12px;font-size:12px;background:#0369a1;white-space:nowrap}.twrap{overflow:auto;border:1px solid #e5eaf1;border-radius:8px}.twrap table{width:100%;border-collapse:collapse;font-size:12px;min-width:420px}.twrap th,.twrap td{padding:7px 10px;border-bottom:1px solid #eef2f7;text-align:left}.twrap th{color:#718096;font-weight:500;background:#f8fafc}.mbody .elist{max-height:240px;overflow:auto}@media(max-width:640px){.toolbar{flex-direction:column}.summary div{min-width:100px;flex:1}}
 /* ---- 升级管理视图（Upg） ---- */
@@ -231,7 +243,53 @@ CSS = """*{box-sizing:border-box}body{margin:0;background:#f4f7fb;color:#172033;
 .wfixbar button.arm{background:#b45309}
 .wfixbar button.arm:hover:not(:disabled){background:#92400e}
 .wfixbar button.err{background:#475569;color:#fff;cursor:default;overflow:hidden;text-overflow:ellipsis;max-width:100%}
-@media(max-width:640px){.vrows{grid-template-columns:1fr}.ucardgrid{grid-template-columns:1fr}.stepper{flex-wrap:wrap}.step{flex:1 1 30%}.prow label{width:auto;text-align:left}.pmeta{margin-left:0}}"""
+@media(max-width:640px){.vrows{grid-template-columns:1fr}.ucardgrid{grid-template-columns:1fr}.stepper{flex-wrap:wrap}.step{flex:1 1 30%}.prow label{width:auto;text-align:left}.pmeta{margin-left:0}}
+/* ---- 维修流转视图（Rep，KVWO-80）：统计 / 看板 / 列表 / 详情 ---- */
+.rbanner{background:#fef2f2;border:1px solid #fecaca;color:#b91c1c;border-radius:10px;padding:10px 14px;font-size:13px;margin-bottom:14px;line-height:1.7}
+.rvswitch{display:inline-flex;border:1px solid #cbd5e1;border-radius:8px;overflow:hidden;flex:none}
+.rvswitch button{background:#f8fafc;color:#475569;border-radius:0;padding:9px 16px;font-size:13px}
+.rvswitch button.on{background:#2563eb;color:white}
+.rchip:hover{border-color:var(--c,#2563eb)}
+.rkan{display:grid;grid-template-columns:repeat(7,minmax(160px,1fr));gap:10px;align-items:start;overflow-x:auto;padding-bottom:6px}
+.rkanhint{grid-column:1/-1}
+.rkcol{background:#f8fafc;border:1px solid #e5eaf1;border-radius:10px;padding:8px;min-width:0}
+.rkcol h3{margin:0 0 8px;font-size:12px;display:flex;justify-content:space-between;align-items:center;gap:6px}
+.rkt{font-size:11px;padding:2px 8px;border-radius:999px;background:color-mix(in srgb,var(--c,#64748b) 12%,white);color:var(--c,#64748b);border:1px solid color-mix(in srgb,var(--c,#64748b) 35%,white);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rkn{background:#e2e8f0;border-radius:999px;font-size:11px;padding:1px 8px;color:#475569;flex:none}
+.rkempty{color:#b6c0cf;font-size:11px;text-align:center;padding:8px 0}
+.rcard{background:white;border:1px solid #e5eaf1;border-radius:8px;padding:9px 10px;margin-bottom:8px;cursor:pointer;font-size:12px;transition:transform .08s}
+.rcard:hover{transform:translateY(-1px);border-color:#b9cbdf}
+.rcard:last-child{margin-bottom:0}
+.rd{font-weight:700;font-family:ui-monospace,monospace;font-size:12px;word-break:break-all;display:flex;align-items:center;gap:5px;flex-wrap:wrap}
+.rtyp{font-size:10px;padding:1px 7px;border-radius:999px;background:#f1f5f9;color:#475569;white-space:nowrap;flex:none}
+.rtyp.rt2{background:#dbeafe;color:#1d4ed8}
+.rtyp.rt1{background:#fef3c7;color:#b45309}
+.rprob{color:#475569;margin-top:4px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.5}
+.rmeta{color:#98a2b3;font-size:11px;display:flex;justify-content:space-between;gap:6px;margin-top:6px}
+.ronrow{margin-top:6px}
+.ron{display:inline-block;font-size:10px;padding:1px 8px;border-radius:999px;white-space:nowrap}
+.ron.on{background:#dcfce7;color:#15803d}
+.ron.off{background:#fee2e2;color:#b91c1c}
+.ron.na{background:#f1f5f9;color:#98a2b3}
+.ron.link{cursor:pointer;border:1px solid transparent}
+.ron.link:hover{border-color:currentColor}
+.rtable{width:100%;border-collapse:collapse;font-size:12px;min-width:820px}
+.rtable th,.rtable td{padding:7px 10px;border-bottom:1px solid #eef2f7;text-align:left;vertical-align:top}
+.rtable th{color:#718096;font-weight:500;background:#f8fafc;white-space:nowrap}
+.rtable tbody tr{cursor:pointer}
+.rtable tbody tr:hover{background:#f8fafc}
+.rtable td.rdev{font-family:ui-monospace,monospace;font-weight:600;white-space:nowrap}
+.rprob-cell{max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rdonewrap{margin-top:12px}
+#repDoneToggle{margin-bottom:8px}
+.rtable td.rempty{color:#718096;text-align:center;padding:18px 10px;cursor:default}
+.rattach{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}
+.rattach a{display:flex;flex-direction:column;width:96px;border:1px solid #e5eaf1;border-radius:8px;overflow:hidden;background:#f8fafc;text-decoration:none}
+.rattach img{width:96px;height:72px;object-fit:cover;display:block}
+.rattach .rfname{font-size:11px;color:#667085;padding:4px 6px;word-break:break-all;line-height:1.4}
+.rfootbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:14px}
+.rfeishu{color:#2563eb;text-decoration:none;font-size:13px;border:1px solid #bfdbfe;background:#eff6ff;border-radius:8px;padding:8px 14px}
+.rfeishu:hover{background:#dbeafe}"""
 JS = """const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
 const ETAGS={online:'上线',offline:'掉线',version_change:'版本变更',first_seen:'新设备'};
@@ -536,7 +594,7 @@ archOf(f){const m=String((f&&(f.hw_model||f.hardware))||'').toLowerCase();if(/rk
 init(){
  const tabs=this.gid('viewTabs');
  tabs.addEventListener('click',e=>{const b=e.target.closest('button[data-view]');if(b)this.setView(b.dataset.view)});
- window.addEventListener('hashchange',()=>{const v=new URLSearchParams(location.hash.slice(1)).get('view')==='upgrade'?'upgrade':'overview';if(v!==this.view)this.setView(v,true)});
+ window.addEventListener('hashchange',()=>{const v=new URLSearchParams(location.hash.slice(1)).get('view');const w=['upgrade','repairs'].includes(v)?v:'overview';if(w!==this.view)this.setView(w,true)});
  const urlIn=this.gid('upgUrl'),shaIn=this.gid('upgSha');
  urlIn.addEventListener('input',()=>{clearTimeout(this.urlTimer);this.urlTimer=setTimeout(()=>this.onUrlInput(),400)});
  urlIn.addEventListener('change',()=>{clearTimeout(this.urlTimer);this.onUrlInput()});
@@ -561,15 +619,17 @@ init(){
  setInterval(()=>{if(this.view==='upgrade')this.loadFleet()},15000);
 },
 setView(v,skipHash){
- if(v!=='upgrade')v='overview';
+ if(!['overview','upgrade','repairs'].includes(v))v='overview';
  this.view=v;
  this.gid('viewOverview').hidden=v!=='overview';
  this.gid('viewUpgrade').hidden=v!=='upgrade';
+ this.gid('viewRepairs').hidden=v!=='repairs';
  document.querySelectorAll('#viewTabs button').forEach(b=>b.classList.toggle('on',b.dataset.view===v));
- if(!skipHash){const p=new URLSearchParams(location.hash.slice(1));if(v==='upgrade')p.set('view','upgrade');else p.delete('view');const s=p.toString();history.replaceState(null,'',location.pathname+location.search+(s?'#'+s:''))}
+ if(!skipHash){const p=new URLSearchParams(location.hash.slice(1));if(v==='overview')p.delete('view');else p.set('view',v);const s=p.toString();history.replaceState(null,'',location.pathname+location.search+(s?'#'+s:''))}
  if(v==='upgrade')this.enter();
+ if(v==='repairs')Rep.enter();
 },
-route(){const v=new URLSearchParams(location.hash.slice(1)).get('view')==='upgrade'?'upgrade':'overview';this.setView(v,true)},
+route(){const v=new URLSearchParams(location.hash.slice(1)).get('view');this.setView(['upgrade','repairs'].includes(v)?v:'overview',true)},
 enter(){this.loadRegistry();this.loadFleet();this.loadJobs();this.renderParam();this.updateSelBar();this.updateActions()},
 setActHint(msg,warn){const el=this.gid('upgActHint');el.textContent=msg||'';el.className='uhint'+(warn?' warn':'')},
 parseOssUrl(u){
@@ -990,7 +1050,320 @@ applyTask(t){
  this.renderJob();
 }
 };
-Upg.init();"""
+/* ================= 维修流转视图（Rep.* 独立命名空间，KVWO-80） =================
+ 数据契约（后端子任务 KVWO-79 联调基准；字段名解析带候选键容错，最终契约以后端完成评论为准）：
+ GET /api/repairs?stage=&type=&unit=&owner=&q= → {repairs:[…17 字段 snake_case +
+ record_id/feishu_url/device_online(true|false|null)]}（或直接返回数组）；
+ GET /api/repairs/stats → {total,by_stage:{7 阶段:计数},active_count,last_sync_at[,sync_error]}；
+ GET /api/repairs/{record_id} → 单条详情（附件含可直接访问的 URL）。
+ 后端未上线（404）/拉取失败/同步失败：明确提示 + 最后成功同步时间，
+ 不渲染陈旧数据冒充实时；空态有引导文案；字段缺失一律显示「—」。 */
+const Rep={
+STAGES:['待接收','损坏原因确认中','维修中','待发出确认','待发出','已发出','已完结'],
+SC:{'待接收':'#dc2626','损坏原因确认中':'#d97706','维修中':'#ea580c','待发出确认':'#7c3aed','待发出':'#4f46e5','已发出':'#0891b2','已完结':'#64748b'},
+KEYS:{
+ device_id:['device_id','device_no','device_code'],
+ device_type:['device_type','type'],
+ accessories:['accessories','parts'],
+ unit:['unit','unit_name','org'],
+ stage:['stage','phase'],
+ problem:['problem','description','issue'],
+ name:['name','contact_name'],
+ contact:['contact','phone','mobile','contact_info'],
+ receive_address:['receive_address','address','recv_address'],
+ return_address:['return_address','return_info','expected_return'],
+ tracking_no:['tracking_no','express_no','tracking_number'],
+ outbound_tracking_no:['outbound_tracking_no','send_tracking_no','outbound_express_no'],
+ owner:['owner','repair_owner','maintainer','assignee'],
+ last_followup_at:['last_followup_at','last_follow_time','followup_at','last_followup'],
+ last_followup_note:['last_followup_note','last_follow_desc','followup_note','last_note'],
+ attachments:['attachments','files'],
+ created_at:['created_at','create_time','created'],
+ record_id:['record_id','id'],
+ feishu_url:['feishu_url','feishu_link','record_url'],
+ device_online:['device_online','online']
+},
+view:'kanban',loading:false,rows:[],all:[],stats:null,statsErr:'',listErr:'',
+q:'',stageF:'',typeF:'',unitF:'',ownerF:'',doneOpen:false,qT:null,
+gid(i){return document.getElementById(i)},
+pick(r,ks){for(const k of ks){const v=r?r[k]:undefined;if(v!==undefined&&v!==null&&v!=='')return v}return null},
+parseTs(v){if(v==null)return null;if(typeof v==='number')return v<1e12?v*1000:v;const t=Date.parse(String(v).replace(' ','T'));return isNaN(t)?null:t},
+fmtClock(ms){const d=new Date(ms);return isNaN(d.getTime())?'—':d.toLocaleString('zh-CN',{hour12:false})},
+fmtRel(ms){if(ms==null)return '—';let s=Math.max(0,(Date.now()-ms)/1000);if(s<60)return Math.floor(s)+' 秒前';const m=s/60;if(m<60)return Math.floor(m)+' 分钟前';const h=m/60;if(h<24)return Math.floor(h)+' 小时前';const d=h/24;if(d<30)return Math.floor(d)+' 天前';if(d<365)return Math.floor(d/30)+' 个月前';return Math.floor(d/365)+' 年前'},
+f(v){return v==null||v===''?'—':v},
+apiErr(r,d){if(r&&r.status===404)return '接口未上线（404）——后端维修同步（KVWO-79）完成后可用';return (d&&d.error)?d.error:('HTTP '+(r?r.status:'?'))},
+norm(r){
+ const o={stage:''};
+ for(const k in this.KEYS)o[k]=this.pick(r,this.KEYS[k]);
+ o.stage=o.stage==null?'':String(o.stage);
+ o.stageIdx=this.STAGES.indexOf(o.stage);
+ o.done=o.stage==='已完结';
+ o.accessories=Array.isArray(o.accessories)?o.accessories.map(String):(o.accessories?String(o.accessories).split(/[,、]/).map(s=>s.trim()).filter(Boolean):[]);
+ const atts=Array.isArray(o.attachments)?o.attachments.slice():(o.attachments?[o.attachments]:[]);
+ o.attachments=atts.map(a=>{
+  if(a==null)return null;
+  if(typeof a==='string')return{name:'',url:a};
+  const u=String((a.url||a.link||a.src||a.path)||'');
+  const nm=String((a.name||a.filename||a.title)||(u?u.split('?')[0].split('/').pop():'')||'附件');
+  return{name:nm,url:u};
+ }).filter(a=>a&&a.url);
+ const dv=o.device_online;
+ o.online=(dv===true||dv===1||dv==='true'||dv==='True')?true:((dv===false||dv===0||dv==='false'||dv==='False')?false:null);
+ o.followMs=this.parseTs(o.last_followup_at);
+ o.createdMs=this.parseTs(o.created_at);
+ return o;
+},
+normList(d){const l=Array.isArray(d)?d:(d&&(d.repairs||d.items||d.records||d.list));return Array.isArray(l)?l:[]},
+hasFilter(){return !!(this.q||this.stageF||this.typeF||this.unitF||this.ownerF)},
+params(){
+ const p=new URLSearchParams();
+ if(this.view==='list'&&this.stageF)p.set('stage',this.stageF);
+ if(this.typeF)p.set('type',this.typeF);
+ if(this.unitF)p.set('unit',this.unitF);
+ if(this.ownerF)p.set('owner',this.ownerF);
+ if(this.q)p.set('q',this.q);
+ const s=p.toString();return s?'?'+s:'';
+},
+async loadStats(){
+ try{
+  const r=await fetch('/api/repairs/stats',{cache:'no-store'});
+  const d=await r.json().catch(()=>({}));
+  if(!r.ok)throw Error(this.apiErr(r,d));
+  this.stats={total:d.total,active_count:d.active_count,byStage:d.by_stage||d.byStage||{},syncMs:this.parseTs(d.last_sync_at||d.lastSyncAt),syncError:d.sync_error||d.last_error||d.last_sync_error||''};
+  this.statsErr='';
+ }catch(e){
+  this.statsErr='维修统计不可用：'+((e&&e.message)?e.message:String(e))+(this.stats&&this.stats.syncMs?'（最后成功同步 '+this.fmtClock(this.stats.syncMs)+'，以下统计为当时数据）':'');
+ }
+ this.renderStats();this.renderBanner();
+},
+async loadList(){
+ this.loading=true;this.render();
+ try{
+  const r=await fetch('/api/repairs'+this.params(),{cache:'no-store'});
+  const d=await r.json().catch(()=>({}));
+  if(!r.ok)throw Error(this.apiErr(r,d));
+  this.rows=this.normList(d).map(x=>this.norm(x));
+  if(!this.params()){this.all=this.rows;this.buildOptions()}
+  this.listErr='';
+ }catch(e){this.listErr='维修数据加载失败：'+((e&&e.message)?e.message:String(e));this.rows=[]}
+ this.loading=false;this.render();
+},
+load(){this.loadStats();this.loadList()},
+enter(){this.setView(this.view);this.load()},
+render(){this.renderBanner();if(this.view==='kanban')this.renderKanban();else this.renderList()},
+renderStats(){
+ const s=this.stats,by=s?s.byStage:null;
+ const num=v=>(v==null||v===''||isNaN(Number(v)))?null:Number(v);
+ const act=s?num(s.active_count):null;
+ const tot=s?num(s.total):null;
+ const dn=by?num(by['已完结']):null;
+ this.gid('repActive').textContent=act!=null?act:'—';
+ this.gid('repTotal').textContent=tot!=null?tot:'—';
+ this.gid('repDoneN').textContent=dn!=null?dn:'—';
+ const se=this.gid('repSync');
+ if(s&&s.syncMs){se.textContent=this.fmtRel(s.syncMs);se.title='最后成功同步：'+this.fmtClock(s.syncMs)}
+ else if(s){se.textContent='未同步';se.title='后端尚未完成过一次成功同步'}
+ else{se.textContent='—';se.title=''}
+ let h='';
+ for(const st of this.STAGES){const n=by?num(by[st]):null;h+='<span class="chip rchip" data-stage="'+esc(st)+'" style="--c:'+(this.SC[st]||'#64748b')+'">'+esc(st)+' <b>'+(n!=null?n:'—')+'</b></span>'}
+ this.gid('repStageStats').innerHTML=h;
+ this.gid('repStageStats').querySelectorAll('.rchip').forEach(c=>c.onclick=()=>{
+  const st=c.dataset.stage;
+  if(this.view==='list'){const sel=this.gid('repStageF');sel.value=(this.stageF===st)?'all':st;this.stageF=sel.value==='all'?'':sel.value;this.loadList()}
+  else{let target=null;this.gid('repKanban').querySelectorAll('.rkcol').forEach(x=>{if(x.dataset.col===st)target=x});if(target)target.scrollIntoView({behavior:'smooth',block:'nearest',inline:'start'})}
+ });
+},
+renderBanner(){
+ const el=this.gid('repBanner');
+ const errs=[];
+ if(this.statsErr)errs.push(this.statsErr);
+ if(this.listErr)errs.push(this.listErr);
+ if(!errs.length&&this.stats&&this.stats.syncError)errs.push('后端最近一次飞书同步失败：'+this.stats.syncError+(this.stats.syncMs?'（最后成功同步 '+this.fmtClock(this.stats.syncMs)+'）':'（尚无成功同步）'));
+ if(!errs.length){el.hidden=true;el.innerHTML='';return}
+ el.hidden=false;
+ el.innerHTML=errs.map(x=>'<div>'+esc(x)+'</div>').join('')+'<div>当前未展示实时数据；后端同步与接口恢复后，点「重新加载」获取最新。</div>';
+},
+renderKanban(){
+ const el=this.gid('repKanban');
+ if(this.listErr){el.innerHTML='<p class="uempty">维修数据不可用，详见上方提示</p>';return}
+ const cols=this.STAGES.slice();
+ const seen=new Set(this.STAGES);
+ for(const r of this.rows){const st=r.stage||'未填写阶段';if(!seen.has(st)){seen.add(st);cols.push(st)}}
+ const groups=new Map();for(const st of cols)groups.set(st,[]);
+ for(const r of this.rows)groups.get(r.stage||'未填写阶段').push(r);
+ let h='';
+ if(this.loading&&!this.rows.length)h+='<p class="uempty rkanhint">加载中…</p>';
+ else if(!this.rows.length&&this.hasFilter())h+='<p class="uempty rkanhint">没有匹配的维修记录——调整筛选或搜索词，或点「重新加载」</p>';
+ else if(!this.rows.length)h+='<p class="uempty rkanhint">暂无维修记录——飞书维修表同步到数据后此处展示</p>';
+ for(const st of cols){
+  const list=groups.get(st).slice().sort((a,b)=>(b.followMs||0)-(a.followMs||0));
+  const c=this.SC[st]||'#64748b';
+  h+='<div class="rkcol" data-col="'+esc(st)+'"><h3><span class="rkt" style="--c:'+c+'">'+esc(st)+'</span><span class="rkn">'+list.length+'</span></h3>'+(list.length?list.map(r=>this.cardHtml(r)).join(''):'<div class="rkempty">暂无</div>')+'</div>';
+ }
+ el.innerHTML=h;
+},
+cardHtml(r){
+ const cls=r.device_type==='双目'?' rt2':(r.device_type==='单目'?' rt1':'');
+ const typ=r.device_type?'<span class="rtyp'+cls+'">'+esc(r.device_type)+'</span>':'';
+ return '<div class="rcard" data-rid="'+esc(r.record_id)+'">'
+  +'<div class="rd">'+esc(r.device_id||'（无编号）')+typ+'</div>'
+  +(r.problem?'<div class="rprob" title="'+esc(r.problem)+'">'+esc(r.problem)+'</div>':'')
+  +'<div class="rmeta"><span>'+esc(r.owner||'负责人 —')+'</span><span'+(r.followMs?' title="'+esc(this.fmtClock(r.followMs))+'"':'')+'>'+(r.followMs?esc(this.fmtRel(r.followMs)):'跟进 —')+'</span></div>'
+  +'<div class="ronrow">'+this.onlineBadge(r)+'</div></div>';
+},
+onlineBadge(r){
+ const did=r.device_id||'';
+ if(r.online===true)return '<span class="ron on link" data-jump="'+esc(did)+'" title="设备台账当前在线，点击跳到设备总览定位">台账在线</span>';
+ if(r.online===false)return '<span class="ron off link" data-jump="'+esc(did)+'" title="设备台账当前离线，点击跳到设备总览定位">台账离线</span>';
+ return '<span class="ron na" title="设备编号未匹配到设备台账">台账 —</span>';
+},
+renderList(){
+ const act=this.rows.filter(r=>!r.done),dn=this.rows.filter(r=>r.done);
+ act.sort((a,b)=>(a.stageIdx-b.stageIdx)||((b.followMs||0)-(a.followMs||0)));
+ dn.sort((a,b)=>(b.followMs||0)-(a.followMs||0));
+ const tb=this.gid('repTbody');
+ let msg='';
+ if(this.listErr)msg='维修数据不可用，详见上方提示';
+ else if(!this.rows.length)msg=this.hasFilter()?'没有匹配的维修记录——调整筛选或搜索词试试':'暂无维修记录——飞书维修表同步到数据后此处展示';
+ else if(!act.length)msg='匹配记录均为已完结，见下方折叠区';
+ tb.innerHTML=msg?'<tr><td colspan="8" class="rempty">'+esc(msg)+'</td></tr>':act.map(r=>this.rowHtml(r)).join('');
+ this.gid('repDoneWrap').hidden=!dn.length;
+ this.gid('repDoneTbody').innerHTML=dn.map(r=>this.rowHtml(r)).join('');
+ this.gid('repDoneTable').hidden=!this.doneOpen;
+ this.gid('repDoneToggle').textContent='已完结记录（'+dn.length+'）'+(this.doneOpen?' 收起 ▴':' 展开 ▾');
+},
+rowHtml(r){
+ return '<tr data-rid="'+esc(r.record_id)+'"><td class="rdev">'+esc(r.device_id||'—')+'</td><td>'+esc(r.device_type||'—')+'</td><td><span class="stag" style="--c:'+(this.SC[r.stage]||'#64748b')+'">'+esc(r.stage||'—')+'</span></td><td>'+esc(r.unit||'—')+'</td><td class="rprob-cell" title="'+esc(r.problem||'')+'">'+esc(r.problem||'—')+'</td><td>'+esc(r.owner||'—')+'</td><td'+(r.followMs?' title="'+esc(this.fmtClock(r.followMs))+'"':'')+'>'+(r.followMs?esc(this.fmtRel(r.followMs)):'—')+'</td><td>'+this.onlineBadge(r)+'</td></tr>';
+},
+buildOptions(){
+ const cnt=key=>{const m=new Map();for(const r of this.all){const v=r[key];if(v)m.set(v,(m.get(v)||0)+1)}return[...m.entries()].sort((a,b)=>a[0].localeCompare(b[0],'zh'))};
+ const fill=(id,entries,label,cur)=>{
+  const s=this.gid(id);
+  s.innerHTML='<option value="all">'+label+'</option>'+entries.map(x=>'<option value="'+esc(x[0])+'">'+esc(x[0])+'（'+x[1]+'）</option>').join('');
+  s.value=(cur&&entries.some(x=>x[0]===cur))?cur:'all';
+  return s.value==='all'?'':s.value;
+ };
+ this.unitF=fill('repUnitF',cnt('unit'),'全部单位',this.unitF);
+ this.ownerF=fill('repOwnerF',cnt('owner'),'全部负责人',this.ownerF);
+ const tmap=new Map([['单目',0],['双目',0],['其他',0]]);
+ for(const r of this.all){if(r.device_type)tmap.set(r.device_type,(tmap.get(r.device_type)||0)+1)}
+ this.typeF=fill('repTypeF',[...tmap.entries()],'全部类型',this.typeF);
+ const sel=this.gid('repStageF');
+ sel.innerHTML='<option value="all">全部阶段</option>'+this.STAGES.map(v=>'<option value="'+esc(v)+'">'+esc(v)+'</option>').join('');
+ sel.value=(this.stageF&&this.STAGES.includes(this.stageF))?this.stageF:'all';
+ this.stageF=sel.value==='all'?'':sel.value;
+},
+setView(v){
+ this.view=v==='list'?'list':'kanban';
+ this.gid('repKanban').hidden=this.view!=='kanban';
+ this.gid('repListWrap').hidden=this.view!=='list';
+ this.gid('repStageF').hidden=this.view!=='list';   // 看板本身按阶段分列，阶段筛选仅列表视图生效
+ this.gid('repVKanban').classList.toggle('on',this.view==='kanban');
+ this.gid('repVList').classList.toggle('on',this.view==='list');
+ this.render();
+},
+async openDetail(rid){
+ rid=rid==null?'':String(rid);
+ const cached=this.rows.find(r=>String(r.record_id)===rid)||this.all.find(r=>String(r.record_id)===rid)||null;
+ this.gid('repModal').classList.add('show');
+ const body=this.gid('repModalBody');
+ if(!cached&&!rid){body.innerHTML='<p class="eempty">记录缺少 record_id，无法加载详情</p>';return}
+ body.innerHTML='<p class="eempty">加载中…</p>';
+ if(!rid){this.renderDetail(cached,true);return}
+ try{
+  const r=await fetch('/api/repairs/'+encodeURIComponent(rid),{cache:'no-store'});
+  const d=await r.json().catch(()=>({}));
+  if(!r.ok)throw Error(this.apiErr(r,d));
+  let raw=Array.isArray(d)?d[0]:(d&&(d.record||d.repair||d.item)||d);
+  this.renderDetail(this.norm((raw&&typeof raw==='object')?raw:{}),false);
+ }catch(e){
+  if(cached)this.renderDetail(cached,true);
+  else{body.innerHTML='<p class="eempty">详情加载失败：'+esc((e&&e.message)?e.message:String(e))+'</p><button type="button" class="x" id="repClose" style="margin-top:10px">关闭</button>';this.bindClose()}
+ }
+},
+bindClose(){const b=this.gid('repClose');if(b)b.onclick=()=>this.closeDetail()},
+closeDetail(){this.gid('repModal').classList.remove('show')},
+renderDetail(o,degraded){
+ const body=this.gid('repModalBody');
+ const atts=o.attachments||[];
+ const IMG_EXT=['.jpg','.jpeg','.png','.gif','.webp','.bmp'];
+ const attHtml=atts.length?'<div class="rattach">'+atts.map(a=>{
+  const href=a.url||'';
+  const isImg=IMG_EXT.some(e=>href.toLowerCase().split('?')[0].endsWith(e));
+  return '<a href="'+esc(href)+'" target="_blank" rel="noopener" title="'+esc(a.name||href)+'">'+(isImg?'<img src="'+esc(href)+'" loading="lazy" alt="'+esc(a.name)+'" onerror="this.style.display=&quot;none&quot;">':'')+'<span class="rfname">'+esc(a.name||'附件')+'</span></a>';
+ }).join('')+'</div>':'<p class="eempty">无附件</p>';
+ const fu=o.feishu_url?'<a class="rfeishu" href="'+esc(o.feishu_url)+'" target="_blank" rel="noopener">查看飞书原记录 ↗</a>':'<span class="eempty">飞书原记录链接：—</span>';
+ const jump=(o.online!==null&&o.device_id)?'<button type="button" id="repJump">在设备总览中定位 '+esc(o.device_id)+'</button>':'';
+ body.innerHTML=`
+  <header><div><span class="name">${esc(o.device_id||'（无设备编号）')}</span> <span class="stag" style="--c:${this.SC[o.stage]||'#64748b'}">${esc(o.stage||'阶段 —')}</span></div><button class="x" id="repClose">✕</button></header>
+  ${degraded?'<p class="uhint warn">详情接口不可用，以下为列表缓存数据（附件可能缺失）</p>':''}
+  <div class="mgrid">
+   <span>设备编号</span><b>${esc(this.f(o.device_id))}</b>
+   <span>设备所属类型</span><b>${esc(this.f(o.device_type))}</b>
+   <span>所含配件</span><b>${o.accessories&&o.accessories.length?esc(o.accessories.join('、')):'—'}</b>
+   <span>所属单位</span><b>${esc(this.f(o.unit))}</b>
+   <span>当前阶段</span><b>${esc(this.f(o.stage))}</b>
+   <span>问题描述</span><b style="white-space:pre-wrap">${esc(this.f(o.problem))}</b>
+   <span>姓名</span><b>${esc(this.f(o.name))}</b>
+   <span>联系方式</span><b>${esc(this.f(o.contact))}</b>
+   <span>收件地址</span><b>${esc(this.f(o.receive_address))}</b>
+   <span>期望寄回地址和联系方式</span><b>${esc(this.f(o.return_address))}</b>
+   <span>快递单号</span><b>${esc(this.f(o.tracking_no))}</b>
+   <span>发出快递单号</span><b>${esc(this.f(o.outbound_tracking_no))}</b>
+   <span>维修负责人</span><b>${esc(this.f(o.owner))}</b>
+   <span>最后跟进时间</span><b>${o.followMs?esc(this.fmtClock(o.followMs)+'（'+this.fmtRel(o.followMs)+'）'):'—'}</b>
+   <span>最后跟进说明</span><b style="white-space:pre-wrap">${esc(this.f(o.last_followup_note))}</b>
+   <span>创建时间</span><b>${o.createdMs?esc(this.fmtClock(o.createdMs)):'—'}</b>
+   <span>台账在线状态</span><b>${this.onlineBadge(o)}</b>
+  </div>
+  <h3>附件（${atts.length}）</h3>${attHtml}
+  <div class="rfootbar">${fu}${jump}</div>`;
+ this.bindClose();
+ const jb=this.gid('repJump');if(jb)jb.onclick=()=>{this.closeDetail();this.jumpDevice(o.device_id)};
+},
+jumpDevice(did){
+ if(!did)return;
+ Upg.setView('overview');
+ const qi=document.getElementById('q');
+ if(qi)qi.value=did;
+ q=String(did).toLowerCase();          // 设备总览全局搜索（matches() 消费）
+ siteFilter='';verFilter='';pendingOnly=false;statusFilter='all';
+ const sf=document.getElementById('statusFilter');if(sf)sf.value='all';
+ renderSites();renderVers();renderGrid();
+ if(qi)qi.scrollIntoView({behavior:'smooth',block:'center'});
+},
+init(){
+ this.gid('repKanban').addEventListener('click',e=>{
+  const j=e.target.closest('.ron.link');if(j){e.stopPropagation();this.jumpDevice(j.dataset.jump);return}
+  const c=e.target.closest('.rcard');if(c)this.openDetail(c.dataset.rid);
+ });
+ const rowClick=e=>{
+  const j=e.target.closest('.ron.link');if(j){e.stopPropagation();this.jumpDevice(j.dataset.jump);return}
+  const tr=e.target.closest('tr[data-rid]');if(tr)this.openDetail(tr.dataset.rid);
+ };
+ this.gid('repTbody').addEventListener('click',rowClick);
+ this.gid('repDoneTbody').addEventListener('click',rowClick);
+ this.gid('repVKanban').onclick=()=>this.setView('kanban');
+ this.gid('repVList').onclick=()=>this.setView('list');
+ this.gid('repReload').onclick=()=>this.load();
+ this.gid('repDoneToggle').onclick=()=>{this.doneOpen=!this.doneOpen;this.renderList()};
+ const qi=this.gid('repQ');
+ qi.addEventListener('input',()=>{clearTimeout(this.qT);this.qT=setTimeout(()=>{this.q=qi.value.trim();this.loadList()},350)});
+ for(const id of['repStageF','repTypeF','repUnitF','repOwnerF']){
+  this.gid(id).addEventListener('change',()=>{
+   const g=i=>{const v=this.gid(i).value;return v==='all'?'':v};
+   this.stageF=g('repStageF');this.typeF=g('repTypeF');this.unitF=g('repUnitF');this.ownerF=g('repOwnerF');
+   this.loadList();
+  });
+ }
+ const m=this.gid('repModal');
+ m.addEventListener('click',e=>{if(e.target===m)this.closeDetail()});
+ document.addEventListener('keydown',e=>{if(e.key==='Escape')this.closeDetail()});
+ setInterval(()=>{if(!this.gid('viewRepairs').hidden)this.load()},60000);
+}
+};
+Upg.init();
+Rep.init();"""
 
 
 def _json_request(url, *, method="GET", data=None, headers=None, timeout=4):
