@@ -8,18 +8,20 @@ are returned. Results are naturally sorted by hostname/proxy name.
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 from urllib.request import Request, urlopen
 from datetime import datetime, timedelta, timezone
 import base64
 import hashlib
 import hmac
 import json
+import mimetypes
 import os
 import queue
 import re
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -110,6 +112,21 @@ WEBFIX_MAX_PARALLEL = max(1, int(os.getenv("FRP_MONITOR_WEBFIX_MAX_PARALLEL", "2
 # 上线后稳定窗口（秒，默认 60）：连续在线满窗且期间未掉线才自动触发，线上
 # 可经环境变量调整（KVWO-44）；0 = 满窗判定退化为下一轮刷新即触发
 WEBFIX_DELAY = max(0.0, float(os.getenv("FRP_MONITOR_WEBFIX_DELAY", "60")))
+
+# --- 维修面板（KVWO-78/79）：飞书维修表 lark-cli 定时同步 → 本地 SQLite + 只读 API
+# 数据源为飞书多维表（唯一维护入口，面板只读不写回）。同步命令 / base / table /
+# 本地库路径全部走环境变量，不硬编码凭证（lark-cli 自身凭证由其配置目录管理，
+# 与本服务解耦）。同步失败只记录错误状态、保留上次成功数据继续服务，不影响
+# 面板其他页签。配置说明见仓库 REPAIRS.md。
+REPAIR_SYNC_ENABLED = os.getenv("FRP_MONITOR_REPAIR_SYNC", "1").strip().lower() not in ("0", "false", "no", "off")
+REPAIR_SYNC_INTERVAL = max(60.0, float(os.getenv("FRP_MONITOR_REPAIR_INTERVAL", "300")))  # 默认 5 分钟
+REPAIR_LARK_CMD = os.getenv("FRP_MONITOR_REPAIR_LARK_CMD", "lark-cli")
+REPAIR_BASE_TOKEN = os.getenv("FRP_MONITOR_REPAIR_BASE_TOKEN", "V0YwbaOzya0ADBsO2wSc8M9Cntf")
+REPAIR_TABLE_ID = os.getenv("FRP_MONITOR_REPAIR_TABLE_ID", "tblf1nlwkHhMX1V9")
+REPAIR_VIEW_ID = os.getenv("FRP_MONITOR_REPAIR_VIEW", "vewVBaWePF")  # 仅用于拼飞书原记录链接
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPAIR_DB_PATH = os.getenv("FRP_MONITOR_REPAIR_DB", os.path.join(_SCRIPT_DIR, "repairs.sqlite"))
+REPAIR_ATTACH_DIR = os.getenv("FRP_MONITOR_REPAIR_ATTACH_DIR", os.path.join(_SCRIPT_DIR, "repair-attachments"))
 
 V0_HOSTS = {
     "ep-000101", "ep-000102", "ep-000103", "ep-000104", "ep-000105",
@@ -3750,6 +3767,468 @@ def _prune_webfix_memory():
 
 
 # ----------------------------------------------------------------------------
+# 维修面板（KVWO-78/79）：飞书维修表 lark-cli 同步 + 只读 API
+# ----------------------------------------------------------------------------
+# 飞书字段清单（field_id -> snake_case 键与解析方式）。lark-cli record-list 返回
+# 行矩阵 + field_id_list，列序按 field_id 排序、并非固定顺序，因此按 field_id
+# 动态对齐；飞书表加列/调序不影响解析，未登记字段自动忽略。
+REPAIR_FIELD_MAP = {
+    "fldx4c6Flq": ("device_no", "text"),             # 设备编号
+    "fldekV0gKB": ("device_type", "select"),         # 设备所属类型（单目/双目/其他）
+    "fldXSSDwxu": ("parts", "select_multi"),         # 所含配件（多选）
+    "flddlnusAD": ("unit", "text"),                  # 所属单位
+    "fld8pX79fy": ("stage", "select"),               # 当前阶段
+    "fldQUKUSwQ": ("problem", "text"),               # 问题描述
+    "fldPl56KmS": ("contact_name", "text"),          # 姓名
+    "fldPyqR6Kz": ("contact_phone", "text"),         # 联系方式
+    "fldaYxqLZP": ("recv_address", "text"),          # 收件地址
+    "fldK0Omrot": ("return_address", "text"),        # 期望寄回地址和联系方式
+    "fldNSnDuEW": ("tracking_no_in", "text"),        # 快递单号（寄入）
+    "fld5JmUvOY": ("tracking_no_out", "text"),       # 发出快递单号（寄出）
+    "fldb9pcfQp": ("owner_name", "user"),            # 维修负责人（user，取 name）
+    "fldVVgRTyK": ("last_followup_at", "datetime"),  # 最后跟进时间
+    "fldHpO5cwl": ("last_followup_note", "text"),    # 最后跟进说明
+    "fld9KwsKJB": ("attachments", "attachment"),     # 附件（file_token/name/size）
+    "fldiwa2Opq": ("created_at", "datetime"),        # 创建时间（飞书自动字段）
+}
+# 流转阶段固定顺序（排序用）；未知阶段排在已知之后（按名称）
+REPAIR_STAGE_ORDER = ["待接收", "损坏原因确认中", "维修中", "待发出确认", "待发出", "已发出", "已完结"]
+REPAIR_DONE_STAGE = "已完结"
+REPAIR_ITEM_FIELDS = ["record_id", "device_no", "device_type", "parts", "unit", "stage",
+                      "problem", "contact_name", "contact_phone", "recv_address",
+                      "return_address", "tracking_no_in", "tracking_no_out", "owner_name",
+                      "last_followup_at", "last_followup_note", "created_at"]
+REPAIR_LARK_TIMEOUT = 120     # 单次 lark-cli record-list 子进程超时（秒）
+REPAIR_ATTACH_TIMEOUT = 180   # 单个附件下载超时（秒）
+
+
+def repair_feishu_url(record_id):
+    """飞书原记录链接（面板详情页跳回飞书用）。"""
+    return (f"https://archebase.feishu.cn/base/{REPAIR_BASE_TOKEN}"
+            f"?table={REPAIR_TABLE_ID}&view={REPAIR_VIEW_ID}&record={record_id}")
+
+
+def _repair_json_lenient(text):
+    """从 lark-cli stdout 解析 JSON（容忍进度前缀，取首个 '{' 起）。"""
+    text = text or ""
+    pos = text.find("{")
+    if pos < 0:
+        raise ValueError("输出中不含 JSON")
+    return json.loads(text[pos:])
+
+
+def _repair_cell(cell, kind):
+    """按字段类型解析飞书行矩阵单元格 → snake_case 值；空值一律 None。"""
+    if cell is None or cell == "":
+        return None
+    if kind == "text":
+        return str(cell).strip() or None
+    if kind == "select":
+        if isinstance(cell, list):
+            items = [str(v).strip() for v in cell if str(v).strip()]
+            return items[0] if items else None
+        return str(cell).strip() or None
+    if kind == "select_multi":
+        if isinstance(cell, list):
+            items = [str(v).strip() for v in cell if str(v).strip()]
+            return items or None
+        value = str(cell).strip()
+        return [value] if value else None
+    if kind == "user":
+        if isinstance(cell, list):
+            names = [str((u or {}).get("name") or "").strip()
+                     for u in cell if isinstance(u, dict)]
+            return "、".join(n for n in names if n) or None
+        return str(cell).strip() or None
+    if kind == "datetime":
+        return str(cell).strip() or None
+    if kind == "attachment":
+        items = []
+        for att in (cell if isinstance(cell, list) else [cell]):
+            if not isinstance(att, dict):
+                continue
+            token = str(att.get("file_token") or "").strip()
+            if token:
+                items.append({"file_token": token,
+                              "name": str(att.get("name") or token),
+                              "size": int(att.get("size") or 0)})
+        return items or None
+    return None
+
+
+def repair_parse_row(row, field_ids):
+    """把一行行矩阵（与 field_id_list 对齐）解析为 17 字段 snake_case dict。"""
+    rec = {spec[0]: None for spec in REPAIR_FIELD_MAP.values()}
+    for fid, cell in zip(field_ids or [], row or []):
+        spec = REPAIR_FIELD_MAP.get(fid)
+        if spec is not None:
+            rec[spec[0]] = _repair_cell(cell, spec[1])
+    return rec
+
+
+class RepairStore:
+    """维修记录本地 SQLite 存储（飞书表全量镜像，record_id 为主键）。
+
+    独立于可选的 MySQL 历史库：本地文件即数据，同步失败只记错误状态，
+    已入库数据继续服务只读 API；单 RLock 串行化读写，与 Store 同样的
+    “任何库问题都不拖垮面板”哲学。
+    """
+
+    _COLS = ["record_id", "device_no", "device_type", "parts", "unit", "stage",
+             "problem", "contact_name", "contact_phone", "recv_address",
+             "return_address", "tracking_no_in", "tracking_no_out", "owner_name",
+             "last_followup_at", "last_followup_note", "attachments",
+             "created_at", "synced_at"]
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.RLock()
+        self.conn = None
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            self.conn = sqlite3.connect(path, check_same_thread=False)
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA busy_timeout=5000")
+            self._migrate()
+        except (OSError, sqlite3.Error) as exc:
+            print(f"frp-monitor: 维修表本地库不可用（{path}: {exc}），维修面板无数据",
+                  flush=True)
+            self.conn = None
+
+    def _migrate(self):
+        with self.lock:
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS repairs ("
+                "record_id TEXT PRIMARY KEY, "  # 飞书 record_id（幂等主键）
+                + ", ".join(f"{c} TEXT" for c in self._COLS[1:-1])
+                + ", synced_at REAL)")
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS repairs_sync ("
+                "id INTEGER PRIMARY KEY CHECK (id = 1), "
+                "last_sync_at REAL, "   # 最近一次同步尝试（含失败）
+                "last_ok_at REAL, "     # 最近一次成功同步（数据新鲜度）
+                "last_error TEXT, "     # 最近一次失败原因（成功则清空）
+                "record_count INTEGER)")
+            self.conn.execute("INSERT OR IGNORE INTO repairs_sync (id) VALUES (1)")
+            self.conn.commit()
+
+    @staticmethod
+    def _decode(item):
+        for col in ("parts", "attachments"):
+            item[col] = json.loads(item[col]) if item[col] else None
+        return item
+
+    def replace_all(self, records, synced_at=None):
+        """全量镜像式幂等写入：record_id upsert，飞书已删记录本地同步删除。"""
+        if self.conn is None:
+            return 0
+        synced_at = time.time() if synced_at is None else synced_at
+        json_cols = {"parts", "attachments"}
+        cols = self._COLS
+        with self.lock:
+            cur = self.conn.cursor()
+            try:
+                cur.execute("BEGIN")
+                for rid, rec in records.items():
+                    row = {"record_id": rid, "synced_at": synced_at, **rec}
+                    values = [json.dumps(row.get(c), ensure_ascii=False) if c in json_cols
+                              else row.get(c) for c in cols]
+                    cur.execute(f"INSERT OR REPLACE INTO repairs ({','.join(cols)}) "
+                                f"VALUES ({','.join('?' * len(cols))})", values)
+                if records:
+                    cur.execute(f"DELETE FROM repairs WHERE record_id NOT IN "
+                                f"({','.join('?' * len(records))})", list(records))
+                else:
+                    cur.execute("DELETE FROM repairs")
+                cur.execute("UPDATE repairs_sync SET last_sync_at = ?, last_ok_at = ?, "
+                            "last_error = NULL, record_count = ? WHERE id = 1",
+                            (synced_at, synced_at, len(records)))
+                self.conn.commit()
+            except sqlite3.Error:
+                self.conn.rollback()
+                raise
+        return len(records)
+
+    def set_error(self, error):
+        """同步失败：记错误状态，保留上次成功数据与计数不动。"""
+        if self.conn is None:
+            return
+        with self.lock:
+            self.conn.execute("UPDATE repairs_sync SET last_sync_at = ?, last_error = ? "
+                              "WHERE id = 1", (time.time(), str(error)[:500]))
+            self.conn.commit()
+
+    def all_records(self):
+        """全部记录 dict 列表，按阶段固定顺序 + 创建时间倒序排列。"""
+        if self.conn is None:
+            return []
+        cols = self._COLS
+        with self.lock:
+            rows = self.conn.execute(f"SELECT {','.join(cols)} FROM repairs").fetchall()
+        items = [self._decode(dict(zip(cols, row))) for row in rows]
+        stage_rank = {s: i for i, s in enumerate(REPAIR_STAGE_ORDER)}
+
+        def created_key(it):
+            # ISO 8601（同一 +08:00 时区）字典序即时间序；空值排最后
+            return (0, it.get("created_at") or "") if it.get("created_at") else (1, "")
+
+        items.sort(key=created_key, reverse=True)
+        items.sort(key=lambda it: stage_rank.get(it.get("stage") or "", len(stage_rank) + 1))
+        return items
+
+    def get(self, record_id):
+        if self.conn is None:
+            return None
+        cols = self._COLS
+        with self.lock:
+            row = self.conn.execute(f"SELECT {','.join(cols)} FROM repairs "
+                                    "WHERE record_id = ?", (record_id,)).fetchone()
+        return self._decode(dict(zip(cols, row))) if row else None
+
+    def sync_state(self):
+        empty = {"last_sync_at": None, "last_ok_at": None, "last_sync_error": None,
+                 "record_count": 0}
+        if self.conn is None:
+            return empty
+        with self.lock:
+            row = self.conn.execute("SELECT last_sync_at, last_ok_at, last_error, "
+                                    "record_count FROM repairs_sync WHERE id = 1").fetchone()
+        if row is None:
+            return empty
+        return {"last_sync_at": row[0], "last_ok_at": row[1],
+                "last_sync_error": row[2], "record_count": row[3] or 0}
+
+
+repair_store = RepairStore(REPAIR_DB_PATH)
+REPAIR_SYNC_LOCK = threading.Lock()
+
+
+def _repair_lark_run(args, timeout=REPAIR_LARK_TIMEOUT, cwd=None):
+    """跑一次 lark-cli 子进程，stdout 解析 JSON；非零退出 / ok=false 抛 RuntimeError。"""
+    argv = shlex.split(REPAIR_LARK_CMD) + list(args)
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, cwd=cwd)
+    except FileNotFoundError:
+        raise RuntimeError(f"lark-cli 不存在（{REPAIR_LARK_CMD}），"
+                           f"请安装或配置 FRP_MONITOR_REPAIR_LARK_CMD")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"lark-cli 超时（>{timeout}s）")
+    if proc.returncode != 0:
+        raise RuntimeError(f"lark-cli 退出码 {proc.returncode}: "
+                           f"{(proc.stderr or proc.stdout).strip()[:300]}")
+    try:
+        payload = _repair_json_lenient(proc.stdout)
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"lark-cli 输出非 JSON（{exc}）: {proc.stdout[:200]}")
+    if not payload.get("ok"):
+        raise RuntimeError("lark-cli 返回失败: "
+                           + json.dumps(payload.get("error") or {}, ensure_ascii=False)[:300])
+    return payload
+
+
+def repair_fetch_records():
+    """分页全量拉取飞书维修表 → {record_id: {17 字段 snake_case}}。"""
+    records, offset = {}, 0
+    field_ids = []
+    while True:
+        payload = _repair_lark_run(["base", "+record-list",
+                                    "--base-token", REPAIR_BASE_TOKEN,
+                                    "--table-id", REPAIR_TABLE_ID,
+                                    "--format", "json",
+                                    "--limit", "200", "--offset", str(offset)])
+        data = payload.get("data") or {}
+        field_ids = data.get("field_id_list") or field_ids
+        rows = data.get("data") or []
+        rids = data.get("record_id_list") or []
+        for rid, row in zip(rids, rows):
+            records[rid] = repair_parse_row(row, field_ids)
+        if not data.get("has_more") or not rows:
+            break
+        offset += len(rows)
+    return records
+
+
+def _repair_attach_index():
+    """扫描附件目录 → {去扩展名 token: 实际文件名}。
+
+    lark-cli 下载会按内容类型自动给输出文件补扩展名（token → token.jpg），
+    本地按裸 token 入索引，URL/服务侧统一用它解析真实文件名。
+    """
+    index = {}
+    try:
+        with os.scandir(REPAIR_ATTACH_DIR) as entries:
+            for entry in entries:
+                if entry.is_file():
+                    index[os.path.splitext(entry.name)[0]] = entry.name
+    except OSError:
+        pass
+    return index
+
+
+def _repair_attach_file(token, index=None):
+    """token → 附件目录内实际文件名（无则 None）。"""
+    if not token:
+        return None
+    index = _repair_attach_index() if index is None else index
+    return index.get(token)
+
+
+def repair_sync_attachments(records):
+    """把新出现的附件下载到本地静态目录（按 file_token 命名，存在即跳过）。
+
+    多维表附件经 Drive 直下接口 403，走 lark-cli drive +preview
+    --type source_file 通道可行（实测）；lark-cli 的 --output 只接受当前
+    目录内相对路径，因此以附件目录为 cwd、裸 token 为文件名。单个附件
+    失败只记日志，不影响整次同步（该附件 URL 置 null，下轮同步自动补下）。
+    """
+    try:
+        os.makedirs(REPAIR_ATTACH_DIR, exist_ok=True)
+    except OSError as exc:
+        print(f"frp-monitor: 维修附件目录不可用（{REPAIR_ATTACH_DIR}: {exc}）", flush=True)
+        return
+    index = _repair_attach_index()
+    for rec in records.values():
+        for att in rec.get("attachments") or []:
+            token = att.get("file_token")
+            if not token or _repair_attach_file(token, index) is not None:
+                continue
+            try:
+                _repair_lark_run(["drive", "+preview", "--file-token", token,
+                                  "--type", "source_file", "--output", token],
+                                 timeout=REPAIR_ATTACH_TIMEOUT, cwd=REPAIR_ATTACH_DIR)
+                # lark-cli 会自动补扩展名，按 token 前缀找回实际落盘文件名
+                for name in os.listdir(REPAIR_ATTACH_DIR):
+                    if name == token or name.startswith(token + "."):
+                        index[token] = name
+                        break
+            except RuntimeError as exc:
+                print(f"frp-monitor: 维修附件下载失败 {token}"
+                      f"（{att.get('name')}）: {exc}", flush=True)
+
+
+def run_repair_sync(reason="scheduled"):
+    """同步一次飞书维修表 → SQLite 全量镜像；错误也返回摘要、绝不抛出。"""
+    with REPAIR_SYNC_LOCK:
+        started = time.time()
+        try:
+            records = repair_fetch_records()
+            repair_sync_attachments(records)
+            repair_store.replace_all(records)
+            print(f"frp-monitor: 维修表同步成功（{reason}）：{len(records)} 条，"
+                  f"耗时 {time.time() - started:.1f}s", flush=True)
+            return {"ok": True, "count": len(records), "reason": reason,
+                    "elapsed": round(time.time() - started, 1)}
+        except Exception as exc:  # noqa: BLE001 —— 同步失败要有明确错误状态，不影响其他页签
+            try:
+                repair_store.set_error(f"{reason}: {exc}")
+            except Exception:
+                pass
+            print(f"frp-monitor: 维修表同步失败（{reason}）: {exc}", flush=True)
+            return {"ok": False, "count": repair_store.sync_state()["record_count"],
+                    "reason": reason, "error": str(exc),
+                    "elapsed": round(time.time() - started, 1)}
+
+
+def _repair_sync_loop():
+    if not REPAIR_SYNC_ENABLED:
+        return
+    while True:
+        run_repair_sync("scheduled")
+        time.sleep(REPAIR_SYNC_INTERVAL)
+
+
+def _repair_online_lookup():
+    """返回 device_no → 在线状态 函数：True=当前在线（frps 快照）、
+    False=台账已登记但未上线、None=台账与快照均未匹配（数据不合成，显示 —）。"""
+    try:
+        hosts, _ = get_snapshot()
+        online = {h["hostname"] for h in hosts}
+    except Exception:
+        online = set()  # 快照暂不可得（仅首次拉取失败窗口）：登记设备按离线计
+    registered = set(store.roster) if store.enabled else set()
+
+    def lookup(device_no):
+        if not device_no:
+            return None
+        key = str(device_no).strip().casefold()
+        if key in online:
+            return True
+        if key in registered:
+            return False
+        return None
+
+    return lookup
+
+
+def _repair_public(rec, lookup=None, attach_index=None):
+    """库内记录 → API 视图（17 字段 + feishu_url + 附件本地 URL + device_online）。"""
+    item = {k: rec.get(k) for k in REPAIR_ITEM_FIELDS}
+    item["feishu_url"] = repair_feishu_url(rec["record_id"])
+    attachments = []
+    for att in rec.get("attachments") or []:
+        entry = dict(att)
+        token = entry.get("file_token") or ""
+        if _repair_attach_file(token, attach_index) is not None:
+            entry["url"] = f"/repair-attachments/{token}/{quote(str(entry.get('name') or token))}"
+        else:
+            entry["url"] = None
+        attachments.append(entry)
+    item["attachments"] = attachments or None
+    if lookup is not None:
+        item["device_online"] = lookup(item.get("device_no"))
+    item["synced_at"] = rec.get("synced_at")
+    return item
+
+
+def repairs_list_view(filters=None):
+    """维修列表（stage/type 精确、unit 模糊、owner 精确、q 设备编号/问题描述模糊）。"""
+    filters = filters or {}
+    lookup = _repair_online_lookup()
+    attach_index = _repair_attach_index()
+    items = [_repair_public(rec, lookup, attach_index) for rec in repair_store.all_records()]
+    stage = (filters.get("stage") or "").strip()
+    if stage:
+        items = [i for i in items if i.get("stage") == stage]
+    dtype = (filters.get("type") or "").strip()
+    if dtype:
+        items = [i for i in items if i.get("device_type") == dtype]
+    unit = (filters.get("unit") or "").strip()
+    if unit:
+        items = [i for i in items if unit in (i.get("unit") or "")]
+    owner = (filters.get("owner") or "").strip()
+    if owner:
+        items = [i for i in items if i.get("owner_name") == owner]
+    q = (filters.get("q") or "").strip().casefold()
+    if q:
+        items = [i for i in items
+                 if q in (i.get("device_no") or "").casefold()
+                 or q in (i.get("problem") or "").casefold()]
+    return items
+
+
+def repairs_stats_view():
+    """顶部统计：总数 / 各阶段计数（7 阶段固定顺序）/ 未完结数 / 同步状态。"""
+    items = repair_store.all_records()
+    counts = {}
+    for it in items:
+        stage = it.get("stage") or ""
+        counts[stage] = counts.get(stage, 0) + 1
+    by_stage = {s: counts.get(s, 0) for s in REPAIR_STAGE_ORDER}
+    for stage, n in counts.items():  # 未知阶段原样追加（数据不合成也不丢弃）
+        if stage and stage not in by_stage:
+            by_stage[stage] = n
+    state = repair_store.sync_state()
+    return {"total": len(items), "by_stage": by_stage,
+            "active_count": sum(n for s, n in counts.items() if s != REPAIR_DONE_STAGE),
+            "last_sync_at": state["last_ok_at"],
+            "last_sync_attempt_at": state["last_sync_at"],
+            "last_sync_error": state["last_sync_error"],
+            "sync_enabled": REPAIR_SYNC_ENABLED,
+            "sync_interval": int(REPAIR_SYNC_INTERVAL),
+            "stage_order": REPAIR_STAGE_ORDER}
+
+
+# ----------------------------------------------------------------------------
 # 数据保留与每日备份（随服务运行的后台线程）
 # ----------------------------------------------------------------------------
 def run_maintenance(retention=True, backup=True, reason="daily"):
@@ -3919,6 +4398,29 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(200, {"ok": True, "timestamp": ts,
                              "total": len(hosts), "online": len(hosts)})
 
+    def _repair_attachment(self, token, name=None):
+        """提供本地已下载的维修附件（token 定位文件，URL 已限制字符集，防目录穿越）。"""
+        if not token or "/" in token or "\\" in token or token != os.path.basename(token):
+            return self.send_error(404)
+        filename = _repair_attach_file(token)
+        if filename is None or os.path.splitext(filename)[0] != token:
+            return self.send_error(404)
+        fp = os.path.join(REPAIR_ATTACH_DIR, filename)
+        # Content-Type 从 URL 里的原始文件名推断（本地文件名是裸 token[.ext]）
+        ctype = mimetypes.guess_type(name or "")[0] if name else None
+        ctype = ctype or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        try:
+            with open(fp, "rb") as f:
+                body = f.read()
+        except OSError:
+            return self.send_error(404)
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "public, max-age=86400")  # token 内容寻址，可缓存
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         if not self._authorized():
             self.send_unauthorized()
@@ -3987,6 +4489,31 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(200, view)
         if path == "/api/refresh":
             return self._api_refresh()
+        # --- 维修面板只读 API（KVWO-78/79，数据源飞书维修表 lark-cli 同步） ---
+        if path == "/api/repairs":
+            qs = parse_qs(urlsplit(self.path).query)
+            filters = {k: (qs.get(k, [""])[0] or "") for k in ("stage", "type", "unit", "owner", "q")}
+            items = repairs_list_view(filters)
+            state = repair_store.sync_state()
+            return self.send_json(200, {
+                "enabled": REPAIR_SYNC_ENABLED, "total": len(items), "items": items,
+                "last_sync_at": state["last_ok_at"],
+                "last_sync_attempt_at": state["last_sync_at"],
+                "last_sync_error": state["last_sync_error"],
+                "sync_interval": int(REPAIR_SYNC_INTERVAL),
+                "stage_order": REPAIR_STAGE_ORDER})
+        if path == "/api/repairs/stats":
+            return self.send_json(200, repairs_stats_view())
+        m = re.match(r"^/api/repairs/([A-Za-z0-9]+)$", path)
+        if m:
+            rec = repair_store.get(m.group(1))
+            if rec is None:
+                return self.send_json(404, {"error": "unknown record", "record_id": m.group(1)})
+            return self.send_json(200, _repair_public(rec, _repair_online_lookup(),
+                                                      _repair_attach_index()))
+        m = re.match(r"^/repair-attachments/([A-Za-z0-9_-]+)(?:/(.*))?$", path)
+        if m:
+            return self._repair_attachment(m.group(1), m.group(2))
         if path == "/api/hosts":
             force = "refresh" in parse_qs(urlsplit(self.path).query)
             if force:
@@ -4242,6 +4769,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_json(200, result)
             return
+        if path == "/api/repairs/sync":
+            # 手动触发一次维修表同步（自测/验证用；与定时同步互斥串行）
+            result = run_repair_sync("manual")
+            return self.send_json(200, result)
         self.send_error(404)
 
 
@@ -4278,11 +4809,14 @@ if __name__ == "__main__":
     threading.Thread(target=_refresh_loop, name="snapshot-refresher", daemon=True).start()
     threading.Thread(target=_collect_duration_loop, name="collect-duration-puller", daemon=True).start()
     threading.Thread(target=_maintenance_loop, name="daily-maintenance", daemon=True).start()
+    threading.Thread(target=_repair_sync_loop, name="repair-syncer", daemon=True).start()
     print(f"frp-monitor: serving on :{HTTP_PORT} (oss-signed-url distribution, "
           f"upgrade_parallel={UPGRADE_MAX_PARALLEL}, retention={RETENTION_DAYS}d, "
           f"backup={BACKUP_DIR} keep {BACKUP_KEEP}, "
           f"webfix={'auto' if (WEBFIX_AUTO and store.enabled and DEPLOY_PW) else 'off'} "
-          f"ports {WEBFIX_PORT_BASE}-{WEBFIX_PORT_MAX}, stable-window {WEBFIX_DELAY:g}s)",
+          f"ports {WEBFIX_PORT_BASE}-{WEBFIX_PORT_MAX}, stable-window {WEBFIX_DELAY:g}s, "
+          f"repairs={'on' if REPAIR_SYNC_ENABLED else 'off'}"
+          f"{'/' + str(int(REPAIR_SYNC_INTERVAL)) + 's' if REPAIR_SYNC_ENABLED else ''})",
           flush=True)
     httpd = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), Handler)
     httpd.daemon_threads = True  # SSE 长连接随主进程退出，不阻塞重启
