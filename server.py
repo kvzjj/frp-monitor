@@ -157,7 +157,7 @@ def ssh_user_for_device(hardware="", hw_model=""):
 
 INDEX = """<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>EGO 设备面板</title><style>{css}</style></head><body><main>
 <header><div><h1>EGO 设备面板</h1><p id=sub>正在加载…</p></div><button id=refresh>立即刷新</button></header>
-<nav id=viewTabs class=vtabs><button type=button data-view=overview class=on>设备总览</button><button type=button data-view=upgrade>升级</button></nav>
+<nav id=viewTabs class=vtabs><button type=button data-view=overview class=on>设备总览</button><button type=button data-view=assets>资产</button><button type=button data-view=upgrade>升级</button></nav>
 <section id=viewOverview>
 <section class=summary><div><b id=online>0</b><span>在线设备</span></div><div><b id=registered>0</b><span>登记设备</span></div><div><b id=pendingN>0</b><span id=targetLbl>待升级</span></div><div><b id=sitesN>0</b><span>站点</span></div><div><b id=missingN>0</b><span>未上线</span></div></section>
 <div class=toolbar><input id=q placeholder="搜索 hostname / device_id / 设备名 / IP"><select id=statusFilter><option value=all>全部状态</option><option value=online selected>仅在线</option><option value=offline>仅未上线</option></select><select id=targetSel title="升级目标版本"></select><button id=copyPending class=listbtn title="按当前筛选（站点/状态/版本/搜索）复制：设备号 站点 IP SSH端口 device_id 当前版本">复制待升级清单</button><button id=copyCmds class=listbtn title="按当前筛选复制 SSH 跳板登录命令">复制跳板命令</button><button id=copyList class=listbtn title="按当前筛选复制设备编号">复制编号</button></div>
@@ -165,6 +165,22 @@ INDEX = """<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=
 <nav id=vers class=sitesbar></nav>
 <div id=grid class=grid></div>
 <section id=events><h2>最近事件（24 小时）</h2><div id=eventsBody class=elist><p class=eempty>加载中…</p></div></section>
+</section>
+<section id=viewAssets hidden>
+<nav id=assetTabs class="vtabs asub"><button type=button data-atab=dashboard class=on>资产总览</button><button type=button data-atab=hardware>硬件台账</button><button type=button data-atab=repairs>维修看板</button><button type=button data-atab=versions>版本视图</button><button type=button data-atab=units>项目视图</button></nav>
+<div id=asSyncBar class="asyncbar ok" hidden></div>
+<section id=atabDashboard>
+<section class=amcards id=asMetrics></section>
+<div class=adists id=asDists></div>
+</section>
+<section id=atabHardware hidden>
+<div class=toolbar><input id=asQ placeholder="搜索设备编号 / 去向备注 / 单位"><select id=asStatus></select><select id=asType></select><select id=asUnit></select><label class=aswitch title="归档（已拆解）设备默认隐藏，勾选后追加在表格底部"><input type=checkbox id=asArchived>显示归档设备</label></div>
+<div class=twrap><table class=astable><thead id=asLedgerHead></thead><tbody id=asLedgerBody></tbody></table></div>
+<p class=uhint id=asLedgerHint></p>
+</section>
+<section id=atabRepairs hidden><div id=asRepairsSlot></div></section>
+<section id=atabVersions hidden><div id=asVersionBody><p class=eempty>加载中…</p></div></section>
+<section id=atabUnits hidden><div id=asUnitBody><p class=eempty>加载中…</p></div><div id=asUnitDetail hidden></div></section>
 </section>
 <section id=viewUpgrade hidden>
 <section class=upanel id=upgParamPanel><div class=uhead><h2>① 升级参数</h2><span class=uhint id=upgRegState></span></div>
@@ -231,7 +247,65 @@ CSS = """*{box-sizing:border-box}body{margin:0;background:#f4f7fb;color:#172033;
 .wfixbar button.arm{background:#b45309}
 .wfixbar button.arm:hover:not(:disabled){background:#92400e}
 .wfixbar button.err{background:#475569;color:#fff;cursor:default;overflow:hidden;text-overflow:ellipsis;max-width:100%}
-@media(max-width:640px){.vrows{grid-template-columns:1fr}.ucardgrid{grid-template-columns:1fr}.stepper{flex-wrap:wrap}.step{flex:1 1 30%}.prow label{width:auto;text-align:left}.pmeta{margin-left:0}}"""
+@media(max-width:640px){.vrows{grid-template-columns:1fr}.ucardgrid{grid-template-columns:1fr}.stepper{flex-wrap:wrap}.step{flex:1 1 30%}.prow label{width:auto;text-align:left}.pmeta{margin-left:0}}
+/* ---- 资产管理视图（Assets，KVWO-84）：子页签/指标卡/分布条/台账/单位卡/mock 横幅 ---- */
+.asub{margin:-4px 0 18px}
+.asub button{padding:6px 16px;font-size:13px}
+.asyncbar{font-size:12px;border-radius:8px;padding:8px 14px;margin-bottom:14px;display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;line-height:1.6}
+.asyncbar.ok{background:#f0fdf4;border:1px solid #bbf7d0;color:#166534}
+.asyncbar.warn{background:#fffbeb;border:1px solid #fde68a;color:#92400e}
+.asyncbar.err{background:#fef2f2;border:1px solid #fecaca;color:#b91c1c}
+.amcards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:18px}
+.amcard{background:white;border:1px solid #e5eaf1;border-radius:12px;padding:14px 16px;box-shadow:0 2px 8px #1720330a;cursor:help}
+.amcard b{display:block;font-size:26px;color:#172033;font-variant-numeric:tabular-nums}
+.amcard.rate b{color:var(--c,#2563eb)}
+.amcard .albl{color:#718096;font-size:12px}
+.amcard .asub2{color:#98a2b3;font-size:11px;margin-top:7px;line-height:1.55}
+.adists{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
+.apanel{background:white;border:1px solid #e5eaf1;border-radius:12px;padding:16px 18px;box-shadow:0 2px 8px #1720330a;margin-bottom:14px}
+.apanel h3{margin:0 0 12px;font-size:14px;color:#334155}
+.apanel h4{margin:14px 0 8px;font-size:12px;color:#475569}
+.abar{display:grid;grid-template-columns:minmax(72px,120px) 1fr 44px;gap:8px;align-items:center;font-size:12px;margin-bottom:7px}
+.abar .albl2{color:#475569;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.abar .atrack{background:#f1f5f9;border-radius:999px;height:14px;position:relative;overflow:hidden}
+.abar .atrack i{position:absolute;left:0;top:0;bottom:0;border-radius:999px;background:var(--c,#2563eb);min-width:2px}
+.abar .an{color:#667085;text-align:right;font-variant-numeric:tabular-nums}
+.astable{width:100%;border-collapse:collapse;font-size:12px}
+.astable th,.astable td{padding:7px 10px;border-bottom:1px solid #eef2f7;text-align:left;white-space:nowrap}
+.astable th{color:#718096;font-weight:500;background:#f8fafc;user-select:none}
+.astable th.sort{cursor:pointer}
+.astable th.sort:hover{color:#2563eb}
+.astable th .sarr{color:#2563eb;margin-left:2px;font-size:10px}
+.astable td.wrap{max-width:180px;overflow:hidden;text-overflow:ellipsis}
+.astable tr[data-code]{cursor:pointer}
+.astable tr[data-code]:hover td{background:#f8fafc}
+.astable tr.aarch td{opacity:.66;background:#fafbfc}
+.mono{font-family:ui-monospace,monospace}
+.mut{color:#98a2b3}
+.aon{color:#16a34a}.aoff{color:#dc2626}.anull{color:#98a2b3}
+.abadge{border:1px solid #fde68a;background:#fef3c7;color:#b45309;border-radius:999px;padding:1px 9px;font-size:11px;cursor:pointer}
+.abadge:hover{background:#fde68a}
+.aswitch{display:inline-flex;gap:6px;align-items:center;font-size:13px;color:#475569;white-space:nowrap;cursor:pointer}
+.aswitch input{accent-color:#2563eb;width:15px;height:15px}
+.aunitgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px}
+.aunit{background:white;border:1px solid #e5eaf1;border-radius:12px;padding:14px 16px;box-shadow:0 2px 8px #1720330a;cursor:pointer;transition:transform .08s}
+.aunit:hover{transform:translateY(-1px);border-color:#b9cbdf}
+.auhead{display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin-bottom:10px}
+.auhead b{font-size:15px}
+.auhead span{color:#98a2b3;font-size:12px}
+.abarate{display:grid;grid-template-columns:1fr 64px;gap:8px;align-items:center;margin-bottom:10px}
+.abarate span{font-size:12px;color:#166534;text-align:right;font-variant-numeric:tabular-nums}
+.aurow{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+.auinv{font-size:12px;color:#0f766e;background:#ccfbf1;border-radius:8px;padding:6px 10px;margin-bottom:8px}
+.aumut{font-size:11px;color:#98a2b3}
+.auhead2{display:flex;gap:12px;align-items:baseline;flex-wrap:wrap;margin-bottom:6px}
+.auhead2 b{font-size:16px}
+.auhead2 span{color:#718096;font-size:12px}
+.chip2{display:inline-block;border:1px solid #e5eaf1;background:white;border-radius:999px;padding:2px 10px;font-size:11px;font-family:ui-monospace,monospace;color:#475569;margin:2px 4px 2px 0}
+.acards3{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:4px}
+.acards3 div{background:#f8fafc;border:1px solid #e5eaf1;border-radius:10px;padding:8px 16px;font-size:12px;color:#475569}
+.acards3 b{display:block;font-size:18px;color:#172033;font-variant-numeric:tabular-nums}
+@media(max-width:640px){.abar{grid-template-columns:80px 1fr 40px}.amcards{grid-template-columns:repeat(auto-fit,minmax(140px,1fr))}}"""
 JS = """const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
 const ETAGS={online:'上线',offline:'掉线',version_change:'版本变更',first_seen:'新设备'};
@@ -536,7 +610,7 @@ archOf(f){const m=String((f&&(f.hw_model||f.hardware))||'').toLowerCase();if(/rk
 init(){
  const tabs=this.gid('viewTabs');
  tabs.addEventListener('click',e=>{const b=e.target.closest('button[data-view]');if(b)this.setView(b.dataset.view)});
- window.addEventListener('hashchange',()=>{const v=new URLSearchParams(location.hash.slice(1)).get('view')==='upgrade'?'upgrade':'overview';if(v!==this.view)this.setView(v,true)});
+ window.addEventListener('hashchange',()=>{const h=new URLSearchParams(location.hash.slice(1)).get('view');const v=h==='upgrade'?'upgrade':h==='assets'?'assets':'overview';if(v!==this.view)this.setView(v,true)});
  const urlIn=this.gid('upgUrl'),shaIn=this.gid('upgSha');
  urlIn.addEventListener('input',()=>{clearTimeout(this.urlTimer);this.urlTimer=setTimeout(()=>this.onUrlInput(),400)});
  urlIn.addEventListener('change',()=>{clearTimeout(this.urlTimer);this.onUrlInput()});
@@ -561,15 +635,17 @@ init(){
  setInterval(()=>{if(this.view==='upgrade')this.loadFleet()},15000);
 },
 setView(v,skipHash){
- if(v!=='upgrade')v='overview';
+ if(v!=='upgrade'&&v!=='assets')v='overview';
  this.view=v;
  this.gid('viewOverview').hidden=v!=='overview';
  this.gid('viewUpgrade').hidden=v!=='upgrade';
+ this.gid('viewAssets').hidden=v!=='assets';
  document.querySelectorAll('#viewTabs button').forEach(b=>b.classList.toggle('on',b.dataset.view===v));
- if(!skipHash){const p=new URLSearchParams(location.hash.slice(1));if(v==='upgrade')p.set('view','upgrade');else p.delete('view');const s=p.toString();history.replaceState(null,'',location.pathname+location.search+(s?'#'+s:''))}
+ if(!skipHash){const p=new URLSearchParams(location.hash.slice(1));if(v!=='overview')p.set('view',v);else p.delete('view');const s=p.toString();history.replaceState(null,'',location.pathname+location.search+(s?'#'+s:''))}
  if(v==='upgrade')this.enter();
+ if(v==='assets'&&typeof Assets!=='undefined')Assets.enter();   // 资产区域（KVWO-84）懒加载，见文件尾 Assets.*（声明先于 Upg.init）
 },
-route(){const v=new URLSearchParams(location.hash.slice(1)).get('view')==='upgrade'?'upgrade':'overview';this.setView(v,true)},
+route(){const h=new URLSearchParams(location.hash.slice(1)).get('view');const v=h==='upgrade'?'upgrade':h==='assets'?'assets':'overview';this.setView(v,true)},
 enter(){this.loadRegistry();this.loadFleet();this.loadJobs();this.renderParam();this.updateSelBar();this.updateActions()},
 setActHint(msg,warn){const el=this.gid('upgActHint');el.textContent=msg||'';el.className='uhint'+(warn?' warn':'')},
 parseOssUrl(u){
@@ -990,7 +1066,384 @@ applyTask(t){
  this.renderJob();
 }
 };
-Upg.init();"""
+/* ================= 资产管理视图（Assets.*，KVWO-84：总览仪表盘/硬件台账 360°/项目/版本） =================
+ 契约对齐后端 KVWO-83（/api/assets 系列）：
+   GET /api/assets?status=&type=&unit=&q=&archived=1 → {devices:[…],last_sync_at}
+   GET /api/assets/stats → {registered_total,archived_total,inventory:{unit_shanghai,unused_note},
+                            deployed,by_status,by_type,by_unit,repair_rate,damage_rate,last_sync_at}
+   GET /api/assets/units → {units:[{unit,total,normal_rate,repairing,abnormal,last_updated}]}
+   GET /api/assets/versions → {detected:[{version,count}],ledger:[…],ledger_empty,matched,
+                              detected_only:[…],ledger_missing:[…]}
+   GET /api/assets/{device_code} → {ledger:{…},repairs:[…],flows:[…],parts:[…],transfers:[…]}
+ 接口未合并（404）时按契约 mock 并以横幅明示（绝不静默冒充生产数据）；后端合入后 404 消失
+ 即自动切真实数据，前端零改动。字段解析容错（候选键），联调以真实字段为准。
+ 导航：顶栏「资产」页签 + 子页签（总览/硬件/维修/版本/项目）。「维修看板」为 KVWO-80 预留槽位
+ （先合并者定布局：本区域先行合入，KVWO-80 适配此子页签结构）。 */
+const Assets={
+mock:false,err:'',lastGoodAt:0,loaded:false,tab:'dashboard',drillUnit:'',
+stats:null,units:null,versions:null,devices:[],archived:[],_mockCache:null,
+hw:{q:'',status:'',type:'',unit:'',archived:false,sortKey:'code',sortDir:1},
+STATUS_ORDER:['正常','异常','维修中','待维修','待标定','测试中','已拆解'],
+ST_COLOR:{'正常':'#16a34a','异常':'#dc2626','维修中':'#ea580c','待维修':'#d97706','待标定':'#2563eb','测试中':'#0891b2','已拆解':'#64748b'},
+TYPE_COLOR:{'EgoPortal-Stereo-V0':'#2563eb','EgoPortal-Stereo-V1':'#7c3aed','EgoPortal-Lite':'#0891b2'},
+init(){
+ const tabs=document.getElementById('assetTabs');
+ tabs.addEventListener('click',e=>{const b=e.target.closest('button[data-atab]');if(b)this.go(b.dataset.atab)});
+ window.addEventListener('hashchange',()=>{if(!document.getElementById('viewAssets').hidden)this.applyHash()});
+ document.getElementById('asQ').oninput=e=>{this.hw.q=e.target.value.trim().toLowerCase();this.renderLedger()};
+ document.getElementById('asStatus').onchange=e=>{this.hw.status=e.target.value;this.renderLedger()};
+ document.getElementById('asType').onchange=e=>{this.hw.type=e.target.value;this.renderLedger()};
+ document.getElementById('asUnit').onchange=e=>{this.hw.unit=e.target.value;this.renderLedger()};
+ document.getElementById('asArchived').onchange=e=>{this.hw.archived=e.target.checked;this.renderLedger()};
+ document.getElementById('asLedgerHead').onclick=e=>{const th=e.target.closest('th[data-sk]');if(!th)return;if(this.hw.sortKey===th.dataset.sk)this.hw.sortDir*=-1;else{this.hw.sortKey=th.dataset.sk;this.hw.sortDir=1}this.renderLedger()};
+ document.getElementById('asLedgerBody').onclick=e=>{this.rowClick(e)};
+ document.getElementById('asUnitDetail').addEventListener('click',e=>{
+  if(e.target.closest('#asUnitBack')){this.drillUnit='';document.getElementById('asUnitDetail').hidden=true;document.getElementById('asUnitBody').hidden=false;this.writeHash({atab:'units'});return}
+  this.rowClick(e)});
+ setInterval(()=>{if(!document.getElementById('viewAssets').hidden&&this.loaded&&!this.mock)this.loadAll()},60000);
+ if(!document.getElementById('viewAssets').hidden)this.enter();
+},
+rowClick(e){
+ const rb=e.target.closest('button[data-gorep]');
+ if(rb){this.go('repairs',{q:rb.dataset.gorep});return}
+ const tr=e.target.closest('tr[data-code]');if(tr)this.open360(tr.dataset.code)
+},
+enter(){this.applyHash();if(!this.loaded)this.loadAll();else this.syncBar()},
+applyHash(){
+ const p=new URLSearchParams(location.hash.slice(1));
+ if(p.get('view')!=='assets')return;
+ const t=p.get('atab')||'dashboard';
+ this.setTab(['dashboard','hardware','repairs','versions','units'].includes(t)?t:'dashboard');
+ if(p.get('q')!=null){this.hw.q=String(p.get('q')).toLowerCase();const el=document.getElementById('asQ');if(el)el.value=p.get('q')||''}
+ const u=p.get('unit');if(u&&this.units)this.drill(u);
+ if(this.loaded)this.render();
+},
+writeHash(extra){
+ const p=new URLSearchParams(location.hash.slice(1));p.set('view','assets');
+ for(const k of['atab','q','unit'])p.delete(k);
+ if(extra)for(const kv of Object.entries(extra))p.set(kv[0],kv[1]);
+ history.replaceState(null,'',location.pathname+location.search+'#'+p.toString())
+},
+go(tab,extra){this.setTab(tab);this.writeHash(Object.assign({atab:tab},extra||{}));if(tab==='repairs')this.renderRepairs()},
+setTab(t){
+ this.tab=t;
+ if(t!=='units')this.drillUnit='';   // 离开项目页签即退出下钻态，避免深链/切页被旧下钻拉回
+ document.querySelectorAll('#assetTabs button').forEach(b=>b.classList.toggle('on',b.dataset.atab===t));
+ for(const s of['dashboard','hardware','repairs','versions','units'])document.getElementById('atab'+s[0].toUpperCase()+s.slice(1)).hidden=s!==t;
+ if(t==='units'&&!this.drillUnit){document.getElementById('asUnitDetail').hidden=true;document.getElementById('asUnitBody').hidden=false}
+},
+/* ---------- 数据层：真实 API 优先，404 时契约 mock（横幅明示） ---------- */
+async api(path){
+ const r=await fetch(path,{cache:'no-store'});
+ if(r.status===404){this.mock=true;return this.mockFor(path)}
+ const d=await r.json().catch(()=>null);
+ if(!r.ok||d==null)throw Error((d&&d.error)||('HTTP '+r.status));
+ this.mock=false;return d
+},
+async loadAll(){
+ try{
+  const res=await Promise.all([this.api('/api/assets/stats'),this.api('/api/assets/units'),this.api('/api/assets/versions'),this.api('/api/assets'),this.api('/api/assets?archived=1')]);
+  this.stats=this.normStats(res[0]);this.units=this.normUnits(res[1]);this.versions=this.normVers(res[2]);
+  this.devices=this.normList(res[3],false);this.archived=this.normList(res[4],true);
+  this.err='';this.loaded=true;this.lastGoodAt=Date.now();
+ }catch(e){this.err=String(e.message||e)}
+ this.syncBar();this.render();
+},
+normList(d,archived){const arr=(d&&(d.devices||d.items||d.records))||(Array.isArray(d)?d:[]);return arr.map(r=>this.normDev(r,archived)).filter(x=>x.code)},
+nByKey(o,ks){for(const k of ks)if(o&&o[k]!=null)return o[k];return null},
+normDev(r,archived){
+ const on=r?(r.device_online!==undefined?r.device_online:r.online):null;
+ return{code:String(this.nByKey(r,['device_code','device_id','code'])||'').trim(),
+  type:this.nByKey(r,['device_type','type']),status:this.nByKey(r,['status']),
+  unit:this.nByKey(r,['unit','organization']),parts:this.nByKey(r,['accessories','parts']),
+  remark:this.nByKey(r,['remark','note']),ledgerVer:this.nByKey(r,['ledger_version','software_version']),
+  detVer:this.nByKey(r,['detected_version']),online:on===true?true:(on===false?false:null),
+  openRepairs:Number(this.nByKey(r,['open_repairs','repair_count'])||0),
+  updatedAt:this.nByKey(r,['updated_at','last_updated']),modifier:this.nByKey(r,['modifier']),
+  archived:!!(archived||(r&&r.archived))}
+},
+normStats(s){return{
+ total:this.nByKey(s,['registered_total','total','registered']),archived:this.nByKey(s,['archived_total','archived']),
+ invA:this.nByKey(s&&s.inventory,['unit_shanghai']),invB:this.nByKey(s&&s.inventory,['unused_note']),
+ deployed:this.nByKey(s,['deployed']),
+ byStatus:Object.assign({},s&&(s.by_status||s.status)||{}),byType:Object.assign({},s&&(s.by_type||s.type)||{}),byUnit:Object.assign({},s&&(s.by_unit||s.unit)||{}),
+ repairRate:this.nByKey(s,['repair_rate']),damageRate:this.nByKey(s,['damage_rate']),
+ lastSync:this.nByKey(s,['last_sync_at','last_sync','synced_at'])}
+},
+normUnits(u){const arr=(u&&(u.units||u.items))||(Array.isArray(u)?u:[]);return arr.map(x=>({
+ unit:String(this.nByKey(x,['unit','name'])||''),total:this.nByKey(x,['total','count']),
+ normalRate:this.nByKey(x,['normal_rate']),repairing:this.nByKey(x,['repairing']),abnormal:this.nByKey(x,['abnormal']),
+ lastUpdated:this.nByKey(x,['last_updated','updated_at'])}))
+},
+normVers(v){const arr=a=>Array.isArray(a)?a:[];return{
+ detected:arr(v&&v.detected),ledger:arr(v&&v.ledger),
+ ledgerEmpty:this.nByKey(v,['ledger_empty']),matched:this.nByKey(v,['matched']),
+ detectedOnly:arr(v&&v.detected_only),ledgerMissing:arr(v&&v.ledger_missing)}
+},
+fmtTs(v){
+ if(v==null||v==='')return null;
+ const t=typeof v==='number'?(v<1e12?v*1000:v):Date.parse(String(v).replace(' ','T'));
+ return isNaN(t)?String(v):new Date(t).toLocaleString('zh-CN',{hour12:false})
+},
+tsOf(v){if(v==null||v==='')return 0;const t=typeof v==='number'?(v<1e12?v*1000:v):Date.parse(String(v).replace(' ','T'));return isNaN(t)?0:t},
+shortType(t){return String(t||'').replace('EgoPortal-','')},
+natCmp(a,b){return String(a).localeCompare(String(b),undefined,{numeric:true,sensitivity:'base'})},
+syncBar(){
+ const el=document.getElementById('asSyncBar');el.hidden=false;
+ const when=this.stats&&this.stats.lastSync?('飞书同步于 '+this.fmtTs(this.stats.lastSync)):'';
+ const good=this.lastGoodAt?('拉取于 '+new Date(this.lastGoodAt).toLocaleString('zh-CN',{hour12:false})):'';
+ if(this.mock){el.className='asyncbar warn';el.innerHTML='⚠ /api/assets 接口未就绪（后端 KVWO-83 未合并）：当前展示<b>契约 mock 演示数据</b>，仅供开发预览，不代表真实资产；后端合入后自动切换真实数据，前端无需改动'}
+ else if(this.err&&!this.loaded){el.className='asyncbar err';el.innerHTML='资产数据加载失败：'+esc(this.err)+'（每 60 秒自动重试）'}
+ else if(this.err){el.className='asyncbar err';el.innerHTML='最近一次刷新失败：'+esc(this.err)+'，展示最后成功数据'+(good?'（'+good+'）':'')+(when?' · '+when:'')}
+ else{el.className='asyncbar ok';el.innerHTML='资产数据'+(when||'')+(good?' · '+good:'')+' · 来源：飞书多维表（只读同步）'}
+},
+render(){if(!this.loaded)return;this.renderMetrics();this.renderDists();this.renderFilters();this.renderLedger();this.renderRepairs();this.renderVersions();this.renderUnits()},
+/* ---------- 模块 1：总览仪表盘 ---------- */
+renderMetrics(){
+ const s=this.stats,el=document.getElementById('asMetrics');if(!s){el.innerHTML='';return}
+ const n=k=>Number((s.byStatus||{})[k]||0);
+ const pctv=v=>v==null?'—':(Math.round(v*1000)/10)+'%';
+ const st='统计时间：'+(this.fmtTs(s.lastSync)||'—');
+ const cards=[
+  {v:s.total,l:'在册总数',sub:'口径：设备明细表（不含归档）'},
+  {v:s.archived,l:'归档（已拆解）',sub:'口径：设备归档数据表，不参与在册指标'},
+  {v:s.invA,l:'库存',sub:'口径 A：上海办公室持有'+(s.invB!=null?'；口径 B（备注含「未使用」）：'+s.invB+' 台':''),c:'#0f766e'},
+  {v:s.deployed,l:'一线部署',sub:'口径：在册 − 上海办公室持有'},
+  {v:pctv(s.repairRate),l:'维修率',rate:1,c:'#ea580c',sub:'计算式：(维修中 '+n('维修中')+' + 待维修 '+n('待维修')+') / 在册 '+s.total},
+  {v:pctv(s.damageRate),l:'损坏率',rate:1,c:'#dc2626',sub:'计算式：(异常 '+n('异常')+' + 维修中 '+n('维修中')+' + 待维修 '+n('待维修')+') / 在册 '+s.total},
+ ];
+ el.innerHTML=cards.map(m=>'<div class="amcard'+(m.rate?' rate':'')+'" style="--c:'+(m.c||'')+'" title="'+esc(m.sub)+'\n'+esc(st)+'"><b>'+esc(m.v==null?'—':m.v)+'</b><span class=albl>'+esc(m.l)+'</span><div class=asub2>'+esc(m.sub)+'<br>'+esc(st)+'</div></div>').join('');
+},
+renderDists(){
+ const el=document.getElementById('asDists'),s=this.stats;if(!s){el.innerHTML='';return}
+ const bars=(entries,colorFn,labelFn)=>{
+  const max=Math.max.apply(null,entries.map(e=>e[1]).concat([1]));
+  return entries.map(e=>'<div class=abar title="'+esc(e[0])+'：'+e[1]+'"><span class=albl2>'+esc(labelFn?labelFn(e[0]):e[0])+'</span><div class=atrack><i style="width:'+(e[1]/max*100).toFixed(1)+'%;--c:'+(colorFn?colorFn(e[0]):'#2563eb')+'"></i></div><span class=an>'+e[1]+'</span></div>').join('')};
+ const stE=this.STATUS_ORDER.filter(k=>s.byStatus[k]).map(k=>[k,s.byStatus[k]]).concat(Object.entries(s.byStatus).filter(e=>this.STATUS_ORDER.indexOf(e[0])<0));
+ const tyE=Object.entries(s.byType).sort((a,b)=>b[1]-a[1]);
+ const unE=Object.entries(s.byUnit).sort((a,b)=>b[1]-a[1]);
+ el.innerHTML='<div class=adists>'+
+  '<div class=apanel><h3>状态分布（在册 '+(s.total!=null?s.total:'—')+' 台）</h3>'+(stE.length?bars(stE,k=>this.ST_COLOR[k]||'#64748b'):'<p class=eempty>暂无数据</p>')+'</div>'+
+  '<div class=apanel><h3>设备类型分布</h3>'+(tyE.length?bars(tyE,k=>this.TYPE_COLOR[k]||'#2563eb',k=>this.shortType(k)):'<p class=eempty>暂无数据</p>')+'</div>'+
+  '<div class=apanel><h3>所属单位 TOP 分布</h3>'+(unE.length?bars(unE,null):'<p class=eempty>暂无数据</p>')+'</div>'+
+ '</div>';
+},
+/* ---------- 模块 2：硬件台账（筛选/自然排序/360°） ---------- */
+renderFilters(){
+ const s=this.stats;if(!s)return;
+ const fill=(id,allLbl,map,ordered)=>{const el=document.getElementById(id);const cur=el.value;
+  let keys=Object.keys(map);if(ordered)keys=ordered.filter(k=>map[k]!=null).concat(keys.filter(k=>ordered.indexOf(k)<0));
+  el.innerHTML='<option value="">'+allLbl+'</option>'+keys.map(k=>'<option value="'+esc(k)+'">'+esc(id==='asType'?this.shortType(k):k)+'（'+map[k]+'）</option>').join('');
+  el.value=keys.indexOf(cur)>=0?cur:''};
+ fill('asStatus','全部状态',s.byStatus,this.STATUS_ORDER);fill('asType','全部类型',s.byType);
+ const um={};for(const u of this.units||[])um[u.unit]=u.total;fill('asUnit','全部单位',um);
+},
+sortDevs(list){
+ const hw=this.hw;
+ return list.slice().sort((x,y)=>{
+  if(hw.sortKey==='code')return this.natCmp(x.code,y.code)*hw.sortDir;
+  return (this.tsOf(x.updatedAt)-this.tsOf(y.updatedAt))*hw.sortDir||this.natCmp(x.code,y.code)
+ })
+},
+ledgerRows(){
+ const hw=this.hw,q=hw.q;
+ const match=d=>{
+  if(hw.status&&d.status!==hw.status)return false;
+  if(hw.type&&d.type!==hw.type)return false;
+  if(hw.unit&&d.unit!==hw.unit)return false;
+  if(q){const hay=(d.code+' '+(d.remark||'')+' '+(d.unit||'')).toLowerCase();if(hay.indexOf(q)<0)return false}
+  return true};
+ let list=this.sortDevs(this.devices.filter(match));
+ if(hw.archived)list=list.concat(this.sortDevs(this.archived.filter(match)));
+ return list
+},
+ledgerHeadHtml(interactive){
+ const cols=[['code','设备编号'],['type','类型'],['status','状态'],['unit','所属单位'],['parts','配件情况'],['remark','去向 / 备注'],['ledgerVer','台账版本'],['detVer','探测版本'],['online','在线'],['openRepairs','维修'],['updatedAt','最后更新']];
+ const ar=k=>interactive&&this.hw.sortKey===k?(this.hw.sortDir>0?'▲':'▼'):'';
+ return '<tr>'+cols.map(c=>'<th'+(interactive?' class=sort data-sk="'+c[0]+'"':'')+'>'+c[1]+(ar(c[0])?' <span class=sarr>'+ar(c[0])+'</span>':'')+'</th>').join('')+'</tr>'
+},
+ledgerRowHtml(d){
+ const c=this.ST_COLOR[d.status]||'#64748b';
+ const on=d.online===true?'<span class=aon title=在线>●</span>':d.online===false?'<span class=aoff title=离线>○</span>':'<span class=anull title=未匹配>—</span>';
+ const rep=d.openRepairs>0?'<button class=abadge data-gorep="'+esc(d.code)+'" title="点击查看维修看板">'+d.openRepairs+'</button>':'<span class=anull>0</span>';
+ return '<tr data-code="'+esc(d.code)+'"'+(d.archived?' class=aarch':'')+'><td class=mono>'+esc(d.code.toUpperCase())+'</td><td>'+esc(this.shortType(d.type)||'—')+'</td><td><span class=stag style="--c:'+c+'">'+esc(d.status||'—')+'</span></td><td>'+esc(d.unit||'—')+'</td><td class=wrap title="'+esc(d.parts||'')+'">'+esc(d.parts||'—')+'</td><td class=wrap title="'+esc(d.remark||'')+'">'+esc(d.remark||'—')+'</td><td>'+esc(d.ledgerVer||'—')+'</td><td>'+esc(d.detVer||'—')+'</td><td>'+on+'</td><td>'+rep+'</td><td class=mut>'+esc(this.fmtTs(d.updatedAt)||'—')+'</td></tr>'
+},
+renderLedger(){
+ document.getElementById('asLedgerHead').innerHTML=this.ledgerHeadHtml(true);
+ const rows=this.ledgerRows();
+ document.getElementById('asLedgerBody').innerHTML=rows.length?rows.map(d=>this.ledgerRowHtml(d)).join(''):'<tr><td colspan=11 class=eempty>没有匹配的设备（可调整筛选或关键词）</td></tr>';
+ document.getElementById('asLedgerHint').textContent='在册 '+this.devices.length+' 台 · 当前显示 '+rows.filter(d=>!d.archived).length+' 台'+(this.hw.archived?' · 归档 '+rows.filter(d=>d.archived).length+' 台（已追加在下方，淡色显示）':' · 归档 '+this.archived.length+' 台默认隐藏（勾选「显示归档设备」展开）');
+},
+async open360(code){
+ const m=document.getElementById('modal');m.classList.add('show');
+ const body=document.getElementById('modalBody');body.innerHTML='<p class=eempty>加载中…</p>';
+ let d;
+ try{d=await this.api('/api/assets/'+encodeURIComponent(code))}
+ catch(e){body.innerHTML='<p class=eempty>读取设备详情失败：'+esc(String(e.message||e))+'</p>';return}
+ const led=(d&&(d.ledger||d.device))||d||{};
+ const dev=this.normDev(led,!!(d&&d.archived));
+ const v=x=>(x==null||x==='')?'—':esc(String(x));
+ const tbl=(cols,rows,empty)=>'<div class=twrap><table class=astable><thead><tr>'+cols.map(c=>'<th>'+c+'</th>').join('')+'</tr></thead><tbody>'+(rows.length?rows.join(''):'<tr><td colspan='+cols.length+' class=eempty>'+(empty||'暂无数据')+'</td></tr>')+'</tbody></table></div>';
+ const repRows=(d&&d.repairs||[]).map(r=>'<tr><td>'+v(r.stage)+'</td><td class=wrap>'+v(r.issue_description||r.issue)+'</td><td>'+v(Array.isArray(r.repair_owners)?r.repair_owners.join('、'):(r.repair_owners||r.owner))+'</td><td>'+v(this.fmtTs(r.last_followed_at))+'</td><td class=wrap>'+v(r.last_follow_note)+'</td></tr>');
+ const flowRows=(d&&d.flows||[]).map(r=>'<tr><td>'+v(r.action)+'</td><td>'+v(r.operator)+'</td><td>'+v(this.fmtTs(r.ts||r.time||r.operated_at))+'</td><td class=wrap>'+v(r.note||r.summary)+'</td></tr>');
+ const partRows=(d&&d.parts||[]).map(r=>'<tr><td>'+v(r.part||r.accessory)+'</td><td>'+v(r.arrival||r.arrival_status)+'</td><td>'+v(r.item||r.check_item)+'</td><td class=wrap>'+v(r.note||r.status_note)+'</td><td>'+v(this.fmtTs(r.checked_at||r.time))+'</td></tr>');
+ const trRows=(d&&d.transfers||[]).map(r=>'<tr><td>'+v(this.fmtTs(r.ts||r.time))+'</td><td>'+v(r.unit)+'</td><td>'+v(r.item)+'</td><td>'+v(r.qty!=null?r.qty:null)+'</td><td class=wrap>'+v(r.note)+'</td></tr>');
+ const stc=this.ST_COLOR[dev.status]||'#64748b';
+ body.innerHTML=
+  '<header><div><span class=name>'+esc(dev.code.toUpperCase())+'</span> <span class=stag style="--c:'+stc+'">'+esc(dev.status||'—')+'</span>'+(dev.archived?' <span class=stag style="--c:#64748b">归档</span>':'')+'</div><button class=x id=mClose>✕</button></header>'+
+  '<h3>台账信息</h3><div class=mgrid>'+
+  '<span>设备编号</span><b>'+esc(dev.code.toUpperCase())+'</b>'+
+  '<span>设备类型</span><b>'+v(dev.type)+'</b>'+
+  '<span>所属单位</span><b>'+v(dev.unit)+'</b>'+
+  '<span>配件情况</span><b>'+v(dev.parts)+'</b>'+
+  '<span>去向 / 备注</span><b>'+v(dev.remark)+'</b>'+
+  '<span>台账软件版本</span><b>'+v(dev.ledgerVer)+'</b>'+
+  '<span>探测版本</span><b>'+v(dev.detVer)+'</b>'+
+  '<span>在线状态</span><b>'+(dev.online===true?'<span style="color:#16a34a">● 在线</span>':dev.online===false?'<span style="color:#dc2626">○ 离线</span>':'—（未匹配）')+'</b>'+
+  '<span>未完结维修</span><b>'+(dev.openRepairs||0)+' 条</b>'+
+  '<span>最后更新</span><b>'+v(this.fmtTs(dev.updatedAt))+'</b>'+
+  '<span>修改人</span><b>'+v(dev.modifier)+'</b>'+
+  '</div>'+
+  '<h3>维修记录（异常设备表）</h3>'+tbl(['阶段','问题描述','负责人','最后跟进','跟进说明'],repRows)+
+  '<h3>处理流水（异常处理流转）</h3>'+tbl(['动作','操作人','时间','说明'],flowRows)+
+  '<h3>配件核对</h3>'+tbl(['配件','到货状态','核对项','状态说明','核对时间'],partRows)+
+  (trRows.length?'<h3>流转记录</h3>'+tbl(['时间','所属单位','物品','数量','说明'],trRows):'');
+ document.getElementById('mClose').onclick=()=>m.classList.remove('show');
+},
+/* ---------- 模块 3：项目（单位）视图 ---------- */
+stagN(l,n){const c=this.ST_COLOR[l]||'#64748b';return '<span class=stag style="--c:'+c+'">'+l+' '+(n==null?'—':n)+'</span>'},
+shanghaiInv(){
+ if(!this.stats)return null;
+ const sh=this.devices.filter(d=>d.unit==='上海办公室');
+ const unused=this.stats.invB!=null?this.stats.invB:sh.filter(d=>String(d.remark||'').indexOf('未使用')>=0).length;
+ return{unused:unused,newBuild:sh.filter(d=>String(d.remark||'').indexOf('新组装')>=0).length}
+},
+renderUnits(){
+ if(this.drillUnit){this.drill(this.drillUnit);return}
+ const el=document.getElementById('asUnitBody'),us=this.units;
+ if(!us||!us.length){el.innerHTML='<p class=eempty>暂无单位数据</p>';return}
+ const inv=this.shanghaiInv();
+ el.innerHTML='<div class=aunitgrid>'+us.map(u=>{
+  const rate=u.normalRate==null?null:Math.round(u.normalRate*1000)/10;
+  return '<div class=aunit data-unit="'+esc(u.unit)+'" title="点击下钻该单位设备列表">'+
+   '<div class=auhead><b>'+esc(u.unit)+'</b><span>'+(u.total!=null?u.total:'—')+' 台</span></div>'+
+   '<div class=abarate><div class=atrack><i style="width:'+(rate==null?0:Math.min(rate,100))+'%;--c:#16a34a"></i></div><span>'+(rate==null?'—':rate+'%')+' 正常</span></div>'+
+   '<div class=aurow>'+this.stagN('维修中',u.repairing)+this.stagN('异常',u.abnormal)+'</div>'+
+   (u.unit==='上海办公室'&&inv?'<div class=auinv>库存细分（来自备注）：未使用 '+inv.unused+' · 新组装 '+inv.newBuild+'</div>':'')+
+   '<div class=aumut>最近更新：'+esc(this.fmtTs(u.lastUpdated)||'—')+'</div></div>'
+ }).join('')+'</div>';
+ el.querySelectorAll('.aunit').forEach(c=>c.onclick=()=>this.drill(c.dataset.unit));
+},
+drill(unit){
+ this.drillUnit=unit;this.setTab('units');
+ document.getElementById('asUnitBody').hidden=true;
+ const det=document.getElementById('asUnitDetail');det.hidden=false;
+ const devs=this.sortDevs(this.devices.filter(d=>d.unit===unit));
+ const rep=this.devices.filter(d=>d.unit===unit&&(d.status==='维修中'||d.status==='待维修'));
+ det.innerHTML='<div class=apanel>'+
+  '<div class=auhead2><button class=listbtn id=asUnitBack>← 返回单位列表</button><b>'+esc(unit)+'</b><span>'+devs.length+' 台在册'+(rep.length?' · 维修中/待维修 '+rep.length+' 台':'')+'</span></div>'+
+  (rep.length?'<h3>维修中 / 待维修设备</h3><div class=twrap><table class=astable><thead>'+this.ledgerHeadHtml(false)+'</thead><tbody>'+rep.map(d=>this.ledgerRowHtml(d)).join('')+'</tbody></table></div>':'')+
+  '<h3>该单位全部设备（点击行查看 360° 详情）</h3>'+
+  '<div class=twrap><table class=astable><thead>'+this.ledgerHeadHtml(false)+'</thead><tbody>'+(devs.length?devs.map(d=>this.ledgerRowHtml(d)).join(''):'<tr><td colspan=11 class=eempty>该单位暂无在册设备</td></tr>')+'</tbody></table></div></div>';
+ this.writeHash({atab:'units',unit:unit});
+},
+/* ---------- 模块 4：版本视图 ---------- */
+renderVersions(){
+ const el=document.getElementById('asVersionBody'),v=this.versions;
+ if(!v){el.innerHTML='<p class=eempty>暂无版本数据</p>';return}
+ const det=(v.detected||[]).slice().sort((a,b)=>(b.count||0)-(a.count||0));
+ const led=(v.ledger||[]).slice().sort((a,b)=>(b.count||0)-(a.count||0));
+ const dmax=Math.max.apply(null,det.map(x=>x.count||0).concat([1]));
+ const lmax=Math.max.apply(null,led.map(x=>x.count||0).concat([1]));
+ const codeOf=x=>typeof x==='string'?x:String((x&&(x.device_code||x.code||x.hostname))||'');
+ const chip=x=>{const s=codeOf(x);return '<span class=chip2 title="'+esc(s)+'">'+esc(s.toUpperCase())+'</span>'};
+ const only=v.detectedOnly||[],miss=v.ledgerMissing||[];
+ el.innerHTML='<div class=adists>'+
+  '<div class=apanel><h3>探测版本分布（在线设备）</h3>'+(det.length?det.map(x=>'<div class=abar><span class="albl2 mono">'+esc(x.version||'—')+'</span><div class=atrack><i style="width:'+((x.count||0)/dmax*100).toFixed(1)+'%"></i></div><span class=an>'+(x.count||0)+'</span></div>').join(''):'<p class=eempty>暂无探测数据</p>')+'</div>'+
+  '<div class=apanel><h3>台账登记版本</h3>'+(v.ledgerEmpty?'<div class=uwarn style="margin:0 0 12px">台账「软件版本」当前全部未登记：<b>'+v.ledgerEmpty+'</b> 台为空（如实展示，待台账补录后此处显示分布）</div>':'')+(led.length?led.map(x=>'<div class=abar><span class="albl2 mono">'+esc(x.version||'—')+'</span><div class=atrack><i style="width:'+((x.count||0)/lmax*100).toFixed(1)+'%;--c:#0f766e"></i></div><span class=an>'+(x.count||0)+'</span></div>').join(''):'<p class=eempty>无已登记版本</p>')+'</div>'+
+  '<div class=apanel><h3>台账 × 探测对照</h3><div class=acards3><div><b>'+esc(v.matched!=null?v.matched:'—')+'</b>版本匹配</div><div><b>'+only.length+'</b>在线但台账未登记</div><div><b>'+miss.length+'</b>台账有但探测不到</div></div>'+
+  '<h4>detected_only · 在线但台账未登记</h4>'+(only.length?only.map(chip).join(''):'<p class=eempty>无</p>')+
+  '<h4>ledger_missing · 台账有但探测不到（离线 / 未部署）</h4>'+(miss.length?'<p class=uhint>共 '+miss.length+' 台</p><details><summary style="cursor:pointer;font-size:12px;color:#2563eb">展开设备列表</summary><div style="margin-top:8px">'+miss.map(chip).join('')+'</div></details>':'<p class=eempty>无</p>')+
+  '<p style="margin-top:14px"><button class=listbtn id=asGoUpg>▶ 前往升级视图（版本批量升级入口）</button></p></div></div>';
+ const b=document.getElementById('asGoUpg');if(b)b.onclick=()=>{location.hash='view=upgrade'};
+},
+/* ---------- 维修看板子页签：KVWO-80 预留槽位 ---------- */
+renderRepairs(){
+ const el=document.getElementById('asRepairsSlot');if(!el)return;
+ const p=new URLSearchParams(location.hash.slice(1));
+ const pend=this.tab==='repairs'&&p.get('view')==='assets'?p.get('q'):'';
+ el.innerHTML='<div class=apanel><h3>维修看板</h3>'+
+  '<p class=uhint>维修流转看板（7 阶段：待接收 → 损坏原因确认中 → 维修中 → 待发出确认 → 待发出 → 已发出 → 已完结）由前端子任务 <b>KVWO-80</b> 提供，尚未合并；合并后展示在本页签。接口侧 /api/repairs（KVWO-79）'+(this.mock?'同样未就绪（当前资产视图使用契约 mock 数据）':'')+'。</p>'+
+  (pend?'<p class=uhint>待筛选设备编号：<b class=mono>'+esc(pend.toUpperCase())+'</b>（看板合入后自动应用该筛选）</p>':'')+
+  '</div>';
+},
+/* ---------- 契约 mock（仅 404 时启用；确定性种子，数字对齐父 issue 基线：在册 248/归档 69/库存 A 94/维修率 5.2%/损坏率 8.5%） ---------- */
+mockFor(path){
+ const M=this.mockData();
+ if(path.indexOf('/api/assets/stats')===0)return M.stats;
+ if(path.indexOf('/api/assets/units')===0)return{units:M.units};
+ if(path.indexOf('/api/assets/versions')===0)return M.versions;
+ if(path.indexOf('/api/assets?')===0)return{devices:M.archived,last_sync_at:M.lastSync};
+ if(path.indexOf('/api/assets/')===0){
+  const code=decodeURIComponent(path.slice('/api/assets/'.length)).toLowerCase();
+  const dev=M.devices.concat(M.archived).filter(x=>x.device_code.toLowerCase()===code)[0];
+  if(dev)return this.mockDetail(dev);
+  throw Error('设备不存在：'+code)
+ }
+ return{devices:M.devices,last_sync_at:M.lastSync};
+},
+mockData(){
+ if(this._mockCache)return this._mockCache;
+ let seed=20261020;
+ const rnd=()=>{seed|=0;seed=seed+0x6D2B79F5|0;let t=Math.imul(seed^seed>>>15,1|seed);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296};
+ const pickR=a=>a[Math.floor(rnd()*a.length)];
+ const UNITS=[['上海办公室',94],['苏州项目组',24],['杭州项目组',22],['南京项目组',20],['成都项目组',18],['武汉项目组',16],['西安项目组',14],['北京项目组',12],['广州项目组',12],['长沙项目组',10],['深圳项目组',6]];
+ const pool=(pairs)=>{const a=[];for(const[s,n]of pairs)for(let i=0;i<n;i++)a.push(s);for(let i=a.length-1;i>0;i--){const j=Math.floor(rnd()*(i+1));const t=a[i];a[i]=a[j];a[j]=t}return a};
+ const stPool=pool([['正常',217],['异常',8],['维修中',10],['待维修',3],['待标定',6],['测试中',4]]);
+ const tyPool=pool([['EgoPortal-Stereo-V0',160],['EgoPortal-Stereo-V1',55],['EgoPortal-Lite',33]]);
+ const PARTS=['头盔','相机','主机','数据线','腰带','充电宝'];
+ const base=Date.UTC(2026,9,20,0,0,0);
+ const devs=[];let k=0;
+ for(const[unit,count]of UNITS)for(let i=0;i<count;i++){
+  const status=stPool[k],type=tyPool[k];k++;
+  let code='EP-'+String(k).padStart(6,'0');if(k===31)code='ep-000031';   // 大小写混杂样例（匹配须不区分大小写）
+  const isSh=unit==='上海办公室',r=rnd();
+  const remark=isSh?(r<0.38?'库存·未使用':r<0.5?'新组装备用':r<0.6?'新组装·待发放':'上海备机'):(pickR(['一线部署','现场备用','项目交付','演示用机','']));
+  const online=isSh?(r<0.1?null:false):(rnd()<0.72?true:false);
+  const detVer=online?pickR(['v0.4.6','v0.4.6','v0.5.0','v0.4.5']):null;
+  const openRep=status==='维修中'?(rnd()<0.3?2:1):status==='待维修'?1:(status==='异常'&&rnd()<0.4?1:0);
+  devs.push({device_code:code,device_type:type,status:status,unit:unit,accessories:pickR(PARTS)+(rnd()<0.5?'、'+pickR(PARTS):''),remark:remark,ledger_version:null,detected_version:detVer,device_online:online,open_repairs:openRep,updated_at:new Date(base-k*37*60000).toISOString(),modifier:pickR(['张伟','李娜','王强','刘敏','陈晨'])})
+ }
+ const arch=[];
+ for(let i=0;i<69;i++)arch.push({device_code:i===49?'ep-000298':'EP-'+String(249+i).padStart(6,'0'),device_type:pickR(['EgoPortal-Stereo-V0','EgoPortal-Stereo-V1','EgoPortal-Lite']),status:'已拆解',unit:pickR(UNITS.map(u=>u[0])),accessories:'',remark:'已拆解归档',ledger_version:null,detected_version:null,device_online:false,open_repairs:0,updated_at:new Date(base-400*3600000-i*3600000).toISOString(),modifier:'李娜'});
+ const byStatus={},byType={},byUnit={};
+ for(const s of this.STATUS_ORDER)byStatus[s]=devs.filter(d=>d.status===s).length;
+ for(const d of devs){byType[d.device_type]=(byType[d.device_type]||0)+1;byUnit[d.unit]=(byUnit[d.unit]||0)+1}
+ const invA=byUnit['上海办公室']||0;
+ const invB=devs.filter(d=>d.unit==='上海办公室'&&String(d.remark||'').indexOf('未使用')>=0).length;
+ const det={};for(const d of devs)if(d.detected_version)det[d.detected_version]=(det[d.detected_version]||0)+1;
+ const lastSync=new Date(base+5*60000).toISOString();
+ const units=UNITS.map(u=>{const us=devs.filter(d=>d.unit===u[0]);const mx=us.reduce((m,d)=>Math.max(m,Date.parse(d.updated_at)||0),0);return{unit:u[0],total:us.length,normal_rate:us.length?us.filter(d=>d.status==='正常').length/us.length:null,repairing:us.filter(d=>d.status==='维修中').length,abnormal:us.filter(d=>d.status==='异常').length,last_updated:mx?new Date(mx).toISOString():null}});
+ this._mockCache={devices:devs,archived:arch,lastSync:lastSync,
+  stats:{registered_total:devs.length,archived_total:arch.length,inventory:{unit_shanghai:invA,unused_note:invB},deployed:devs.length-invA,by_status:byStatus,by_type:byType,by_unit:byUnit,repair_rate:(byStatus['维修中']+byStatus['待维修'])/devs.length,damage_rate:(byStatus['异常']+byStatus['维修中']+byStatus['待维修'])/devs.length,last_sync_at:lastSync},
+  units:units,
+  versions:{detected:Object.entries(det).map(e=>({version:e[0],count:e[1]})),ledger:[],ledger_empty:devs.length,matched:devs.filter(d=>d.detected_version).length,detected_only:[{device_code:'ep-900201',version:'v0.5.0'},{device_code:'EP-900202',version:'v0.4.6'},{device_code:'EP-900203',version:'v0.5.0'}],ledger_missing:devs.filter(d=>!d.detected_version).map(d=>d.device_code)}};
+ return this._mockCache;
+},
+mockDetail(dev){
+ let s=String(dev.device_code).length*7919+42;
+ const rnd=()=>{s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296};
+ const needRep=dev.status==='维修中'||dev.status==='待维修'||dev.status==='异常'||dev.open_repairs>0;
+ const base=(Date.parse(dev.updated_at)||Date.now())-86400000;
+ const repairs=needRep?[{stage:dev.status==='待维修'?'待接收':(dev.status==='异常'?'损坏原因确认中':'维修中'),issue_description:dev.device_type+' 相机模块无画面，待进一步检测',repair_owners:['刘希源'],last_followed_at:new Date(base-86400000).toISOString(),last_follow_note:'已联系现场确认寄回地址'}]:[];
+ const flows=[{action:'设备登记',operator:'李娜',ts:new Date(base-19*86400000).toISOString(),note:'台账初始登记'},{action:'接收确认',operator:'刘希源',ts:new Date(base-5*86400000).toISOString(),note:'收到设备，外观完好'},{action:'维修跟进',operator:'刘希源',ts:new Date(base-86400000).toISOString(),note:'更换相机模组后复测'}];
+ const parts=needRep?[{part:'相机',arrival:rnd()<0.7?'完好':'缺失',item:'相机模组',note:'到货待核对',checked_at:new Date(base-2*86400000).toISOString()}]:[];
+ return{ledger:dev,repairs:repairs,flows:flows,parts:parts,transfers:[{ts:new Date(base-14*86400000).toISOString(),unit:dev.unit,item:'整机',qty:1,note:'项目发放'}]};
+}
+};
+Upg.init();      // 路由器先就绪（setView 引用下方 Assets，声明已先千本行求值）
+Assets.init();
+"""
 
 
 def _json_request(url, *, method="GET", data=None, headers=None, timeout=4):
