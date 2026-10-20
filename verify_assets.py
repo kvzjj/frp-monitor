@@ -285,6 +285,42 @@ def unit_stats_tests(srv):
           and items["EP-000009"]["active_repairs"] == 0
           and items["EP-000001"]["active_repairs"] == 0)
 
+    # 闲置口径（KVWO-97 需求 4）：库存外·超 30 天未上线（含从未上线）
+    from datetime import datetime as _dt, timedelta as _td
+    check("fleet 库未启用 → idle.total 如实为 None（不合成）",
+          stats["idle"]["total"] is None
+          and stats["idle"]["threshold_days"] == 30
+          and srv._device_idle("EP-000001", "上海办公室", None) is None)
+    now = _dt.now()
+    fmt = lambda d: d.strftime("%Y-%m-%d %H:%M")
+    seen_40d, seen_now, seen_3d = fmt(now - _td(days=40)), fmt(now), fmt(now - _td(days=3))
+    fake_seen = {"ep-000001": seen_40d,   # 库存（上海）超 30 天未上线 → 不算闲置
+                 "ep-000002": seen_now,    # 库存（上海）刚在线 → 不算
+                 "ep-000009": seen_3d}    # 服务商 3 天前在线 → 不算；其余无记录=从未上线
+    orig_ls = srv._fleet_last_seen
+    srv._fleet_last_seen = lambda: fake_seen
+    try:
+        st2 = srv.assets_stats_view()
+        items2 = {i["device_no"]: i for i in srv.assets_list_view({})}
+        arch2 = {i["device_no"]: i for i in srv.assets_list_view({"include_archived": "1"})
+                 if i["archived"]}
+    finally:
+        srv._fleet_last_seen = orig_ls
+    check("闲置=库存外从未上线/超阈值；库存设备即使从未上线也不算",
+          st2["idle"]["total"] == 2                      # rec10/rec11（服务商，从未上线）
+          and st2["idle"]["by_unit"] == {"潍坊构元服务商": 2}
+          and items2["EP-000010"]["idle"] is True       # 从未上线 → 闲置
+          and items2["EP-000001"]["idle"] is False      # 库存超 30 天未上线 → 不算
+          and items2["EP-000006"]["idle"] is False)     # 库存从未上线 → 不算（边界）
+    check("最近在线不闲置（3 天前）+ last_seen 原样返回",
+          items2["EP-000009"]["idle"] is False
+          and items2["EP-000009"]["last_seen"] == seen_3d
+          and items2["EP-000010"]["last_seen"] is None)
+    check("归档设备 idle=null（在册口径外）", arch2["EP-900001"]["idle"] is None)
+    text3 = srv.feishu_report_text(st2, now=_dt(2026, 10, 21, 9, 0))
+    check("日报文案：闲置行（数量+口径）",
+          "闲置：2 台（库存外超 30 天未上线，含从未上线）" in text3)
+
 
 def unit_detail_tests(srv):
     print("[4] 单设备 360° 三源关联单测")
@@ -614,6 +650,11 @@ def online_tests(base):
           and stats["inventory"]["units"] == inv_units
           and stats["inventory"]["unused_note"] == inv_b)
     check("stats.deployed = 在册 − 库存", stats["deployed"] == n - inv_total)
+    check("stats.idle 形状与台账列表联动（KVWO-97 需求 4）",
+          stats["idle"]["threshold_days"] >= 1
+          and (stats["idle"]["total"] is None
+               or stats["idle"]["total"] == sum(1 for i in listing["items"]
+                                               if i.get("idle") is True)))
     check("stats.repair_rate / damage_rate",
           abs(stats["repair_rate"] - repairing / n) < 5e-4
           and abs(stats["damage_rate"] - damaged / n) < 5e-4)

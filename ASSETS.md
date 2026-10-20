@@ -33,7 +33,8 @@ SQLite，指标全部由同步数据实时计算（不落死数）。面板只�
 | `FRP_MONITOR_ASSET_INTERVAL` | `300` | 同步间隔（秒），下限 60 |
 | `FRP_MONITOR_ASSET_BASE_TOKEN` | 同维修面板 | 飞书 Base token（默认同 Base） |
 | `FRP_MONITOR_ASSET_DB` | `<server.py 所在目录>/assets.sqlite` | 本地 SQLite 路径 |
-| `FRP_MONITOR_INVENTORY_UNITS` | `上海办公室,潍坊办公室` | 库存口径单位清单（逗号分隔，可扩展；提出人 2026-10-20 确认上海+潍坊均为公司库存未使用，服务商等其他单位持有不计库存） |
+| `FRP_MONITOR_INVENTORY_UNITS` | `上海办公室,潍坊办公室` | 库存口径单位清单（逗号分隔，可扩展；提出人 2026-10-20 确认上海+潍坊均为公司库存未使用，服务商等其他单位持有不计库存）；同时是闲置口径的排除名单（库存设备不算闲置） |
+| `FRP_MONITOR_IDLE_DAYS` | `30` | 闲置阈值（天）：库存外在册设备最后在线距今超此值（含从未上线）计闲置；仅参数化不改口径 |
 | `FRP_MONITOR_FEISHU_WEBHOOK` | 空（关闭） | 飞书群机器人 webhook（KVWO-97 资产日报推送）；**敏感凭据，只落在服务器 env 配置，勿写入仓库/文档；置空/未配置 = 关闭推送** |
 | `FRP_MONITOR_FEISHU_WEBHOOK_SECRET` | 空（不签名） | 机器人签名密钥：群机器人开启「签名校验」时必配（未签名推送被拒 code=19021，2026-10-20 实测已遇到）；同敏感凭据仅落服务器 env；未开启签名校验不用配 |
 | `FRP_MONITOR_REPORT_TIMES` | `09:00` | 日报推送时刻（服务器本地时间，逗号分隔 HH:MM 支持多时刻；调度模式同采集时长 `FRP_MONITOR_COLLECT_TIMES`） |
@@ -56,7 +57,9 @@ frps 主机名本身就是小写 `ep-000xxx`）。
   带 `archived:true`）。每条含台账全字段 + `feishu_url` + `device_online`
   （true 在线 / false 台账登记未上线 / null 未匹配）+ `detected_version`
   （探测版本：在线取当前探测值，离线取最后已知，否则 null）+
-  `active_repairs`（关联未完结维修记录数，大小写不敏感）。
+  `active_repairs`（关联未完结维修记录数，大小写不敏感）+
+  `last_seen`（fleet 最后在线 `YYYY-MM-DD HH:MM`，null=从未上线/无记录）+
+  `idle`（闲置判定 true/false；归档设备与 fleet 库不可用时 null）。
 - `GET /api/assets/stats` — `{registered_total, archived_total,
   inventory:{total, by_unit, units, unused_note}, deployed, by_status, by_type,
   by_unit, repair_rate, damage_rate, last_sync_at, …}`。
@@ -66,7 +69,12 @@ frps 主机名本身就是小写 `ep-000xxx`）。
   （备注含「未使用」）仅作参考；deployed=在册−库存；维修率=
   (维修中+待维修)/在册；损坏率=(异常+维修中+待维修)/在册；归档不计入
   在册。对账基线（2026-10-20）：在册 248、库存 149（上海 94+潍坊 55）、
-  部署 99（随台账实时变化）。`tables` 带按表同步状态。
+  部署 99（随台账实时变化）。`idle`（需求 4）：`{total, threshold_days,
+  by_unit}` —— 闲置 = **库存外在册设备中，frps fleet 库 `last_seen_at`
+  距今 > `FRP_MONITOR_IDLE_DAYS`（默认 30 天，含从未上线）；库存单位
+  设备不计（本就离线存放）；fleet 库（MySQL）未启用/不可查时
+  `total=null` 如实返回，不合成**；归档不在册不参与。`tables` 带按表
+  同步状态。
 - `GET /api/assets/units` — 单位聚合 `{unit, total, normal_rate, repairing
   (=维修中+待维修), abnormal(=异常), last_updated}[]`，按设备数倒序；
   单位详情用 `/api/assets?unit=…` 过滤。
@@ -80,7 +88,9 @@ frps 主机名本身就是小写 `ep-000xxx`）。
   倒序）+ `actions[]`（处理流水：设备编号一致 **或** `linked_records` 命中该
   设备任一维修记录，双路）+ `parts_checks[]`（配件核对，编号一致）+
   `transfers[]`（流转记录按单位关联：相等或互为包含——该列为自由文本，
-  存在「构元服务商」vs「潍坊构元服务商」）。
+  存在「构元服务商」vs「潍坊构元服务商」）。台账部分含 `last_seen`（fleet
+  最后在线）与 `idle`（闲置判定；归档/fleet 不可用为 null），前端 360°
+  展示「最后在线 / 闲置」。
 - `POST /api/assets/sync` — 手动触发一次 5 表同步（验证/运维用）。
 - `GET /api/assets/report` — 资产日报推送状态（KVWO-97）：
   `{enabled, times, next_run_at, last, inventory_units, panel_title}`；
@@ -98,8 +108,10 @@ frps 主机名本身就是小写 `ep-000xxx`）。
   `FRP_MONITOR_REPORT_TIMES` 支持多时刻。
 - 推送内容（中文 text）：库存（合计=分单位明细，注明口径：公司库存，
   服务商持有不计）、在册硬件（附归档不计在册、一线部署）、维修率/
-  损坏率（含分子分母）、数据时间（最近一次飞书成功同步；同步异常时
-  如实提示 ⚠）——指标全部由 `/api/assets/stats` 同一数据源实时计算。
+  损坏率（含分子分母）、闲置（库存外超 N 天未上线，含从未上线；
+  fleet 库未启用时如实标注不可计算）、数据时间（最近一次飞书成功同步；
+  同步异常时如实提示 ⚠）——指标全部由 `/api/assets/stats` 同一数据源
+  实时计算。
 - 推送在独立线程（`feishu-report`）、带退避重试（3 次，签名失败 19021
   等确定性错误不空转重试）；失败只记日志与
   状态（`GET /api/assets/report` / stdout），**不影响面板服务与飞书同步**；
@@ -119,7 +131,9 @@ python3 verify_assets.py --base http://127.0.0.1:9100   # 全量（需 server.py
 
 单测覆盖：列序打乱/表间列序互异下的按名对齐、select（两种形态）/多选/user/
 datetime/attachment/link/number/空值解析、SQLite 幂等与按表错误隔离、
-stats/units/versions 口径（含 KVWO-97 库存=上海+潍坊分单位）、360° 双路
+stats/units/versions 口径（含 KVWO-97 库存=上海+潍坊分单位、闲置=库存外
+超 30 天未上线含从未上线/库存设备排除/归档 null/fleet 不可用 null 边界）、
+360° 双路
 关联；资产日报（单位清单/推送时刻解析、下一调度时刻、文案四项指标+
 数据时间+同步异常提示、webhook 成功/失败判定 monkeypatch、面板标题
 <title>/<h1> 同源）。在线校验与 lark-cli 直查逐字段比对、二次同步幂等、

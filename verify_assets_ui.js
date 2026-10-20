@@ -70,6 +70,7 @@ const ok = (name, cond) => { if (!cond) { console.error('FAIL: ' + name); proces
   ok('指标卡：一线部署 99', met.includes('一线部署') && met.includes('>99<'));
   ok('指标卡：维修率 5.2% 带计算式', met.includes('5.2%') && met.includes('(维修中 10 + 待维修 3) / 在册 248'));
   ok('指标卡：损坏率 8.5% 带计算式', met.includes('8.5%') && met.includes('(异常 8 + 维修中 10 + 待维修 3) / 在册 248'));
+  ok('指标卡：闲置卡（超 30 天未上线口径）', met.includes('闲置') && met.includes('超 30 天未上线（含从未上线）') && met.includes('>' + A.stats.idleTotal + '<'));
   ok('指标卡：统计时间 last_sync_at', met.includes('统计时间'));
   const dist = el('asDists').innerHTML;
   ok('分布图：状态/类型/单位三组', dist.includes('状态分布') && dist.includes('设备类型分布') && dist.includes('所属单位 TOP 分布'));
@@ -78,6 +79,7 @@ const ok = (name, cond) => { if (!cond) { console.error('FAIL: ' + name); proces
   const rows0 = el('asLedgerBody').innerHTML;
   const trs = rows0.split('<tr data-code=').length - 1;
   ok('台账默认显示 248 台在册（归档隐藏）', trs === 248);
+  ok('台账列：闲置标记列存在', el('asLedgerHead').innerHTML.includes('闲置') && rows0.includes('>闲置<'));
   ok('自然排序：EP-000001 在首行', rows0.includes('>EP-000001<'));
   ok('小写编号 ep-000031 显示为大写', rows0.includes('>EP-000031<') && !rows0.includes('>ep-000031<'));
   ok('台账版本列如实为空（—）', rows0.includes('台账版本') || true);
@@ -106,6 +108,7 @@ const ok = (name, cond) => { if (!cond) { console.error('FAIL: ' + name); proces
   await A.open360('ep-000031');
   const m = el('modalBody').innerHTML;
   ok('360°：台账信息 + 维修记录 + 处理流水 + 配件核对', ['台账信息', '维修记录', '处理流水', '配件核对'].every(s => m.includes(s)));
+  ok('360°：最后在线 + 闲置判定行', m.includes('最后在线') && m.includes('闲置'));
   ok('360°：设备编号大写 + 修改人', m.includes('EP-000031') && m.includes('修改人'));
   ok('360°：缺省字段显示 —', m.includes('—'));
   // 未完结维修跳维修看板（KVWO-80 已并入：真实 Rep 看板替代占位，KVWO-88）
