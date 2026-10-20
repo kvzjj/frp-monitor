@@ -161,6 +161,9 @@ def _parse_unit_list(spec):
 INVENTORY_UNITS = _parse_unit_list(os.getenv("FRP_MONITOR_INVENTORY_UNITS",
                                              "上海办公室,潍坊办公室"))
 FEISHU_WEBHOOK = os.getenv("FRP_MONITOR_FEISHU_WEBHOOK", "").strip()
+# 群机器人若开启「签名校验」（实测推送返回 code 19021 sign match fail），
+# 需配签名密钥（机器人设置页展示的 secret，同为敏感凭据仅落服务器 env）。
+FEISHU_WEBHOOK_SECRET = os.getenv("FRP_MONITOR_FEISHU_WEBHOOK_SECRET", "").strip()
 REPORT_TIMES = os.getenv("FRP_MONITOR_REPORT_TIMES", "09:00")
 PANEL_TITLE_ENV = os.getenv("FRP_MONITOR_PANEL_TITLE", "").strip()
 PANEL_TITLE_FALLBACK = "设备库存与流转管理"  # Base 全称兑底（lark-cli 解析失败时）
@@ -5530,10 +5533,24 @@ def feishu_report_text(stats, now=None):
     return "\n".join(lines)
 
 
+def _feishu_webhook_sign(secret, timestamp):
+    """飞书自定义机器人签名（官方算法）：key = "timestamp\nsecret"，消息体为空。"""
+    string_to_sign = f"{timestamp}\n{secret}"
+    return base64.b64encode(
+        hmac.new(string_to_sign.encode("utf-8"), digestmod=hashlib.sha256).digest()
+    ).decode("utf-8")
+
+
 def _feishu_webhook_post(text, attempts=3):
-    """POST 飞书群机器人 text 消息；带退避重试，返回 (ok, http_status, detail)。"""
-    body = json.dumps({"msg_type": "text", "content": {"text": text}},
-                      ensure_ascii=False).encode("utf-8")
+    """POST 飞书群机器人 text 消息；带退避重试，返回 (ok, http_status, detail)。
+
+    配置了签名密钥时按官方算法附带 timestamp+sign（机器人开启签名校验
+    必需，否则飞书拒绝 code=19021 sign match fail）。"""
+    payload = {"msg_type": "text", "content": {"text": text}}
+    if FEISHU_WEBHOOK_SECRET:
+        ts = str(int(time.time()))
+        payload.update(timestamp=ts, sign=_feishu_webhook_sign(FEISHU_WEBHOOK_SECRET, ts))
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     last_code, last_detail = None, ""
     for attempt in range(attempts):
         if attempt:
@@ -5548,14 +5565,22 @@ def _feishu_webhook_post(text, attempts=3):
             last_code, last_detail = None, f"{type(exc).__name__}: {exc}"
             continue
         try:
-            payload = json.loads(raw or "{}")
+            resp_json = json.loads(raw or "{}")
         except ValueError:
-            payload = {}
+            resp_json = {}
         # 新版 {code:0} / 旧版 {StatusCode:0}；缺省视为成功（HTTP 200 即送达）
-        biz = payload.get("code", payload.get("StatusCode", 0))
+        biz = resp_json.get("code", resp_json.get("StatusCode", 0))
         if status == 200 and biz == 0:
             return True, status, raw[:200]
-        last_code, last_detail = status, raw[:200]
+        if biz == 19021:
+            last_detail = (f"飞书拒绝 code=19021（签名校验失败）：请在群机器人设置"
+                           f"核对签名密钥（FRP_MONITOR_FEISHU_WEBHOOK_SECRET）或关闭"
+                           f"签名校验；resp={raw[:120]}")
+            last_code = status
+            break  # 签名失败是确定性错误：重试无意义
+        else:
+            last_detail = raw[:200]
+        last_code = status
     return False, last_code, last_detail
 
 

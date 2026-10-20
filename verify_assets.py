@@ -414,6 +414,56 @@ def unit_report_tests(srv):
           and "在册硬件：11 台" in out["text"]
           and srv._feishu_report_state["last"]["ok"] is True)
 
+    # 签名校验（群机器人开启签名时必需，实测未签名会被拒 code=19021）
+    import base64 as _b64, hashlib as _hl, hmac as _hmac, time as _time
+    ts = "1761021000"
+    expect_sign = _b64.b64encode(_hmac.new(f"{ts}\n/test-secret".encode(),
+                                         digestmod=_hl.sha256).digest()).decode()
+    check("签名算法与飞书官方一致（key=timestamp\nsecret，空消息体）",
+          srv._feishu_webhook_sign("/test-secret", ts) == expect_sign)
+
+    bodies = []
+
+    def _sign_open(req, timeout=None):
+        bodies.append(json.loads(req.data.decode("utf-8")))
+        return _Resp()
+
+    class _Resp19021(_Resp):
+        def read(self, n=-1):
+            return b'{"code":19021,"msg":"sign match fail or timestamp is not within one hour"}'
+
+    def _open_19021(req, timeout=None):
+        bodies.append(json.loads(req.data.decode("utf-8")))
+        return _Resp19021()
+
+    orig_secret = srv.FEISHU_WEBHOOK_SECRET
+    srv.FEISHU_WEBHOOK = "https://example.invalid/hook"
+    try:
+        srv.FEISHU_WEBHOOK_SECRET = ""     # 未配密钥：不带签名字段
+        srv.urlopen = _sign_open
+        ok_ns, _, _ = srv._feishu_webhook_post("hi", attempts=1)
+        unsigned = dict(bodies[-1])
+        srv.FEISHU_WEBHOOK_SECRET = "/test-secret"
+        ok3, _, _ = srv._feishu_webhook_post("hi", attempts=2)
+        n_ok = len(bodies)
+        srv.urlopen = _open_19021
+        ok4, code4, detail4 = srv._feishu_webhook_post("hi", attempts=3)
+        n_19021 = len(bodies) - n_ok
+    finally:
+        srv.urlopen, srv.FEISHU_WEBHOOK_SECRET = orig_open, orig_secret
+        srv.FEISHU_WEBHOOK = orig_hook
+    sent = bodies[n_ok - 1]   # 最后一次成功签名推送的载荷
+    check("未配密钥时不带 timestamp/sign 字段（关闭签名校验的机器人可用）",
+          ok_ns is True and unsigned.get("msg_type") == "text"
+          and "sign" not in unsigned and "timestamp" not in unsigned)
+    check("配密钥后载荷带 timestamp+sign（官方算法）",
+          ok3 is True and sent.get("timestamp") and sent.get("sign")
+          and sent["msg_type"] == "text"
+          and abs(int(sent["timestamp"]) - int(_time.time())) < 60)
+    check("code=19021 → 明示签名问题且不空转重试（1 次即停）",
+          ok4 is False and code4 == 200 and "19021" in detail4
+          and "签名" in detail4 and n_19021 == 1)
+
     # 面板标题：env 未设 → 兑底值；模板标签与页头一致
     title = srv.panel_title()
     check("面板标题：env 未设时用兑底值（台账全称）",

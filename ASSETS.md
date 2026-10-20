@@ -35,6 +35,7 @@ SQLite，指标全部由同步数据实时计算（不落死数）。面板只�
 | `FRP_MONITOR_ASSET_DB` | `<server.py 所在目录>/assets.sqlite` | 本地 SQLite 路径 |
 | `FRP_MONITOR_INVENTORY_UNITS` | `上海办公室,潍坊办公室` | 库存口径单位清单（逗号分隔，可扩展；提出人 2026-10-20 确认上海+潍坊均为公司库存未使用，服务商等其他单位持有不计库存） |
 | `FRP_MONITOR_FEISHU_WEBHOOK` | 空（关闭） | 飞书群机器人 webhook（KVWO-97 资产日报推送）；**敏感凭据，只落在服务器 env 配置，勿写入仓库/文档；置空/未配置 = 关闭推送** |
+| `FRP_MONITOR_FEISHU_WEBHOOK_SECRET` | 空（不签名） | 机器人签名密钥：群机器人开启「签名校验」时必配（未签名推送被拒 code=19021，2026-10-20 实测已遇到）；同敏感凭据仅落服务器 env；未开启签名校验不用配 |
 | `FRP_MONITOR_REPORT_TIMES` | `09:00` | 日报推送时刻（服务器本地时间，逗号分隔 HH:MM 支持多时刻；调度模式同采集时长 `FRP_MONITOR_COLLECT_TIMES`） |
 | `FRP_MONITOR_PANEL_TITLE` | 空 | 面板标题覆盖（浏览器标签与页头）；未设时启动后台线程用 lark-cli 查 Base 全称 best-effort，失败用兑底值「设备库存与流转管理」 |
 
@@ -99,9 +100,12 @@ frps 主机名本身就是小写 `ep-000xxx`）。
   服务商持有不计）、在册硬件（附归档不计在册、一线部署）、维修率/
   损坏率（含分子分母）、数据时间（最近一次飞书成功同步；同步异常时
   如实提示 ⚠）——指标全部由 `/api/assets/stats` 同一数据源实时计算。
-- 推送在独立线程（`feishu-report`）、带退避重试（3 次）；失败只记日志与
+- 推送在独立线程（`feishu-report`）、带退避重试（3 次，签名失败 19021
+  等确定性错误不空转重试）；失败只记日志与
   状态（`GET /api/assets/report` / stdout），**不影响面板服务与飞书同步**；
-  webhook 置空即整体关闭（调度线程不启动）。
+  webhook 置空即整体关闭（调度线程不启动）。机器人开启「签名校验」时配
+  `FRP_MONITOR_FEISHU_WEBHOOK_SECRET`（飞书官方算法：
+  key=`timestamp\nsecret`、空消息体，载荷附带 timestamp+sign）。
 - 面板更名（同需求）：浏览器标签与页头一致，默认取飞书台账
   Base（`V0YwbaOzya0ADBsO2wSc8M9Cntf`）全称，`FRP_MONITOR_PANEL_TITLE`
   可覆盖。
@@ -135,5 +139,6 @@ active_repairs 与既有 API 交叉一致；日报状态端点/手动推送文�
 - `assets.sqlite` 落在 `/opt/frp-monitor/`，已加 .gitignore。
 - 日报推送（KVWO-97）：在 `/etc/frp-monitor.env` 配置
   `FRP_MONITOR_FEISHU_WEBHOOK`（群机器人地址，敏感凭据勿入仓库）后重启；
-  `POST /api/assets/report/run` 可立即验推一次；时刻用
+  **机器人若开启「签名校验」需同配 `FRP_MONITOR_FEISHU_WEBHOOK_SECRET`
+  （签名密钥）**；`POST /api/assets/report/run` 可立即验推一次；时刻用
   `FRP_MONITOR_REPORT_TIMES` 调整（默认 09:00）。
