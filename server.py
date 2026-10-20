@@ -91,6 +91,26 @@ BACKUP_DIR = os.getenv("FRP_MONITOR_BACKUP_DIR", "/opt/frp-monitor/backups")
 BACKUP_KEEP = max(1, int(os.getenv("FRP_MONITOR_BACKUP_KEEP", "7")))
 MAINTENANCE_TIME = os.getenv("FRP_MONITOR_MAINTENANCE_TIME", "03:30")
 
+# --- webfix：缺失 web 代理设备的自动检测与一次性补配（KVWO-17/19/44）--------
+# 触发时机（KVWO-44，需求方定稿 2026-10-16）：上线事件 + 稳定窗口，不再周期
+# 扫描命中即触发——设备从离线转在线（且 ssh 代理在、web 代理缺、无 auto 台账
+# 记录）→ 启动稳定计时；连续在线满 WEBFIX_DELAY 秒且期间未掉线（掉线计时
+# 作废、重新上线重计）→ 仍缺 web 代理 → 触发；面板启动时已在线的存量设备
+# 从首次观测起算同样窗口。
+# 检测判据：在线 + 有 SSH 代理端口 + 无 web 代理端口（仅 version_error 属探测
+# 瞬时失败，不触发）；每台设备自动触发严格一次（webfix_tasks 台账防重，永不
+# 清理），失败不自动重试，面板 POST /api/webfix/retry 手动重试。补配只动设备侧
+# frpc.toml（网关 allowPorts 30000-30999 已由 DevOps 预放宽，见兄弟任务），单机
+# 隧道秒级闪断为预期行为；不触碰 frps / 网关任何配置。
+WEBFIX_AUTO = os.getenv("FRP_MONITOR_WEBFIX_AUTO", "1").strip().lower() not in ("0", "false", "no", "off")
+WEBFIX_PORT_BASE = int(os.getenv("FRP_MONITOR_WEBFIX_PORT_BASE", "30000"))  # web 端口 = 基数 + 设备编号
+WEBFIX_PORT_MAX = int(os.getenv("FRP_MONITOR_WEBFIX_PORT_MAX", "30999"))     # 网关预放宽段上界
+WEBFIX_VERIFY_TIMEOUT = float(os.getenv("FRP_MONITOR_WEBFIX_VERIFY_TIMEOUT", "180"))  # 重启回连+闭环校验上限(秒)
+WEBFIX_MAX_PARALLEL = max(1, int(os.getenv("FRP_MONITOR_WEBFIX_MAX_PARALLEL", "2")))
+# 上线后稳定窗口（秒，默认 60）：连续在线满窗且期间未掉线才自动触发，线上
+# 可经环境变量调整（KVWO-44）；0 = 满窗判定退化为下一轮刷新即触发
+WEBFIX_DELAY = max(0.0, float(os.getenv("FRP_MONITOR_WEBFIX_DELAY", "60")))
+
 V0_HOSTS = {
     "ep-000101", "ep-000102", "ep-000103", "ep-000104", "ep-000105",
     "ep-000107", "ep-000110", "ep-000111", "ep-000112", "ep-000113",
@@ -1277,6 +1297,27 @@ class Store:
             "first_seen DATETIME NOT NULL, "
             "UNIQUE KEY uq_ver_arch (version, arch)"
             ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4")
+        # webfix 台账（KVWO-17/19/44）：每次补配一行（auto 一次性防重靠 trigger_type='auto'
+        # 的历史行；attempts 为累计次数）；与 devices 同为永不清理的台账，
+        # run_maintenance 的 30 天保留不涉及此表。log 随子任务入库，重启后仍可回看。
+        # status 三态收口（KVWO-44，对齐父需求）：success / failed（环境性失败，
+        # 排障后重试可成功）/ blocked（阻断类：前置不满足或确定性错配，重试同样
+        # 结果，需人工介入）；error_code 为细分码（如 arch_unknown / proxy_conflict）。
+        self._execute(
+            "CREATE TABLE IF NOT EXISTS webfix_tasks ("
+            "id INT NOT NULL PRIMARY KEY, "
+            "hostname VARCHAR(64) NOT NULL, "
+            "trigger_type VARCHAR(8) NOT NULL, "         # auto / manual
+            "status VARCHAR(16) NOT NULL DEFAULT 'queued', "  # queued/running/success/failed/blocked
+            "error VARCHAR(500) NOT NULL DEFAULT '', "
+            "error_code VARCHAR(32) NOT NULL DEFAULT '', "   # 细分码（KVWO-44；空 = 未分类）
+            "attempts INT NOT NULL DEFAULT 1, "           # 该设备累计补配次数
+            "log LONGTEXT NULL, "
+            "created_at DATETIME NOT NULL, "
+            "finished_at DATETIME NULL, "
+            "KEY idx_host (hostname), "
+            "KEY idx_created (created_at)"
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4")
         rows = self._execute(
             "SELECT column_name FROM information_schema.columns "
             "WHERE table_schema=DATABASE() AND table_name='devices'", fetch="all")
@@ -1300,14 +1341,21 @@ class Store:
         tcols = {r[0] for r in rows or []}
         if tcols and "error_code" not in tcols:
             self._execute("ALTER TABLE upgrade_tasks ADD COLUMN error_code VARCHAR(32) NOT NULL DEFAULT ''")
+        # 老库补列（KVWO-44 前的 webfix_tasks 无 error_code）
+        rows = self._execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema=DATABASE() AND table_name='webfix_tasks'", fetch="all")
+        wcols = {r[0] for r in rows or []}
+        if wcols and "error_code" not in wcols:
+            self._execute("ALTER TABLE webfix_tasks ADD COLUMN error_code VARCHAR(32) NOT NULL DEFAULT ''")
 
     def _load_roster(self):
         rows = self._execute(
             "SELECT hostname, IFNULL(site,''), IFNULL(owner,''), IFNULL(hardware,''), retired, "
-            "IFNULL(hw_model,''), IFNULL(ip,''), ssh_port FROM devices",
+            "IFNULL(hw_model,''), IFNULL(ip,''), ssh_port, IFNULL(device_id,'') FROM devices",
             fetch="all")
         self.roster = {r[0]: {"site": r[1], "owner": r[2], "hardware": r[3], "retired": bool(r[4]),
-                              "hw_model": r[5], "ip": r[6], "ssh_port": r[7]}
+                              "hw_model": r[5], "ip": r[6], "ssh_port": r[7], "device_id": r[8]}
                        for r in rows or []}
 
     def _load_state(self):
@@ -1669,6 +1717,94 @@ class Store:
             self.finish_upgrade_job(job_id, now)
         return len(rows)
 
+    # --- webfix 台账（KVWO-17/19/44）----------------------------------------------
+    def create_webfix_task(self, task_id, hostname, trigger_type, attempts, created_at,
+                           status="queued", error="", error_code="", finished_at=None):
+        """落一行台账；KVWO-44 起支持直接以终态落行（auto 阻断类前置不满足：
+        不跑设备端，状态直接 blocked 收口，占一次性名额、可手动重试）。"""
+        self._execute(
+            "INSERT INTO webfix_tasks (id, hostname, trigger_type, status, error, "
+            "error_code, attempts, created_at, finished_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (task_id, hostname, trigger_type, status, (error or "")[:500],
+             (error_code or "")[:32], attempts, created_at, finished_at))
+
+    def update_webfix_task(self, task_id, status=None, error=None, error_code=None,
+                           log=None, finished_at=None):
+        sets, args = [], []
+        if status is not None:
+            sets.append("status=%s"); args.append(status)
+        if error is not None:
+            sets.append("error=%s"); args.append(error[:500])
+        if error_code is not None:
+            sets.append("error_code=%s"); args.append(error_code[:32])
+        if log is not None:
+            sets.append("log=%s"); args.append(log)
+        if finished_at is not None:
+            sets.append("finished_at=%s"); args.append(finished_at)
+        if not sets:
+            return
+        args.append(task_id)
+        self._execute(f"UPDATE webfix_tasks SET {', '.join(sets)} WHERE id=%s", args)
+
+    def webfix_has_auto(self, hostname):
+        """该设备是否已有自动触发记录（无论成败）——自动补配严格一次的判据。"""
+        row = self._execute(
+            "SELECT 1 FROM webfix_tasks WHERE hostname=%s AND trigger_type='auto' LIMIT 1",
+            (hostname,), fetch="one")
+        return bool(row)
+
+    def webfix_attempts(self, hostname):
+        row = self._execute(
+            "SELECT MAX(attempts) FROM webfix_tasks WHERE hostname=%s", (hostname,), fetch="one")
+        return int(row[0] or 0) if row else 0
+
+    def webfix_tasks_view(self):
+        """各设备补配状态：每设备取最新一行（含 error / error_code / 累计 attempts / 日志长度）。"""
+        rows = self._execute(
+            "SELECT w.id, w.hostname, w.trigger_type, w.status, w.error, w.error_code, "
+            "w.attempts, "
+            "UNIX_TIMESTAMP(w.created_at), IFNULL(UNIX_TIMESTAMP(w.finished_at), 0), "
+            "IFNULL(LENGTH(w.log), 0), IFNULL(d.site, '') "
+            "FROM webfix_tasks w "
+            "JOIN (SELECT hostname, MAX(id) AS mid FROM webfix_tasks GROUP BY hostname) t "
+            "ON w.id = t.mid "
+            "LEFT JOIN devices d ON d.hostname = w.hostname "
+            "ORDER BY w.id DESC", fetch="all")
+        return [{"task_id": r[0], "hostname": r[1], "trigger_type": r[2], "status": r[3],
+                 "error": r[4] or "", "error_code": r[5] or "", "attempts": int(r[6] or 1),
+                 "created_at": r[7],
+                 "finished_at": r[8] or None, "chars": int(r[9] or 0), "site": r[10] or ""}
+                for r in rows or []]
+
+    def webfix_task_log(self, task_id):
+        """取库内日志（进程重启后回看）；返回 (log, status, hostname) 或 None。"""
+        row = self._execute(
+            "SELECT log, status, hostname FROM webfix_tasks WHERE id=%s", (task_id,), fetch="one")
+        if not row:
+            return None
+        return row[0] or "", row[1] or "", row[2] or ""
+
+    def max_webfix_id(self):
+        row = self._execute("SELECT MAX(id) FROM webfix_tasks", fetch="one")
+        return int(row[0] or 0) if row else 0
+
+    def reconcile_webfix_tasks(self):
+        """进程重启后把遗留 queued/running 的补配任务标记为 failed（自动触发的
+        一次性语义不固中断而重置：台账里 auto 记录仍在，不再自动触发；可手动重试）。"""
+        rows = self._execute(
+            "SELECT id, hostname FROM webfix_tasks WHERE status IN ('queued', 'running')",
+            fetch="all")
+        if not rows:
+            return 0
+        now = datetime.now()
+        for tid, hostname in rows:
+            self.update_webfix_task(
+                tid, status="failed",
+                error="面板进程重启，补配任务中断（若配置已写入则保留现场；可手动重试）",
+                finished_at=now)
+        return len(rows)
+
     def events(self, hours, limit):
         rows = self._execute(
             "SELECT hostname, DATE_FORMAT(ts, '%%Y-%%m-%%d %%H:%%i:%%s'), event_type, "
@@ -1702,6 +1838,15 @@ def _refresh_loop():
             refresh_snapshot()
         except Exception:
             pass
+        else:
+            # webfix 自动检测（KVWO-17/19/44）：挂入现有刷新循环，每轮快照后推进
+            # 「上线事件 + 稳定窗口」状态机——新候选记窗口起点，掉线作废重计，
+            # 连续在线满 WEBFIX_DELAY（默认 60s）且仍缺 web 代理才触发（判据只看
+            # 代理列表；version_error 单独出现不触发，探测瞬时失败 ≠ 缺配置）。
+            try:
+                webfix_auto_detect()
+            except Exception:
+                pass
         time.sleep(REFRESH_INTERVAL)
 
 
@@ -1981,6 +2126,67 @@ fi
 echo "health: portal=$(systemctl is-active ego-portal.service 2>/dev/null) frpc=$(systemctl is-active frpc 2>/dev/null) api=$(curl -s --max-time 5 http://127.0.0.1/api/setup/status | grep -oP '"release_version":"[^"]*"' | head -1)"
 echo "disk: $(df -h / | awk 'NR==2{print $4" free"}')"
 echo "### done"
+'''
+
+
+SCRIPT_WEBFIX = r'''#!/usr/bin/env bash
+# 设备端 web 代理补配（KVWO-17/19 · 2026-10-16）。经 FRP SSH stdin 推送执行，
+# 参数走远程命令行环境变量：WEBFIX_HOSTNAME（如 ep-000160）、WEBFIX_PORT
+# （如 30160）、DEPLOY_PW（sudo 凭据，经 stdin；严禁密码管道接 tee -a —— SOP #4）。
+# 流程：flock 防并发 → 备份 frpc.toml → 幂等检查（同名代理已存在：端口一致 =
+# 无事可做；不一致 = 报错人工介入，不覆盖）→ 临时文件追加 [[proxies]] 块 →
+# frpc verify → sudo cp 覆盖（保留原文件属主/权限）→ 延迟重启 frpc。重启会闪断
+# 自身 SSH 隧道（预期内），故以 setsid 后台延迟执行后立即退出，回连与版本闭环
+# 校验（/api/setup/status 比对 device_id）由面板侧完成。
+# 结果标记：WEBFIX_APPLIED / WEBFIX_ALREADY / ERROR_*（失败不回滚，保留现场）。
+set -u
+pw="${DEPLOY_PW:?need DEPLOY_PW}"
+s() { printf '%s\n' "$pw" | sudo -S -p '' "$@" 2>/dev/null; }
+HOST="${WEBFIX_HOSTNAME:?need WEBFIX_HOSTNAME, e.g. ep-000160}"
+PORT="${WEBFIX_PORT:?need WEBFIX_PORT, e.g. 30160}"
+printf '%s' "$HOST" | grep -qE '^ep-[0-9]+$' || { echo "ERROR_BAD_HOSTNAME: $HOST 不符合 ep-<编号> 约定"; exit 18; }
+case "$PORT" in ''|*[!0-9]*) echo "ERROR_BAD_PORT: $PORT"; exit 19;; esac
+CONF=/etc/frp/frpc.toml
+exec 9>/var/tmp/webfix.lock
+flock -n 9 || { echo "ERROR_BUSY: 另一个 webfix 正在此设备上运行"; exit 20; }
+echo "webfix: host=$HOST web=$PORT conf=$CONF frpc=$(systemctl is-active frpc 2>/dev/null || true)"
+s test -f "$CONF" || { echo "ERROR_NO_CONF: $CONF 不存在（frpc 配置路径与预期不符，需人工确认）"; exit 11; }
+# 1) 幂等检查：同名代理块已存在 → remotePort 一致 = 无事可做；不一致 = 不覆盖，人工介入
+line=$(s grep -nE "^[[:space:]]*name[[:space:]]*=[[:space:]]*\"${HOST}-web\"" "$CONF" | head -1 || true)
+if [ -n "$line" ]; then
+  ln=${line%%:*}
+  existing=$(s tail -n +"$((ln + 1))" "$CONF" | sed -n '/^[[:space:]]*\[\[/q; /remotePort[[:space:]]*=/p' | grep -oE '[0-9]+' | head -1)
+  if [ "$existing" = "$PORT" ]; then
+    echo "WEBFIX_ALREADY: 代理 ${HOST}-web 已存在且 remotePort=$PORT 一致，未做任何改动"
+    exit 0
+  fi
+  echo "ERROR_PROXY_CONFLICT: 已存在同名代理 ${HOST}-web（remotePort=${existing:-?} ≠ $PORT），不覆盖，需人工介入"
+  exit 12
+fi
+# 2) 备份（时间戳留档，不覆盖历史备份，供人工排查/回滚参考）
+BAK="${CONF}.bak-webfix-$(date +%Y%m%d-%H%M%S)"
+s cp -p "$CONF" "$BAK" || { echo "ERROR_BACKUP: 备份失败，未改动配置"; exit 13; }
+echo "backup: $BAK"
+# 3) 临时文件组装（用户态临时文件；sudo cat 读原配置，不依赖其权限）→
+#    frpc verify → sudo cp 覆盖（对已存在目标为截断写，保留原属主/权限）
+TMP=$(mktemp /var/tmp/frpc-webfix.XXXXXX)
+trap 'rm -f "$TMP"' EXIT
+s cat "$CONF" > "$TMP" || { echo "ERROR_READ_CONF: 读取 $CONF 失败"; exit 14; }
+[ "$(tail -c1 "$TMP" | wc -l)" -gt 0 ] || printf '\n' >> "$TMP"   # 原文件无结尾换行时补一行，防 TOML 粘连
+printf '[[proxies]]\nname = "%s-web"\ntype = "tcp"\nlocalIP = "127.0.0.1"\nlocalPort = 80\nremotePort = %s\n' "$HOST" "$PORT" >> "$TMP"
+echo "append: ${HOST}-web remotePort=$PORT -> 127.0.0.1:80"
+FRPC=$(command -v frpc 2>/dev/null || true)
+[ -n "$FRPC" ] || for c in /usr/local/bin/frpc /usr/bin/frpc /opt/frp/frpc; do [ -x "$c" ] && FRPC="$c" && break; done
+[ -n "$FRPC" ] || { echo "ERROR_NO_FRPC: 找不到 frpc 可执行文件，需人工确认安装路径"; exit 17; }
+printf '%s\n' "$pw" | sudo -S -p '' "$FRPC" verify -c "$TMP" || { echo "ERROR_VERIFY: frpc verify 未通过（见上方输出），未改动 $CONF"; exit 15; }
+echo "verify: frpc syntax check pass"
+s cp "$TMP" "$CONF" || { echo "ERROR_INSTALL: sudo cp 覆盖 $CONF 失败（备份在 $BAK）"; exit 16; }
+s ls -l "$CONF" | sed 's/^/installed: /'
+# 4) 延迟重启（setsid 脱离会话：frpc 重启会闪断本 SSH 隧道，本进程须先安全退出；
+#    9>&- 不把 flock 句柄遗传给后台进程，锁随本脚本退出即释放）
+s sh -c "nohup setsid sh -c 'sleep 2; systemctl restart frpc; sleep 3; systemctl is-active frpc' >/var/tmp/webfix-restart.log 2>&1 9>&- &"
+echo "WEBFIX_APPLIED: 已写入 ${HOST}-web（remotePort=$PORT -> 127.0.0.1:80），2s 后重启 frpc（本机隧道秒级闪断为预期）"
+exit 0
 '''
 
 
@@ -2363,13 +2569,18 @@ def _next_upgrade_ids(n):
 
 
 def device_busy(hostname):
-    """该设备是否已有 queued/running 子任务（跨任务查重，并发护栏）。"""
+    """该设备是否已有 queued/running 子任务（跨任务查重，并发护栏）。
+
+    含 webfix 补配任务（frpc 重启会闪断 SSH 隧道，与升级互斥）。"""
     with UPGRADES_LOCK:
         for job in UPGRADES.values():
             with job.lock:
                 for t in job.tasks:
                     if t.hostname == hostname and t.status in ("queued", "running"):
                         return job.id
+    webfix = webfix_active(hostname)
+    if webfix is not None:
+        return f"webfix#{webfix.id}"
     return None
 
 
@@ -2710,7 +2921,10 @@ def _run_upgrade_task(task):
 
 
 def _resolve_device(hostname):
-    """以面板设备记录为准解析 ssh_port 与机型；返回 (ssh_port, arch, error)。"""
+    """以面板设备记录为准解析 ssh_port 与机型；返回 (ssh_port, arch, error, error_code)。
+
+    error_code（KVWO-44 阻断类细分码）：no_ssh_port / arch_unknown，供 webfix
+    阻断落库与 API 回显；升级编排调用方忽略该值。"""
     snap = {}
     try:
         hosts, _ = get_snapshot()
@@ -2723,12 +2937,14 @@ def _resolve_device(hostname):
         ssh_port = int(ssh_port)
     hw = (roster.get("hardware") or "").strip() or _hardware_category(roster.get("hw_model") or "")
     arch = ARCH_BY_HW.get((hw or "").strip()) or ARCH_BY_HW.get(hw.casefold() if hw else "")
-    error = None
+    error, code = None, ""
     if not ssh_port:
         error = "无 SSH 端口记录（以面板设备记录为准，请等设备上线后再试）"
+        code = "no_ssh_port"
     elif not arch:
         error = "无法确定机型（V0/amd64 或 V1/rk3588），请先在设备登记表维护 hardware"
-    return ssh_port, arch, error
+        code = "arch_unknown"
+    return ssh_port, arch, error, code
 
 
 def create_upgrade_job(kind, devices, params):
@@ -2805,7 +3021,7 @@ def create_upgrade_job(kind, devices, params):
         if busy:
             skipped.append({"hostname": hostname, "reason": f"已有任务 {busy} 在进行中"})
             continue
-        ssh_port, arch, error = _resolve_device(hostname)
+        ssh_port, arch, error, _ = _resolve_device(hostname)
         if error:
             skipped.append({"hostname": hostname, "reason": error})
             continue
@@ -2925,6 +3141,515 @@ def _prune_upgrade_memory():
 
 
 # ----------------------------------------------------------------------------
+# webfix 引擎（KVWO-17/19/44）：缺失 web 代理设备的自动检测与一次性补配。
+# 检测挂入 _refresh_loop（上线事件 + 稳定窗口，KVWO-44）；补配复用升级编排的
+# SSH 基建（run_remote/push_script，SSH 用户按机型解析，KVWO-13）与 SSE/日志
+# 体系；台账入库 webfix_tasks。
+# 只动设备侧 frpc.toml，不触碰 frps / 网关（allowPorts 30000-30999 已预放宽）。
+# ----------------------------------------------------------------------------
+# 阻断类细分码（KVWO-44，对齐父需求「成功/失败/阻断」三态与 KVWO-21 的
+# blocked / error_code 设计）：阻断 = 前置条件不满足或确定性错配，重试同样
+# 结果，需人工介入（补登记表 / 放宽网关段 / 处理配置冲突）；普通失败 =
+# 环境性/瞬时性失败（SSH 不可达、闭环校验超时等），排障后重试可成功。
+#   面板侧前置：bad_hostname / port_out_of_range / no_ssh_port / arch_unknown
+#   设备端脚本：no_conf（配置缺失）/ proxy_conflict（同名代理端口冲突）/ no_frpc
+#               / bad_hostname / bad_port
+#   闭环校验：  device_id_mismatch（端口「借住」错配，不会自愈，等人工）
+WEBFIX_BLOCKED_CODES = {"bad_hostname", "bad_port", "port_out_of_range", "no_ssh_port",
+                        "arch_unknown", "no_conf", "proxy_conflict", "no_frpc",
+                        "device_id_mismatch"}
+_SCRIPT_ERROR_CODES = {"ERROR_BAD_HOSTNAME": "bad_hostname", "ERROR_BAD_PORT": "bad_port",
+                       "ERROR_NO_CONF": "no_conf", "ERROR_PROXY_CONFLICT": "proxy_conflict",
+                       "ERROR_NO_FRPC": "no_frpc"}
+
+
+def _webfix_device_number(hostname):
+    """从设备名提取编号（ep-000160 → 160）；不符合约定返回 None。"""
+    m = re.fullmatch(r"ep-(\d+)", (hostname or "").strip().casefold())
+    return int(m.group(1)) if m else None
+
+
+def webfix_port_for(hostname):
+    """该设备应使用的 web 远端端口（WEBFIX_PORT_BASE + 编号）；超段返回 None。"""
+    number = _webfix_device_number(hostname)
+    if number is None:
+        return None
+    port = WEBFIX_PORT_BASE + number
+    return port if WEBFIX_PORT_BASE <= port <= WEBFIX_PORT_MAX else None
+
+
+def webfix_candidates(hosts):
+    """缺 web 代理候选：在线 + 有 SSH 代理端口 + 无 web 代理端口。
+
+    判据只看 frps 代理列表；web 代理已存在但探测失败（version_error）不属于
+    缺配置，不触发——那是探测瞬时失败，改设备配置解决不了。"""
+    out = []
+    for h in hosts or []:
+        if not h.get("port"):        # 无 SSH 代理：无法推送补配脚本
+            continue
+        if h.get("web_port"):        # web 代理已存在（即使 version_error 也不是候选）
+            continue
+        out.append(h["hostname"])
+    return out
+
+
+def _webfix_id_matches(got, expected):
+    """闭环校验的 device_id 比对：数字串按值比（"0160"="160"），其余按字面比。"""
+    g, e = str(got or "").strip(), str(expected or "").strip()
+    if not g or not e:
+        return False
+    if g.isdigit() and e.isdigit():
+        return int(g) == int(e)
+    return g.casefold() == e.casefold()
+
+
+class WebfixTask:
+    """一台设备一次补配的运行态（内存态权威，状态/日志增量落 webfix_tasks）。
+
+    兼容 run_remote/push_script 的任务接口（ssh_port/ssh_user/log）。status 三态
+    收口（KVWO-44）：success / failed（环境性）/ blocked（阻断类，重试同样
+    结果，需人工介入）；error_code 为细分码。"""
+
+    def __init__(self, task_id, hostname, trigger_type, attempts, ssh_port, ssh_user,
+                 port, expected_id):
+        self.id = task_id
+        self.hostname = hostname
+        self.trigger_type = trigger_type      # auto / manual
+        self.attempts = attempts              # 该设备累计补配次数
+        self.ssh_port = ssh_port
+        self.ssh_user = ssh_user
+        self.port = port                      # 目标 web 远端端口（30000+编号）
+        self.expected_id = expected_id        # 闭环校验期望 device_id
+        self.status = "queued"
+        self.error = ""
+        self.error_code = ""
+        self.created_at = time.time()
+        self.finished_at = 0.0
+        self.text = ""
+        self._flushed = 0
+        self.lock = threading.Lock()
+
+    def log(self, line):
+        chunk = _sanitize(str(line)) + "\n"
+        with self.lock:
+            self.text += chunk
+            if len(self.text) > TASK_LOG_CAP:
+                cut = self.text.find("\n", len(self.text) - int(TASK_LOG_CAP * 0.8))
+                self.text = "…（前文截断）…\n" + self.text[cut + 1:]
+            total = len(self.text)
+            flush = total - self._flushed >= 65536
+        BUS.publish({"type": "webfix_log", "task_id": self.id, "hostname": self.hostname,
+                     "chunk": chunk, "total": total, "text": chunk, "offset": total})
+        if flush:
+            self.persist(log=True)
+
+    def set_status(self, status, error=None, error_code=None):
+        with self.lock:
+            self.status = status
+            if error is not None:
+                self.error = _sanitize(str(error))[:500]
+            if error_code is not None:
+                self.error_code = _sanitize(str(error_code))[:32]
+        BUS.publish({"type": "webfix", "task": self.to_dict()})
+
+    def persist(self, status=None, error=None, error_code=None, log=False, finished=False):
+        kwargs = {}
+        if status is not None:
+            kwargs["status"] = status
+        if error is not None:
+            kwargs["error"] = error
+        if error_code is not None:
+            kwargs["error_code"] = error_code
+        if log:
+            with self.lock:
+                kwargs["log"] = self.text
+                self._flushed = len(self.text)
+        if finished:
+            kwargs["finished_at"] = datetime.now()
+        if kwargs:
+            store.update_webfix_task(self.id, **kwargs)
+
+    def to_dict(self):
+        with self.lock:
+            return {"task_id": self.id, "hostname": self.hostname,
+                    "site": (store.roster.get(self.hostname) or {}).get("site", ""),
+                    "trigger_type": self.trigger_type, "status": self.status,
+                    "error": self.error, "error_code": self.error_code,
+                    "attempts": self.attempts,
+                    "web_port": self.port,
+                    "created_at": self.created_at or None,
+                    "finished_at": self.finished_at or None,
+                    "chars": len(self.text)}
+
+
+WEBFIX = {}              # task_id -> WebfixTask（内存态；历史从 DB 回看）
+WEBFIX_LOCK = threading.RLock()  # 可重入：_start_webfix_checked 持锁时内查 webfix_active
+_WEBFIX_SEQ = store.max_webfix_id() if store.enabled else 0  # 重启后从 DB 续号，防主键冲突
+WEBFIX_POOL = ThreadPoolExecutor(max_workers=WEBFIX_MAX_PARALLEL,
+                                 thread_name_prefix="webfix")
+
+
+def webfix_active(hostname):
+    """该设备是否有 queued/running 的补配任务（返回任务或 None）。"""
+    with WEBFIX_LOCK:
+        for t in WEBFIX.values():
+            if t.hostname == hostname and t.status in ("queued", "running"):
+                return t
+    return None
+
+
+def _webfix_reject_auto(hostname, reason, error_code):
+    """auto 触发遇阻断类前置不满足：不跑设备端，直接落一条 blocked 台账行。
+
+    阻断也占一次性名额（对齐 KVWO-21 语义）：结果落库可查、面板可见，人工
+    补齐登记表 / 放宽网关段后可手动重试；避免每轮刷新对永久性缺口反复探测。"""
+    with WEBFIX_LOCK:
+        global _WEBFIX_SEQ
+        _WEBFIX_SEQ += 1
+        task_id = _WEBFIX_SEQ
+        attempts = (store.webfix_attempts(hostname) or 0) + 1
+        task = WebfixTask(task_id, hostname, "auto", attempts, None, "", None, "")
+        task.status = "blocked"
+        task.error = _sanitize(str(reason))[:500]
+        task.error_code = error_code
+        task.finished_at = time.time()
+        WEBFIX[task_id] = task
+    store.create_webfix_task(task_id, hostname, "auto", attempts, datetime.now(),
+                             status="blocked", error=task.error,
+                             error_code=error_code, finished_at=datetime.now())
+    BUS.publish({"type": "webfix", "task": task.to_dict()})
+    try:
+        store._event(datetime.now(), hostname, "webfix", "auto", "blocked", task.error)
+    except Exception:  # noqa: BLE001  # 事件失败不影响阻断收口
+        pass
+    return {"ok": False, "reason": reason, "error_code": error_code,
+            "blocked": True, "task_id": task_id}
+
+
+def _start_webfix_checked(hostname, trigger):
+    """校验后创建并异步启动一次补配；返回 {ok, task_id?, attempts?, reason?,
+    error_code?, blocked?}。
+
+    trigger: auto（检测引擎，严格一次）/ manual（面板重试，每次新建台账行、
+    attempts 累加、trigger_type=manual）。阻断类前置不满足（机型未知、端口
+    超段等）时：auto 落 blocked 台账行（KVWO-44），manual 仅跳过并回明原因。"""
+    hostname = (hostname or "").strip().casefold()
+    if not hostname:
+        return {"ok": False, "reason": "空设备名"}
+
+    def reject(reason, code=""):
+        if trigger == "auto" and code in WEBFIX_BLOCKED_CODES:
+            return _webfix_reject_auto(hostname, reason, code)
+        return {"ok": False, "reason": reason, "error_code": code}
+
+    port = webfix_port_for(hostname)
+    if port is None:
+        number = _webfix_device_number(hostname)
+        if number is None:
+            return reject(f"设备名 {hostname} 不符合 ep-<编号> 约定，无法推导 web 端口",
+                          "bad_hostname")
+        return reject(f"推导端口 {WEBFIX_PORT_BASE + number} 超出网关预放宽段 "
+                      f"{WEBFIX_PORT_BASE}-{WEBFIX_PORT_MAX}，需先放宽 allowPorts",
+                      "port_out_of_range")
+    if not store.enabled:
+        return {"ok": False, "reason": "历史库未启用（webfix 依赖台账防重，需 MySQL）"}
+    if not DEPLOY_PW:
+        return {"ok": False, "reason": "服务端未设置 DEPLOY_PW（/etc/frp-monitor.env）"}
+    try:
+        hosts, _ = get_snapshot()
+        snap = next((h for h in hosts if h["hostname"] == hostname), None)
+    except Exception:  # noqa: BLE001  # frps 不可达时仅按登记表判定
+        hosts, snap = [], None
+    roster = store.roster.get(hostname) or {}
+    if hostname not in store.roster and snap is None:
+        return {"ok": False, "reason": "未知设备（不在面板记录中）"}
+    if trigger == "auto" and roster.get("retired"):
+        return {"ok": False, "reason": "设备已标记退役，自动补配跳过（可手动重试）"}
+    if snap is not None and snap.get("web_port"):
+        return {"ok": False, "reason": f"web 代理已存在（web_port={snap['web_port']}），无需补配"}
+    busy = device_busy(hostname)
+    if busy:
+        return {"ok": False, "reason": f"已有升级任务 {busy} 在进行中，稍后再试"}
+    ssh_port, arch, error, code = _resolve_device(hostname)
+    if error:
+        return reject(error, code)
+    # 期望 device_id：登记表值优先（探测过的设备），否则按设备编号
+    # （闭环校验防端口「借住」错配的比对基准，SOP #11）
+    expected_id = str(roster.get("device_id") or "").strip() or str(_webfix_device_number(hostname))
+    with WEBFIX_LOCK:
+        active = webfix_active(hostname)
+        if active is not None:
+            return {"ok": False, "reason": f"已有补配任务 #{active.id} 在进行中"}
+        global _WEBFIX_SEQ
+        _WEBFIX_SEQ += 1
+        task_id = _WEBFIX_SEQ
+        attempts = (store.webfix_attempts(hostname) or 0) + 1
+        task = WebfixTask(task_id, hostname, trigger, attempts, ssh_port,
+                          _ssh_user_for_arch(arch), port, expected_id)
+        WEBFIX[task_id] = task
+    store.create_webfix_task(task_id, hostname, trigger, attempts, datetime.now())
+    WEBFIX_POOL.submit(_run_webfix_task, task)
+    return {"ok": True, "task_id": task_id, "attempts": attempts}
+
+
+def _webfix_error_code(out):
+    """从设备端脚本输出提取结构化错误码（末尾 ERROR_* 行优先：
+    ERROR_PROXY_CONFLICT → proxy_conflict）；无标记返回 ''（环境性/无输出失败）。"""
+    for line in reversed([l.strip() for l in (out or "").splitlines() if l.strip()]):
+        if line.startswith("ERROR_"):
+            marker = line.split(":", 1)[0].strip()
+            return _SCRIPT_ERROR_CODES.get(marker,
+                                           marker.removeprefix("ERROR_").strip().lower())
+    return ""
+
+
+def _webfix_script_error(out, rc):
+    """从设备端脚本输出提取可读错误（ERROR_* 行优先，否则末行/退出码）。"""
+    lines = [l.strip() for l in (out or "").splitlines() if l.strip()]
+    for line in reversed(lines):
+        if line.startswith("ERROR_"):
+            body = line.split(":", 1)[1].strip() if ":" in line else line
+            return f"{body}（rc={rc}）" if rc else body
+    if lines:
+        return f"rc={rc}: {lines[-1][:300]}" if rc else lines[-1][:300]
+    return f"rc={rc}（无输出；设备不可达或 SSH 凭据失效）"
+
+
+def _webfix_verify(task):
+    """闭环校验：经 127.0.0.1:<30000+编号> 探 /api/setup/status，要求
+    release_version 非空且 device_id 与设备编号一致（防端口「借住」错配）。
+    返回 (ok, error, error_code)；device_id 不一致立即失败并标阻断类
+    （错配不会自愈，等人工），超时归普通失败（环境性，排障后可重试成功）。"""
+    base = f"http://127.0.0.1:{task.port}"
+    deadline = time.time() + WEBFIX_VERIFY_TIMEOUT
+    last_err = ""
+    while True:
+        try:
+            info = _setup_status_probe(base)
+            got = str(info.get("device_id") or "").strip()
+            if not _webfix_id_matches(got, task.expected_id):
+                err = (f"端口 {task.port} 探到 device_id={got or '<空>'}，与期望 "
+                       f"{task.expected_id} 不一致（疑似端口被其他设备占用/错配，SOP #11）；"
+                       f"设备配置已保留现场，需人工排查")
+                task.log(f"[panel] 闭环校验失败：{err}")
+                return False, err, "device_id_mismatch"
+            task.log(f"[panel] 闭环校验通过：device_id={got} "
+                     f"release_version={info.get('release_version')} — 补配成功")
+            return True, "", ""
+        except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
+            last_err = str(exc)
+        if time.time() >= deadline:
+            break
+        time.sleep(5)
+    err = (f"闭环校验超时（>{int(WEBFIX_VERIFY_TIMEOUT)}s，frpc 重启后 web 代理未就绪"
+           f"或版本不可读）：{last_err}")
+    task.log(f"[panel] {err}")
+    return False, err, "verify_timeout"
+
+
+def _run_webfix_task(task):
+    """一次补配：推送设备端脚本 → 等待重启回连 → 闭环校验。
+
+    失败不回滚设备配置（保留现场供排查），错误信息可读；台账与 SSE 同步收口。"""
+    task.set_status("running")
+    task.persist(status="running")
+    try:
+        task.log(f"[panel] webfix #{task.id} 开始：{task.hostname} 追加代理 "
+                 f"{task.hostname}-web（remotePort={task.port} → 127.0.0.1:80，"
+                 f"SSH {task.ssh_user}@127.0.0.1:{task.ssh_port}）")
+        rc, out = push_script(task, SCRIPT_WEBFIX,
+                              {"WEBFIX_HOSTNAME": task.hostname,
+                               "WEBFIX_PORT": str(task.port)}, timeout=180)
+        if "ERROR_" in out:               # 设备端结构化错误：阻断类（端口冲突/配置缺失等，
+            code = _webfix_error_code(out)  # 重试同样结果需人工）与普通失败分开收口
+            task.set_status("blocked" if code in WEBFIX_BLOCKED_CODES else "failed",
+                            _webfix_script_error(out, rc), error_code=code)
+        elif "WEBFIX_APPLIED" not in out and "WEBFIX_ALREADY" not in out:
+            task.set_status("failed", _webfix_script_error(out, rc))
+        else:
+            if rc != 0:
+                task.log(f"[panel] 注意：SSH 会话在收尾时断开（rc={rc}），"
+                         f"以结果标记与闭环校验为准")
+            if "WEBFIX_ALREADY" in out:
+                task.log("[panel] 设备端代理已存在且端口一致，未改动配置；进入闭环校验")
+            else:
+                task.log("[panel] 设备端配置已写入并重启 frpc（本机隧道秒级闪断为预期），"
+                         "等待 web 代理回连…")
+            ok, err, code = _webfix_verify(task)
+            if ok:
+                task.set_status("success")
+            else:
+                task.set_status("blocked" if code in WEBFIX_BLOCKED_CODES else "failed",
+                                err, error_code=code or None)
+    except Exception as exc:  # noqa: BLE001
+        task.log(f"[panel] 任务异常: {exc!r}")
+        task.set_status("failed", f"任务异常: {exc!r}")
+    finally:
+        task.finished_at = time.time()
+        task.persist(status=task.status, error=task.error or None,
+                     error_code=task.error_code or None, log=True, finished=True)
+        BUS.publish({"type": "webfix", "task": task.to_dict()})
+        try:
+            store._event(datetime.now(), task.hostname, "webfix", task.trigger_type,
+                         task.status, task.error or f"attempts={task.attempts}")
+        except Exception:  # noqa: BLE001  # 事件失败不影响任务收口
+            pass
+
+
+_webfix_windows = {}                 # hostname → 稳定窗口起点（内存态，KVWO-44）
+_webfix_windows_lock = threading.Lock()
+
+
+def webfix_advance_windows(candidates, now=None):
+    """推进「上线事件 + 稳定窗口」状态机；返回窗口已满、应触发自动补配的设备名。
+
+    - 新进入候选集（离线转在线；或面板启动后首次观测到的存量设备）→ 记窗口
+      起点（存量设备从首次观测起算同样窗口）；
+    - 离开候选集（掉线 / web 代理已出现 / ssh 代理消失）→ 计时作废，移除跟踪，
+      重新上线后从新起点重计；
+    - 连续在候选集满 WEBFIX_DELAY 秒 → 进入返回列表。跟踪条目保留：若触发被
+      瞬时原因拒绝（如升级任务占用），下轮窗口仍满可继续尝试；触发成功或落
+      auto 台账（含 blocked）后，调用方的候选集预过滤会将其移出，条目随之清除。
+    """
+    now = time.time() if now is None else now
+    due = []
+    with _webfix_windows_lock:
+        for hostname in set(_webfix_windows) - set(candidates):
+            _webfix_windows.pop(hostname, None)      # 掉线/不再是候选：计时作废
+        for hostname in candidates:
+            since = _webfix_windows.get(hostname)
+            if since is None:
+                _webfix_windows[hostname] = now      # 上线事件：启动稳定计时
+            elif now - since >= WEBFIX_DELAY:
+                due.append(hostname)
+    return due
+
+
+def webfix_auto_detect():
+    """每轮快照后：上线事件 + 稳定窗口模型的一次性自动补配（KVWO-44）。
+
+    触发时机（需求方定稿 2026-10-16）：不再周期扫描命中即触发——设备从离线
+    转在线（且 ssh 代理在、web 代理缺、无 auto 台账记录）→ 启动稳定计时，
+    连续在线满 WEBFIX_DELAY（默认 60s，环境变量可调）且期间未掉线（掉线计时
+    作废、重新上线重计）→ 仍缺 web 代理 → 触发一次。跳过：退役设备、升级/
+    补配任务进行中、已有 auto 台账记录（无论成败；阻断类前置不满足也占名额
+    落 blocked 行，不反复探测）。"""
+    if not WEBFIX_AUTO or not store.enabled or not DEPLOY_PW:
+        return
+    try:
+        hosts, _ = get_snapshot()
+    except Exception:  # noqa: BLE001
+        return
+    candidates = []
+    for hostname in webfix_candidates(hosts):
+        if store.webfix_has_auto(hostname):
+            continue                      # 一次为限：有 auto 记录不再跟踪/触发
+        if (store.roster.get(hostname) or {}).get("retired"):
+            continue
+        candidates.append(hostname)
+    for hostname in webfix_advance_windows(candidates):
+        result = _start_webfix_checked(hostname, "auto")
+        if result.get("ok"):
+            print(f"frp-monitor: webfix auto-trigger {hostname} "
+                  f"(task #{result['task_id']}, attempts={result['attempts']}, "
+                  f"stable>={int(WEBFIX_DELAY)}s)", flush=True)
+        elif result.get("blocked"):
+            print(f"frp-monitor: webfix auto-trigger {hostname} blocked "
+                  f"(task #{result.get('task_id')}, code={result.get('error_code')}): "
+                  f"{result.get('reason', '')}", flush=True)
+
+
+def webfix_retry(devices):
+    """POST /api/webfix/retry：手动重试（面板认证）；每次新建台账行，
+    attempts 累加，trigger_type=manual。自动触发的一次性语义不受影响。"""
+    if not store.enabled:
+        return {"ok": False, "error": "历史库未启用，webfix 不可用（需要 MySQL 台账防重）"}
+    if not DEPLOY_PW:
+        return {"ok": False, "error": "服务端未设置 DEPLOY_PW 环境变量（/etc/frp-monitor.env）"}
+    names, seen = [], set()
+    for h in devices or []:
+        name = str(h).strip().casefold()
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
+    if not names:
+        return {"ok": False, "error": "未指定设备"}
+    started, skipped = [], []
+    for hostname in names:
+        result = _start_webfix_checked(hostname, "manual")
+        if result.get("ok"):
+            started.append({"hostname": hostname, "task_id": result["task_id"],
+                            "attempts": result["attempts"]})
+        else:
+            skipped.append({"hostname": hostname, "reason": result.get("reason", "未知原因")})
+    return {"ok": True, "started": started, "skipped": skipped}
+
+
+def webfix_candidates_view():
+    """当前快照中的候选（在线 + 有 SSH 代理 + 缺 web 代理），供面板标记。"""
+    try:
+        hosts, _ = get_snapshot()
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for hostname in webfix_candidates(hosts):
+        port = webfix_port_for(hostname)
+        out.append({"hostname": hostname, "web_port": port})
+    return out
+
+
+def webfix_view():
+    """GET /api/webfix/tasks：各设备补配状态（最新一行/设备，含 error）。"""
+    rows = store.webfix_tasks_view() if store.enabled else []
+    merged = {row["hostname"]: row for row in rows}
+    with WEBFIX_LOCK:
+        memory = [(t.hostname, t.to_dict()) for t in WEBFIX.values()]
+    for hostname, d in memory:  # 内存态为权威（运行中/刚结束的任务）
+        if hostname not in merged or d["task_id"] >= merged[hostname]["task_id"]:
+            merged[hostname] = d
+    tasks = sorted(merged.values(), key=lambda t: -t["task_id"])
+    return {"enabled": store.enabled,
+            "auto_enabled": WEBFIX_AUTO and store.enabled and bool(DEPLOY_PW),
+            "port_base": WEBFIX_PORT_BASE, "port_max": WEBFIX_PORT_MAX,
+            "delay": WEBFIX_DELAY,          # 上线后稳定窗口秒数（KVWO-44，增补字段）
+            "verify_timeout": int(WEBFIX_VERIFY_TIMEOUT),
+            "candidates": webfix_candidates_view(),
+            "counts": _task_counts(tasks),
+            "tasks": tasks}
+
+
+def webfix_task_log_view(task_id, offset=0):
+    """补配日志增量读取（内存态优先，重启后回落 DB）。"""
+    with WEBFIX_LOCK:
+        task = WEBFIX.get(task_id)
+    if task is not None:
+        with task.lock:
+            text, total = task.text[offset:], len(task.text)
+        return {"ok": True, "task_id": task.id, "hostname": task.hostname,
+                "status": task.status, "log": text, "text": text,
+                "next_offset": total, "offset": total}
+    if store.enabled:
+        row = store.webfix_task_log(task_id)
+        if row is not None:
+            text, status, hostname = row
+            text = text or ""
+            return {"ok": True, "task_id": task_id, "hostname": hostname, "status": status,
+                    "log": text[offset:], "text": text[offset:],
+                    "next_offset": len(text), "offset": len(text)}
+    return None
+
+
+def _prune_webfix_memory():
+    """清理 24h 前已结束的内存态补配任务（历史回看走 DB 台账）。"""
+    with WEBFIX_LOCK:
+        stale = [tid for tid, t in WEBFIX.items()
+                 if t.status not in ("queued", "running")
+                 and time.time() - (t.finished_at or t.created_at) > 86400]
+        for tid in stale:
+            WEBFIX.pop(tid, None)
+
+
+# ----------------------------------------------------------------------------
 # 数据保留与每日备份（随服务运行的后台线程）
 # ----------------------------------------------------------------------------
 def run_maintenance(retention=True, backup=True, reason="daily"):
@@ -2943,6 +3668,7 @@ def run_maintenance(retention=True, backup=True, reason="daily"):
     if store.enabled and backup:
         result["backup"] = _run_db_backup()
     _prune_upgrade_memory()
+    _prune_webfix_memory()
     return result
 
 
@@ -3144,6 +3870,21 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/upgrade/events":
             return self._sse()
+        if path == "/api/webfix/tasks":
+            # 各设备补配状态（最新一行/设备，含 error）+ 当前候选列表（KVWO-17/19）
+            return self.send_json(200, webfix_view())
+        m = re.match(r"^/api/webfix/tasks/(\d+)/log$", path)
+        if m:
+            qs = parse_qs(urlsplit(self.path).query)
+            try:
+                offset = max(0, int(qs.get("offset", ["0"])[0]))
+            except (TypeError, ValueError):
+                offset = 0
+            view = webfix_task_log_view(int(m.group(1)), offset=offset)
+            if view is None:
+                return self.send_json(404, {"error": "unknown webfix task",
+                                            "task_id": int(m.group(1))})
+            return self.send_json(200, view)
         if path == "/api/refresh":
             return self._api_refresh()
         if path == "/api/hosts":
@@ -3373,6 +4114,19 @@ class Handler(BaseHTTPRequestHandler):
             out = create_upgrade_job(str(req.get("kind") or ""),
                                      req.get("devices") or [], params)
             return self.send_json(200 if out.get("ok") else 400, out)
+        if path == "/api/webfix/retry":
+            # 手动重试补配（面板认证）；每次新建台账行，attempts 累加，
+            # trigger_type=manual；自动触发的一次性语义不受影响（KVWO-17/19）
+            try:
+                req = self._json_body()
+            except json.JSONDecodeError:
+                return self.send_json(400, {"ok": False, "error": "bad json"})
+            devices = req.get("devices")
+            if not isinstance(devices, list):
+                return self.send_json(400, {"ok": False,
+                                            "error": "devices 必须是设备名数组"})
+            out = webfix_retry(devices)
+            return self.send_json(200 if out.get("ok") else 400, out)
         if path == "/api/refresh":
             # 与 GET /api/refresh 等价（SOP 工具既有 GET 也有 POST 调法）
             return self._api_refresh()
@@ -3406,15 +4160,29 @@ if __name__ == "__main__":
                       f"left by a previous process", flush=True)
         except Exception as exc:  # noqa: BLE001
             print(f"frp-monitor: upgrade job reconcile failed: {exc}", flush=True)
+        try:
+            _interrupted = store.reconcile_webfix_tasks()
+            if _interrupted:
+                print(f"frp-monitor: reconciled {_interrupted} interrupted webfix task(s) "
+                      f"left by a previous process", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"frp-monitor: webfix reconcile failed: {exc}", flush=True)
     if not DEPLOY_PW:
         print("frp-monitor: DEPLOY_PW not set —— 升级编排不可用（浏览可用），"
               "请在 /etc/frp-monitor.env 配置后重启", flush=True)
+    if not (WEBFIX_AUTO and store.enabled and DEPLOY_PW):
+        why = "FRP_MONITOR_WEBFIX_AUTO=0" if not WEBFIX_AUTO else (
+            "历史库未启用" if not store.enabled else "DEPLOY_PW 未设置")
+        print(f"frp-monitor: webfix 自动补配未启用（{why}；POST /api/webfix/retry 亦不可用）",
+              flush=True)
     threading.Thread(target=_refresh_loop, name="snapshot-refresher", daemon=True).start()
     threading.Thread(target=_collect_duration_loop, name="collect-duration-puller", daemon=True).start()
     threading.Thread(target=_maintenance_loop, name="daily-maintenance", daemon=True).start()
     print(f"frp-monitor: serving on :{HTTP_PORT} (oss-signed-url distribution, "
           f"upgrade_parallel={UPGRADE_MAX_PARALLEL}, retention={RETENTION_DAYS}d, "
-          f"backup={BACKUP_DIR} keep {BACKUP_KEEP})",
+          f"backup={BACKUP_DIR} keep {BACKUP_KEEP}, "
+          f"webfix={'auto' if (WEBFIX_AUTO and store.enabled and DEPLOY_PW) else 'off'} "
+          f"ports {WEBFIX_PORT_BASE}-{WEBFIX_PORT_MAX}, stable-window {WEBFIX_DELAY:g}s)",
           flush=True)
     httpd = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), Handler)
     httpd.daemon_threads = True  # SSE 长连接随主进程退出，不阻塞重启
