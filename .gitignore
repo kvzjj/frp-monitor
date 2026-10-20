@@ -5,3 +5,8 @@ repairs.sqlite-journal
 repairs.sqlite-wal
 repairs.sqlite-shm
 repair-attachments/
+# 资产多表同步运行时数据（KVWO-83）：本地 SQLite 镜像
+assets.sqlite
+assets.sqlite-journal
+assets.sqlite-wal
+assets.sqlite-shm

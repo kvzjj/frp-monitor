@@ -128,6 +128,15 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPAIR_DB_PATH = os.getenv("FRP_MONITOR_REPAIR_DB", os.path.join(_SCRIPT_DIR, "repairs.sqlite"))
 REPAIR_ATTACH_DIR = os.getenv("FRP_MONITOR_REPAIR_ATTACH_DIR", os.path.join(_SCRIPT_DIR, "repair-attachments"))
 
+# 资产多表同步（KVWO-83）：复用维修面板（KVWO-79）的 lark-cli 同步机制与调度模式，
+# 在同一 Base 上增量接入 5 张资产表（设备明细/归档/异常处理流转/配件核对/流转记录）。
+# 同一 Base 与 lark-cli 命令直接沿用维修面板配置，仅同步开关/间隔/库路径独立，
+# 便于资产侧故障隔离。配置说明见 ASSETS.md。
+ASSET_SYNC_ENABLED = os.getenv("FRP_MONITOR_ASSET_SYNC", "1").strip().lower() not in ("0", "false", "no", "off")
+ASSET_SYNC_INTERVAL = max(60.0, float(os.getenv("FRP_MONITOR_ASSET_INTERVAL", "300")))  # 默认 5 分钟
+ASSET_BASE_TOKEN = os.getenv("FRP_MONITOR_ASSET_BASE_TOKEN", REPAIR_BASE_TOKEN)  # 与维修表同一 Base
+ASSET_DB_PATH = os.getenv("FRP_MONITOR_ASSET_DB", os.path.join(_SCRIPT_DIR, "assets.sqlite"))
+
 V0_HOSTS = {
     "ep-000101", "ep-000102", "ep-000103", "ep-000104", "ep-000105",
     "ep-000107", "ep-000110", "ep-000111", "ep-000112", "ep-000113",
@@ -4229,6 +4238,713 @@ def repairs_stats_view():
 
 
 # ----------------------------------------------------------------------------
+# 资产多表同步与聚合 API（KVWO-83，基于 KVWO-79 维修面板同步机制扩展）
+#
+# 同一飞书 Base 增量接入 5 张资产表，全部「全量拉取 + record_id 幂等镜像」：
+#   设备明细（在册台账）/ 设备归档数据表（仅存量展示，不计入在册指标）/
+#   异常处理流转 / 配件核对明细 / 流转记录。
+# 各表列序以 lark-cli 返回的 fields 表头动态对齐（中文字段名键控），
+# 不硬编码列序——归档表与设备明细列序不同（实测），重命名/调整列序不影响解析，
+# 仅字段名变更或删除时该字段退化为 null。
+# 同步失败按表隔离：一张表失败只记该表的错误状态，不影响其他表与维修页签。
+# ----------------------------------------------------------------------------
+ASSET_TABLES = {
+    "devices": {
+        "table_id": "tblg1YoctJNcZskM",
+        "label": "设备明细",           # 在册台账（参与在册指标）
+        "sql_table": "asset_devices",
+        "fields": {
+            "设备编号": ("device_no", "text"),
+            "设备类型": ("device_type", "select"),
+            "状态": ("status", "select"),
+            "所属单位": ("unit", "select"),
+            "配件情况": ("accessories", "text"),
+            "去向/备注": ("note", "text"),
+            "软件版本": ("software_version", "text"),
+            "修改人": ("modified_by", "user"),       # 飞书自动字段 updated_by
+            "最后更新时间": ("updated_at", "datetime"),  # 飞书自动字段 updated_at
+        },
+    },
+    "archived": {
+        "table_id": "tblAeG2cGJ8SjQzR",
+        "label": "设备归档数据表",      # 归档/已拆解，仅存量展示，不计入在册指标
+        "sql_table": "asset_archived",
+        "fields": {  # 与设备明细同构但列序不同（动态对齐不依赖列序）
+            "设备编号": ("device_no", "text"),
+            "设备类型": ("device_type", "select"),
+            "状态": ("status", "select"),
+            "所属单位": ("unit", "select"),
+            "配件情况": ("accessories", "text"),
+            "去向/备注": ("note", "text"),
+            "软件版本": ("software_version", "text"),
+            "修改人": ("modified_by", "user"),
+            "最后更新时间": ("updated_at", "datetime"),
+        },
+    },
+    "actions": {
+        "table_id": "tblri9gaBX4zVXzX",
+        "label": "异常处理流转",
+        "sql_table": "asset_actions",
+        "fields": {
+            "摘要": ("summary", "text"),
+            "说明": ("note", "text"),
+            "动作": ("action", "select"),
+            "提交人": ("created_by", "user"),        # 飞书自动字段 created_by
+            "操作人": ("operator", "user"),
+            "转交给": ("transferred_to", "user"),
+            "设备编号": ("device_no", "select"),     # 本表内是单选而非文本
+            "操作时间": ("operated_at", "datetime"),  # 飞书自动字段 created_at
+            "附件": ("attachments", "attachment"),
+            "关联异常设备": ("linked_records", "link"),  # link → 异常设备表 record_id 列表
+        },
+    },
+    "parts": {
+        "table_id": "tblOLbWKpDlcJkDi",
+        "label": "配件核对明细",
+        "sql_table": "asset_parts",
+        "fields": {
+            "核对项": ("item", "text"),
+            "配件": ("part", "select"),
+            "设备编号": ("device_no", "text"),
+            "到货状态": ("arrival_status", "select"),
+            "状态说明": ("status_note", "text"),
+            "核对人": ("checker", "user"),
+            "核对时间": ("checked_at", "datetime"),   # 飞书自动字段 created_at
+            "照片": ("photos", "attachment"),
+            "关联异常设备": ("linked_records", "link"),
+        },
+    },
+    "transfers": {
+        "table_id": "tblxmVpjAHeATuMU",
+        "label": "流转记录",
+        "sql_table": "asset_transfers",
+        "fields": {
+            "时间": ("occurred_at", "datetime"),
+            "物品": ("item", "text"),
+            "数量": ("quantity", "number"),
+            "说明": ("note", "text"),
+            "所属单位": ("unit", "text"),            # 自由文本（非单选）
+            "签收证明": ("proof", "attachment"),
+        },
+    },
+}
+
+
+def _asset_cell(cell, kind):
+    """资产表单元格解析：text/select/多选/user/datetime/attachment 复用维修表
+    解析器（KVWO-79），在此补充 link（关联记录 id 列表）与 number 两类。"""
+    if kind in ("link", "number"):
+        if cell is None or cell == "":
+            return None
+        if kind == "number":
+            try:
+                value = float(cell)
+                return int(value) if value.is_integer() else value
+            except (TypeError, ValueError):
+                return None
+        ids = []
+        for item in (cell if isinstance(cell, list) else [cell]):
+            if isinstance(item, dict) and str(item.get("id") or "").strip():
+                ids.append(str(item["id"]).strip())
+            elif isinstance(item, str) and item.strip():
+                ids.append(item.strip())
+        return ids or None
+    return _repair_cell(cell, kind)
+
+
+def asset_parse_row(row, fields, field_map):
+    """按 fields 表头（中文字段名）动态对齐解析一行行矩阵 → snake_case dict。
+
+    不依赖列序：zip(fields, row) 后按字段名查映射；未映射列忽略，
+    映射内缺失列保持 None（数据不合成）。
+    """
+    rec = {spec[0]: None for spec in field_map.values()}
+    for name, cell in zip(fields or [], row or []):
+        spec = field_map.get(name)
+        if spec is not None:
+            rec[spec[0]] = _asset_cell(cell, spec[1])
+    return rec
+
+
+def asset_feishu_url(table_id, record_id):
+    """飞书原记录链接（table + record 即可直达，无需视图）。"""
+    return (f"https://archebase.feishu.cn/base/{ASSET_BASE_TOKEN}"
+            f"?table={table_id}&record={record_id}")
+
+
+class AssetStore:
+    """资产 5 表本地 SQLite 镜像（每表 record_id 主键全量幂等 upsert）。
+
+    与 RepairStore 同一套哲学：独立于可选 MySQL 历史库，本地文件即数据；
+    同步失败按表记错误状态、保留上次成功数据；单 RLock 串行化读写。
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.RLock()
+        self.conn = None
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            self.conn = sqlite3.connect(path, check_same_thread=False)
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA busy_timeout=5000")
+            self._migrate()
+        except (OSError, sqlite3.Error) as exc:
+            print(f"frp-monitor: 资产表本地库不可用（{path}: {exc}），资产面板无数据",
+                  flush=True)
+            self.conn = None
+
+    @staticmethod
+    def _spec_cols(spec):
+        """(全部列名, JSON 列集合)：列名为 snake_case JSON 键，含 number 列标记。"""
+        cols = [v[0] for v in spec["fields"].values()]
+        json_cols = {v[0] for v in spec["fields"].values()
+                     if v[1] in ("attachment", "link", "select_multi")}
+        return cols, json_cols
+
+    def _migrate(self):
+        with self.lock:
+            for spec in ASSET_TABLES.values():
+                cols, _ = self._spec_cols(spec)
+                decls = ["record_id TEXT PRIMARY KEY"]
+                for col, (name, (_, kind)) in zip(cols, spec["fields"].items()):
+                    decls.append(f"{col} {'NUM' if kind == 'number' else 'TEXT'}")
+                decls.append("synced_at REAL")
+                self.conn.execute(
+                    f"CREATE TABLE IF NOT EXISTS {spec['sql_table']} ({', '.join(decls)})")
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS asset_sync ("
+                "tbl TEXT PRIMARY KEY, "      # ASSET_TABLES 键（按表隔离错误状态）
+                "last_sync_at REAL, "         # 最近一次同步尝试（含失败）
+                "last_ok_at REAL, "           # 最近一次成功同步（数据新鲜度）
+                "last_error TEXT, "           # 最近一次失败原因（成功则清空）
+                "record_count INTEGER)")
+            self.conn.executemany(
+                "INSERT OR IGNORE INTO asset_sync (tbl) VALUES (?)",
+                [(k,) for k in ASSET_TABLES])
+            self.conn.commit()
+
+    def replace_all(self, key, records, synced_at=None):
+        """单表全量镜像式幂等写入：record_id upsert + 删除飞书已删记录。"""
+        if self.conn is None:
+            return 0
+        spec = ASSET_TABLES[key]
+        cols, json_cols = self._spec_cols(spec)
+        all_cols = ["record_id"] + cols + ["synced_at"]
+        synced_at = time.time() if synced_at is None else synced_at
+        with self.lock:
+            cur = self.conn.cursor()
+            try:
+                cur.execute("BEGIN")
+                for rid, rec in records.items():
+                    row = {"record_id": rid, "synced_at": synced_at, **rec}
+                    values = [json.dumps(row.get(c), ensure_ascii=False) if c in json_cols
+                              else row.get(c) for c in all_cols]
+                    cur.execute(
+                        f"INSERT OR REPLACE INTO {spec['sql_table']} ({','.join(all_cols)}) "
+                        f"VALUES ({','.join('?' * len(all_cols))})", values)
+                if records:
+                    cur.execute(
+                        f"DELETE FROM {spec['sql_table']} WHERE record_id NOT IN "
+                        f"({','.join('?' * len(records))})", list(records))
+                else:
+                    cur.execute(f"DELETE FROM {spec['sql_table']}")
+                cur.execute(
+                    "UPDATE asset_sync SET last_sync_at = ?, last_ok_at = ?, "
+                    "last_error = NULL, record_count = ? WHERE tbl = ?",
+                    (synced_at, synced_at, len(records), key))
+                self.conn.commit()
+            except sqlite3.Error:
+                self.conn.rollback()
+                raise
+        return len(records)
+
+    def set_error(self, key, error):
+        """单表同步失败：只记该表错误状态，其余表与已有数据不受影响。"""
+        if self.conn is None:
+            return
+        with self.lock:
+            self.conn.execute(
+                "UPDATE asset_sync SET last_sync_at = ?, last_error = ? WHERE tbl = ?",
+                (time.time(), str(error)[:500], key))
+            self.conn.commit()
+
+    def all_records(self, key):
+        """单表全部记录（dict 列表，原始库内顺序）。"""
+        if self.conn is None:
+            return []
+        spec = ASSET_TABLES[key]
+        cols, json_cols = self._spec_cols(spec)
+        all_cols = ["record_id"] + cols + ["synced_at"]
+        with self.lock:
+            rows = self.conn.execute(
+                f"SELECT {','.join(all_cols)} FROM {spec['sql_table']}").fetchall()
+        items = []
+        for row in rows:
+            item = dict(zip(all_cols, row))
+            for col in json_cols:
+                item[col] = json.loads(item[col]) if item[col] else None
+            items.append(item)
+        return items
+
+    def sync_state(self, key):
+        empty = {"last_sync_at": None, "last_ok_at": None, "last_sync_error": None,
+                 "record_count": 0}
+        if self.conn is None:
+            return empty
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT last_sync_at, last_ok_at, last_error, record_count "
+                "FROM asset_sync WHERE tbl = ?", (key,)).fetchone()
+        if row is None:
+            return empty
+        return {"last_sync_at": row[0], "last_ok_at": row[1],
+                "last_sync_error": row[2], "record_count": row[3] or 0}
+
+    def sync_states(self):
+        """全部表同步状态（按表隔离展示：{key: {..., label, table_id}}）。"""
+        out = {}
+        for key, spec in ASSET_TABLES.items():
+            state = self.sync_state(key)
+            out[key] = {**state, "label": spec["label"], "table_id": spec["table_id"]}
+        return out
+
+
+asset_store = AssetStore(ASSET_DB_PATH)
+ASSET_SYNC_LOCK = threading.Lock()
+
+
+def _asset_lark_page(args, attempts=3):
+    """拉一页（带退避重试）：lark-cli 瞬时失败（限流等）不该让整表本轮同步失败。"""
+    last = None
+    for attempt in range(attempts):
+        if attempt:
+            time.sleep(2 * attempt)
+        try:
+            return _repair_lark_run(args)
+        except RuntimeError as exc:
+            last = exc
+    raise last
+
+
+def asset_fetch_table(key):
+    """分页全量拉取一张资产表 → {record_id: {snake_case 字段}}。
+
+    列对齐键为 fields 表头（中文字段名），与列序无关；单页瞬时失败
+    退避重试（限流），重试耗尽才让该表本轮同步失败（按表隔离）。
+    """
+    spec = ASSET_TABLES[key]
+    records, offset = {}, 0
+    fields = []
+    while True:
+        data = (_asset_lark_page(["base", "+record-list",
+                                  "--base-token", ASSET_BASE_TOKEN,
+                                  "--table-id", spec["table_id"],
+                                  "--format", "json",
+                                  "--limit", "200", "--offset", str(offset)])
+                .get("data") or {})
+        fields = data.get("fields") or fields
+        rows = data.get("data") or []
+        rids = data.get("record_id_list") or []
+        for rid, row in zip(rids, rows):
+            records[rid] = asset_parse_row(row, fields, spec["fields"])
+        if not data.get("has_more") or not rows:
+            break
+        offset += len(rows)
+    return records
+
+
+def run_asset_sync(reason="scheduled"):
+    """同步全部 5 张资产表 → SQLite 镜像；按表隔离失败，绝不抛出。
+
+    单表失败只记该表错误状态，其余表照常完成（一张表失败不影响其他表
+    与维修页签）。附件元数据入库但不自动下载（体积大且资产页签验收
+    不要求附件可访问；如已存在本地文件则解析出 URL，见 _asset_public）。
+    """
+    with ASSET_SYNC_LOCK:
+        started = time.time()
+        results = {}
+        for key, spec in ASSET_TABLES.items():
+            t0 = time.time()
+            try:
+                records = asset_fetch_table(key)
+                asset_store.replace_all(key, records)
+                results[key] = {"ok": True, "count": len(records),
+                                "elapsed": round(time.time() - t0, 1)}
+                print(f"frp-monitor: 资产表同步成功（{spec['label']}，{reason}）："
+                      f"{len(records)} 条，耗时 {time.time() - t0:.1f}s", flush=True)
+            except Exception as exc:  # noqa: BLE001 —— 单表失败隔离，不拖垮其他表
+                try:
+                    asset_store.set_error(key, f"{reason}: {exc}")
+                except Exception:
+                    pass
+                results[key] = {"ok": False, "count": asset_store.sync_state(key)["record_count"],
+                                "error": str(exc), "elapsed": round(time.time() - t0, 1)}
+                print(f"frp-monitor: 资产表同步失败（{spec['label']}，{reason}）: {exc}",
+                      flush=True)
+        return {"ok": all(r.get("ok") for r in results.values()),
+                "reason": reason, "tables": results,
+                "elapsed": round(time.time() - started, 1)}
+
+
+def _asset_sync_loop():
+    if not ASSET_SYNC_ENABLED:
+        return
+    while True:
+        run_asset_sync("scheduled")
+        time.sleep(ASSET_SYNC_INTERVAL)
+
+
+def _asset_fleet_lookup():
+    """返回资产 API 的探测查询组（device_online / detected_version / 全量快照）。
+
+    设备编号匹配规则（全库统一，大小写不敏感）：台账存在 `ep-000298` 小写、
+    异常表 `EP-000289` 等混杂情况，一律 str.strip().casefold() 后比对——
+    frps 主机名本身就是小写 `ep-000xxx`，casefold 即天然对齐。
+    device_online：frps 快照在线→true；MySQL 台账已登记但未上线→false；
+    均未匹配→null（数据不合成，前端显示「—」）。
+    detected_version：在线取当前探测版本；离线但 MySQL 历史有最后已知版本
+    则返回之；否则 null（探测不到 ≠ 离线，与 device_online 语义分开）。
+    """
+    try:
+        hosts, _ = get_snapshot()
+        snap = {}
+        for h in hosts:
+            snap[str(h.get("hostname") or "").strip().casefold()] = {
+                "online": True, "version": (str(h.get("version") or "").strip() or None)}
+    except Exception:
+        snap = {}  # 快照暂不可得（仅首次拉取失败窗口）：登记设备按离线计
+    registered = set(store.roster) if store.enabled else set()
+    last_known = {}
+    if store.enabled:
+        with store.lock:
+            last_known = {str(h).strip().casefold(): (v or {}).get("version") or None
+                          for h, v in (store.state or {}).items()}
+
+    def online(device_no):
+        if not device_no:
+            return None
+        key = str(device_no).strip().casefold()
+        if key in snap:
+            return True
+        if key in registered:
+            return False
+        return None
+
+    def version(device_no):
+        if not device_no:
+            return None
+        key = str(device_no).strip().casefold()
+        info = snap.get(key)
+        if info is not None:
+            return info["version"]
+        return last_known.get(key) or None
+
+    return online, version, snap
+
+
+def _dev_key(device_no):
+    """设备编号归一（跨表关联统一入口，见 _asset_fleet_lookup 注释）。"""
+    return str(device_no or "").strip().casefold()
+
+
+ASSET_DEVICE_ITEM_FIELDS = ["record_id", "device_no", "device_type", "status", "unit",
+                            "accessories", "note", "software_version", "modified_by",
+                            "updated_at"]
+
+
+def _asset_attach_urls(items):
+    """附件元数据列表 → 带 url 的视图（仅当本地已存在同名 token 文件时给出
+    /repair-attachments/ 静态路径；资产表附件默认不主动下载，url 多为 null）。"""
+    out = []
+    for att in items or []:
+        if not isinstance(att, dict):
+            continue
+        entry = dict(att)
+        token = str(entry.get("file_token") or "")
+        entry["url"] = (f"/repair-attachments/{token}/"
+                        + quote(str(entry.get("name") or token))
+                        if token and _repair_attach_file(token) is not None else None)
+        out.append(entry)
+    return out or None
+
+
+def _asset_device_public(rec, online=None, version=None, repairs_by_dev=None,
+                          table_key="devices"):
+    """设备明细/归档库内记录 → API 视图（全字段 + 探测联动 + 未完结维修数）。"""
+    item = {k: rec.get(k) for k in ASSET_DEVICE_ITEM_FIELDS}
+    item["archived"] = table_key == "archived"
+    item["feishu_url"] = asset_feishu_url(ASSET_TABLES[table_key]["table_id"],
+                                          rec["record_id"])
+    item["device_online"] = online(item.get("device_no")) if online else None
+    item["detected_version"] = version(item.get("device_no")) if version else None
+    item["active_repairs"] = ((repairs_by_dev or {}).get(_dev_key(item.get("device_no"))) or 0) \
+        if repairs_by_dev is not None else None
+    item["synced_at"] = rec.get("synced_at")
+    return item
+
+
+def _asset_active_repairs_index():
+    """{设备编号 casefold: 未完结维修记录数}（来源：KVWO-79 异常设备表镜像）。"""
+    index = {}
+    for rec in repair_store.all_records():
+        stage = rec.get("stage")
+        if not stage or stage == REPAIR_DONE_STAGE:
+            continue
+        key = _dev_key(rec.get("device_no"))
+        if key:
+            index[key] = index.get(key, 0) + 1
+    return index
+
+
+def assets_list_view(filters=None):
+    """台账列表：status/type/unit 精确 + q（设备编号/备注模糊，大小写不敏感）；
+    include_archived=1 时追加归档设备（archived=true 标记）。"""
+    filters = filters or {}
+    online, version, _ = _asset_fleet_lookup()
+    repairs_by_dev = _asset_active_repairs_index()
+    items = [_asset_device_public(rec, online, version, repairs_by_dev)
+             for rec in asset_store.all_records("devices")]
+    if str(filters.get("include_archived") or "").strip().lower() in ("1", "true", "yes"):
+        for rec in asset_store.all_records("archived"):
+            items.append(_asset_device_public(rec, online, version, repairs_by_dev,
+                                              table_key="archived"))
+    status = (filters.get("status") or "").strip()
+    if status:
+        items = [i for i in items if i.get("status") == status]
+    dtype = (filters.get("type") or "").strip()
+    if dtype:
+        items = [i for i in items if i.get("device_type") == dtype]
+    unit = (filters.get("unit") or "").strip()
+    if unit:
+        items = [i for i in items if i.get("unit") == unit]
+    q = (filters.get("q") or "").strip().casefold()
+    if q:
+        items = [i for i in items
+                 if q in (i.get("device_no") or "").casefold()
+                 or q in (i.get("note") or "").casefold()]
+    return items
+
+
+def assets_stats_view():
+    """资产总览指标（全部由同步数据实时计算，不落死数）。
+
+    口径（与父需求基线快照对齐，归档不计入在册）：
+    - 在册 registered_total = 设备明细全部记录
+    - 库存口径 A = 所属单位为「上海办公室」；口径 B = 去向/备注含「未使用」
+    - 一线部署 deployed = 在册 − 库存口径 A（非上海办公室持有）
+    - 维修率 = (维修中 + 待维修) / 在册；损坏率 = (异常 + 维修中 + 待维修) / 在册
+    """
+    devices = asset_store.all_records("devices")
+    archived = asset_store.all_records("archived")
+    n = len(devices)
+
+    def counter(field):
+        counts = {}
+        for d in devices:
+            key = d.get(field) or ""
+            counts[key] = counts.get(key, 0) + 1
+        # 空值单独成桶（数据不合成也不静默丢弃）
+        return counts
+
+    by_status = counter("status")
+    by_type = counter("device_type")
+    by_unit = counter("unit")
+    inv_a = sum(1 for d in devices if (d.get("unit") or "") == "上海办公室")
+    inv_b = sum(1 for d in devices if "未使用" in str(d.get("note") or ""))
+    repairing = by_status.get("维修中", 0) + by_status.get("待维修", 0)
+    damaged = by_status.get("异常", 0) + repairing
+    state = asset_store.sync_state("devices")
+    return {
+        "registered_total": n,
+        "archived_total": len(archived),
+        "inventory": {"unit_shanghai": inv_a, "unused_note": inv_b},
+        "deployed": n - inv_a,
+        "by_status": by_status,
+        "by_type": by_type,
+        "by_unit": by_unit,
+        "repair_rate": round(repairing / n, 4) if n else None,
+        "damage_rate": round(damaged / n, 4) if n else None,
+        "last_sync_at": state["last_ok_at"],
+        "last_sync_attempt_at": state["last_sync_at"],
+        "last_sync_error": state["last_sync_error"],
+        "tables": asset_store.sync_states(),
+    }
+
+
+def assets_units_view():
+    """项目（所属单位）维度聚合：设备数 / 正常率 / 维修中 / 异常 / 最近更新时间。
+
+    维修中数 = 状态为「维修中」+「待维修」；正常率 = 正常 / 该单位设备数；
+    最近更新时间 = 该单位设备「最后更新时间」的最大值（ISO 字典序即时间序）。
+    单位详情由前端引用 /api/assets?unit=… 过滤，不另设接口。
+    """
+    devices = asset_store.all_records("devices")
+    units = {}
+    for d in devices:
+        name = d.get("unit") or "(未填写)"
+        u = units.setdefault(name, {"unit": name, "total": 0, "normal": 0,
+                                    "repairing": 0, "abnormal": 0, "last_updated": None})
+        u["total"] += 1
+        status = d.get("status") or ""
+        if status == "正常":
+            u["normal"] += 1
+        elif status in ("维修中", "待维修"):
+            u["repairing"] += 1
+        elif status == "异常":
+            u["abnormal"] += 1
+        ts = d.get("updated_at") or ""
+        if ts and (u["last_updated"] or "") < ts:
+            u["last_updated"] = ts
+    items = []
+    for u in units.values():
+        items.append({**u,
+                      "normal_rate": round(u["normal"] / u["total"], 4) if u["total"] else None})
+    items.sort(key=lambda x: (-x["total"], x["unit"]))
+    return items
+
+
+def assets_versions_view():
+    """版本分布：探测版本计数 + 台账软件版本计数 + 按设备编号的匹配情况。
+
+    匹配规则（大小写不敏感，见 _asset_fleet_lookup）：
+    - matched：在册（设备明细）且探测到（frps 快照在线）
+    - ledger_missing：在册但探测不到（离线 / 未部署 / 未接入 frps）
+    - detected_only：探测到但在册与归档均未登记
+    归档设备不计入 ledger_missing；探测版本计数覆盖全部快照主机
+    （版本空 =「未获取」桶，与面板总览一致）；台账软件版本当前全空时
+    ledger_by_version 如实返回空对象。
+    """
+    online, version, snap = _asset_fleet_lookup()
+    devices = asset_store.all_records("devices")
+    archived = asset_store.all_records("archived")
+    ledger = {_dev_key(d.get("device_no")): d for d in devices if d.get("device_no")}
+    archived_keys = {_dev_key(d.get("device_no")) for d in archived if d.get("device_no")}
+
+    detected_by_version = {}
+    for key, info in snap.items():
+        ver = info.get("version") or "未获取"
+        detected_by_version[ver] = detected_by_version.get(ver, 0) + 1
+    ledger_by_version = {}
+    ledger_no_version = 0
+    for d in devices:
+        ver = (d.get("software_version") or "").strip()
+        if ver:
+            ledger_by_version[ver] = ledger_by_version.get(ver, 0) + 1
+        else:
+            ledger_no_version += 1
+
+    detected_keys = set(snap)
+    matched = sorted(k for k in ledger if k in detected_keys)
+    ledger_missing = sorted(k for k in ledger if k not in detected_keys)
+    detected_only = sorted(k for k in detected_keys
+                           if k not in ledger and k not in archived_keys)
+    return {
+        "detected_by_version": detected_by_version,
+        "detected_total": len(snap),
+        "ledger_by_version": ledger_by_version,
+        "ledger_registered": ledger_no_version + sum(ledger_by_version.values()),
+        "ledger_no_version": ledger_no_version,
+        "match": {"matched": matched, "ledger_missing": ledger_missing,
+                  "detected_only": detected_only},
+        "match_counts": {"matched": len(matched), "ledger_missing": len(ledger_missing),
+                         "detected_only": len(detected_only)},
+        "last_sync_at": asset_store.sync_state("devices")["last_ok_at"],
+    }
+
+
+def _asset_action_public(rec):
+    return {"record_id": rec["record_id"], "action": rec.get("action"),
+            "summary": rec.get("summary"), "note": rec.get("note"),
+            "operator": rec.get("operator"), "transferred_to": rec.get("transferred_to"),
+            "created_by": rec.get("created_by"), "operated_at": rec.get("operated_at"),
+            "attachments": _asset_attach_urls(rec.get("attachments")),
+            "linked_records": rec.get("linked_records"),
+            "feishu_url": asset_feishu_url(ASSET_TABLES["actions"]["table_id"],
+                                           rec["record_id"])}
+
+
+def _asset_part_public(rec):
+    return {"record_id": rec["record_id"], "item": rec.get("item"),
+            "part": rec.get("part"), "device_no": rec.get("device_no"),
+            "arrival_status": rec.get("arrival_status"),
+            "status_note": rec.get("status_note"), "checker": rec.get("checker"),
+            "checked_at": rec.get("checked_at"), "photos": _asset_attach_urls(rec.get("photos")),
+            "linked_records": rec.get("linked_records"),
+            "feishu_url": asset_feishu_url(ASSET_TABLES["parts"]["table_id"],
+                                           rec["record_id"])}
+
+
+def _asset_transfer_public(rec):
+    return {"record_id": rec["record_id"], "occurred_at": rec.get("occurred_at"),
+            "item": rec.get("item"), "quantity": rec.get("quantity"),
+            "note": rec.get("note"), "unit": rec.get("unit"),
+            "proof": _asset_attach_urls(rec.get("proof")),
+            "feishu_url": asset_feishu_url(ASSET_TABLES["transfers"]["table_id"],
+                                           rec["record_id"])}
+
+
+def asset_detail_view(device_no):
+    """单设备 360°：台账 + 维修记录（异常设备表）+ 处理流水 + 配件核对 + 流转记录。
+
+    关联规则（大小写不敏感，_dev_key 统一）：
+    - 维修记录：异常设备表 device_no 与设备编号一致（全部阶段，倒序）；
+    - 处理流水：异常处理流转.device_no 一致，或 linked_records 命中该设备
+      任一维修记录的 record_id（双路关联）；
+    - 配件核对：配件核对明细.device_no 一致；
+    - 流转记录：无设备编号列，按单位关联——设备所属单位与记录单位去空格后
+      相等或互为包含（该列为自由文本，存在「构元服务商」vs「潍坊构元服务商」）。
+    未匹配到的源返回空数组；台账缺失字段一律 null，不合成。
+    """
+    key = _dev_key(device_no)
+    if not key:
+        return None
+    rec = next((r for r in asset_store.all_records("devices")
+                if _dev_key(r.get("device_no")) == key), None)
+    archived = False
+    if rec is None:
+        rec = next((r for r in asset_store.all_records("archived")
+                    if _dev_key(r.get("device_no")) == key), None)
+        archived = rec is not None
+    if rec is None:
+        return None
+    online, version, _ = _asset_fleet_lookup()
+    item = _asset_device_public(rec, online, version, _asset_active_repairs_index(),
+                                table_key="archived" if archived else "devices")
+
+    repairs = [r for r in repair_store.all_records() if _dev_key(r.get("device_no")) == key]
+    repairs.sort(key=lambda r: r.get("created_at") or "", reverse=True)
+    repair_ids = {r["record_id"] for r in repairs}
+    actions = [r for r in asset_store.all_records("actions")
+               if _dev_key(r.get("device_no")) == key
+               or any(rid in repair_ids for rid in (r.get("linked_records") or []))]
+    actions.sort(key=lambda r: r.get("operated_at") or "", reverse=True)
+    parts = [r for r in asset_store.all_records("parts")
+             if _dev_key(r.get("device_no")) == key]
+    parts.sort(key=lambda r: r.get("checked_at") or "", reverse=True)
+    unit = (rec.get("unit") or "").strip()
+    transfers = []
+    if unit:
+        for r in asset_store.all_records("transfers"):
+            tu = (r.get("unit") or "").strip()
+            if tu and (tu == unit or tu in unit or unit in tu):
+                transfers.append(r)
+        transfers.sort(key=lambda r: r.get("occurred_at") or "", reverse=True)
+
+    item["repairs"] = [{"record_id": r["record_id"], "stage": r.get("stage"),
+                        "device_type": r.get("device_type"),
+                        "problem": r.get("problem"), "owner_name": r.get("owner_name"),
+                        "last_followed_at": r.get("last_followed_at"),
+                        "last_followup_note": r.get("last_followup_note"),
+                        "created_at": r.get("created_at"),
+                        "feishu_url": repair_feishu_url(r["record_id"])} for r in repairs]
+    item["actions"] = [_asset_action_public(r) for r in actions]
+    item["parts_checks"] = [_asset_part_public(r) for r in parts]
+    item["transfers"] = [_asset_transfer_public(r) for r in transfers]
+    return item
+
+
+# ----------------------------------------------------------------------------
 # 数据保留与每日备份（随服务运行的后台线程）
 # ----------------------------------------------------------------------------
 def run_maintenance(retention=True, backup=True, reason="daily"):
@@ -4514,6 +5230,33 @@ class Handler(BaseHTTPRequestHandler):
         m = re.match(r"^/repair-attachments/([A-Za-z0-9_-]+)(?:/(.*))?$", path)
         if m:
             return self._repair_attachment(m.group(1), m.group(2))
+        # --- 资产多表与聚合 API（KVWO-83，只读，数据源飞书资产表 lark-cli 同步） ---
+        if path == "/api/assets":
+            qs = parse_qs(urlsplit(self.path).query)
+            filters = {k: (qs.get(k, [""])[0] or "")
+                       for k in ("status", "type", "unit", "q", "include_archived")}
+            items = assets_list_view(filters)
+            state = asset_store.sync_state("devices")
+            return self.send_json(200, {
+                "enabled": ASSET_SYNC_ENABLED, "total": len(items), "items": items,
+                "last_sync_at": state["last_ok_at"],
+                "last_sync_attempt_at": state["last_sync_at"],
+                "last_sync_error": state["last_sync_error"],
+                "sync_interval": int(ASSET_SYNC_INTERVAL),
+                "tables": asset_store.sync_states()})
+        if path == "/api/assets/stats":
+            return self.send_json(200, assets_stats_view())
+        if path == "/api/assets/units":
+            return self.send_json(200, {"units": assets_units_view(),
+                                       "last_sync_at": asset_store.sync_state("devices")["last_ok_at"]})
+        if path == "/api/assets/versions":
+            return self.send_json(200, assets_versions_view())
+        m = re.match(r"^/api/assets/([A-Za-z0-9_-]+)$", path)
+        if m:
+            detail = asset_detail_view(m.group(1))
+            if detail is None:
+                return self.send_json(404, {"error": "unknown device", "device_id": m.group(1)})
+            return self.send_json(200, detail)
         if path == "/api/hosts":
             force = "refresh" in parse_qs(urlsplit(self.path).query)
             if force:
@@ -4773,6 +5516,11 @@ class Handler(BaseHTTPRequestHandler):
             # 手动触发一次维修表同步（自测/验证用；与定时同步互斥串行）
             result = run_repair_sync("manual")
             return self.send_json(200, result)
+        if path == "/api/assets/sync":
+            # 手动触发一次资产 5 表同步（自测/验证用；与定时同步互斥串行，
+            # 按表隔离失败）
+            result = run_asset_sync("manual")
+            return self.send_json(200, result)
         self.send_error(404)
 
 
@@ -4810,6 +5558,7 @@ if __name__ == "__main__":
     threading.Thread(target=_collect_duration_loop, name="collect-duration-puller", daemon=True).start()
     threading.Thread(target=_maintenance_loop, name="daily-maintenance", daemon=True).start()
     threading.Thread(target=_repair_sync_loop, name="repair-syncer", daemon=True).start()
+    threading.Thread(target=_asset_sync_loop, name="asset-syncer", daemon=True).start()
     print(f"frp-monitor: serving on :{HTTP_PORT} (oss-signed-url distribution, "
           f"upgrade_parallel={UPGRADE_MAX_PARALLEL}, retention={RETENTION_DAYS}d, "
           f"backup={BACKUP_DIR} keep {BACKUP_KEEP}, "
