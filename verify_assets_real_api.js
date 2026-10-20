@@ -51,15 +51,16 @@ const ctx = { document, window, location, history, fetch: fetchMock, setInterval
 ctx.globalThis = ctx;
 vm.createContext(ctx);
 
-const statsFix = { registered_total: 100, archived_total: 5, inventory: { unit_shanghai: 20, unused_note: 8 },
+const statsFix = { registered_total: 100, archived_total: 5,
+  inventory: { total: 20, by_unit: { '上海办公室': 12, '潍坊办公室': 8 }, units: ['上海办公室', '潍坊办公室'], unused_note: 8 },
   deployed: 80, by_status: { '正常': 90, '维修中': 6, '待维修': 4 }, by_type: { 'EgoPortal-Stereo-V0': 70, 'EgoPortal-Lite': 30 },
-  by_unit: { '上海办公室': 20, '苏州项目组': 80 }, repair_rate: 0.1, damage_rate: 0.1, last_sync_at: '2026-10-20T09:00:00+08:00' };
+  by_unit: { '上海办公室': 12, '潍坊办公室': 8, '苏州项目组': 80 }, repair_rate: 0.1, damage_rate: 0.1, last_sync_at: '2026-10-20T09:00:00+08:00' };
 let mode = 'real';
 const realApi = async (path) => {
   if (mode !== 'real') return { status: 500, ok: false, json: async () => ({ error: '数据库不可用' }) };
   const J = o => ({ status: 200, ok: true, json: async () => o });
   if (path.includes('stats')) return J(statsFix);
-  if (path.includes('units')) return J({ units: [{ unit: '上海办公室', total: 20, normal_rate: 0.9, repairing: 1, abnormal: 1, last_updated: '2026-10-20T08:00:00+08:00' }, { unit: '苏州项目组', total: 80, normal_rate: 0.95, repairing: 5, abnormal: 3, last_updated: '2026-10-19T18:00:00+08:00' }] });
+  if (path.includes('units')) return J({ units: [{ unit: '上海办公室', total: 12, normal_rate: 0.9, repairing: 1, abnormal: 1, last_updated: '2026-10-20T08:00:00+08:00' }, { unit: '潍坊办公室', total: 8, normal_rate: 1, repairing: 0, abnormal: 0, last_updated: '2026-10-20T08:00:00+08:00' }, { unit: '苏州项目组', total: 80, normal_rate: 0.95, repairing: 5, abnormal: 3, last_updated: '2026-10-19T18:00:00+08:00' }] });
   if (path.includes('versions')) return J({ detected: [{ version: 'v0.5.0', count: 40 }], ledger: [], ledger_empty: 100, matched: 40, detected_only: ['ep-888888'], ledger_missing: [] });
   if (path.includes('?')) return J({ devices: [] });
   if (path.startsWith('/api/assets/')) return J({ ledger: { device_code: path.split('/').pop(), device_type: 'EgoPortal-Stereo-V0', status: '正常', unit: '苏州项目组' }, repairs: [], flows: [], parts: [] });

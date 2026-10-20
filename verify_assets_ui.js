@@ -65,8 +65,9 @@ const ok = (name, cond) => { if (!cond) { console.error('FAIL: ' + name); proces
   const met = el('asMetrics').innerHTML;
   ok('指标卡：在册 248', met.includes('在册总数') && met.includes('>248<'));
   ok('指标卡：归档 69', met.includes('归档（已拆解）') && met.includes('>69<'));
-  ok('指标卡：库存口径 A 94 + 口径 B 数值一致', met.includes('>94<') && met.includes('未使用」）：' + A.stats.invB));
-  ok('指标卡：一线部署 154', met.includes('一线部署') && met.includes('>154<'));
+  ok('指标卡：库存 149 = 上海 94 + 潍坊 55（口径说明）', met.includes('>149<') && met.includes('上海办公室 94 台 + 潍坊办公室 55 台') && met.includes('公司库存，服务商持有不计'));
+  ok('指标卡：库存口径 B 参考数值一致', met.includes('「未使用」' + A.stats.invB + ' 台'));
+  ok('指标卡：一线部署 99', met.includes('一线部署') && met.includes('>99<'));
   ok('指标卡：维修率 5.2% 带计算式', met.includes('5.2%') && met.includes('(维修中 10 + 待维修 3) / 在册 248'));
   ok('指标卡：损坏率 8.5% 带计算式', met.includes('8.5%') && met.includes('(异常 8 + 维修中 10 + 待维修 3) / 在册 248'));
   ok('指标卡：统计时间 last_sync_at', met.includes('统计时间'));
@@ -124,7 +125,8 @@ const ok = (name, cond) => { if (!cond) { console.error('FAIL: ' + name); proces
   A.go('units');
   const ub = el('asUnitBody').innerHTML;
   ok('项目视图：11 个单位齐全', (ub.match(/class=aunit /g) || []).length === 11);
-  ok('项目视图：上海 94 台 + 库存细分', ub.includes('上海办公室') && ub.includes('>94 台') && ub.includes('未使用 ' + A.stats.invB) && ub.includes('新组装'));
+  ok('项目视图：上海/潍坊标注公司库存（94/55 台）', ub.includes('上海办公室') && ub.includes('公司库存单位 94 台（不计一线部署）') && ub.includes('公司库存单位 55 台（不计一线部署）'));
+  ok('项目视图：上海备注细分（未使用/新组装）', ub.includes('未使用 ' + A.stats.invB) && ub.includes('新组装'));
   ok('项目视图：正常率/维修中/异常', ub.includes('正常') && ub.includes('维修中') && ub.includes('异常') && ub.includes('最近更新'));
   // 下钻
   A.drill('上海办公室');

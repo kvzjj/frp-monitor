@@ -1,4 +1,4 @@
-# 资产多表同步与聚合 API（KVWO-78 / KVWO-83）
+# 资产多表同步与聚合 API（KVWO-78 / KVWO-83；KVWO-97 库存口径修正+日报推送+面板更名）
 
 基于维修面板（KVWO-79，见 [REPAIRS.md](REPAIRS.md)）的 lark-cli 同步机制扩展：
 同一飞书 Base 增量接入 5 张资产表，全量拉取 + `record_id` 幂等镜像到本地
@@ -33,6 +33,10 @@ SQLite，指标全部由同步数据实时计算（不落死数）。面板只�
 | `FRP_MONITOR_ASSET_INTERVAL` | `300` | 同步间隔（秒），下限 60 |
 | `FRP_MONITOR_ASSET_BASE_TOKEN` | 同维修面板 | 飞书 Base token（默认同 Base） |
 | `FRP_MONITOR_ASSET_DB` | `<server.py 所在目录>/assets.sqlite` | 本地 SQLite 路径 |
+| `FRP_MONITOR_INVENTORY_UNITS` | `上海办公室,潍坊办公室` | 库存口径单位清单（逗号分隔，可扩展；提出人 2026-10-20 确认上海+潍坊均为公司库存未使用，服务商等其他单位持有不计库存） |
+| `FRP_MONITOR_FEISHU_WEBHOOK` | 空（关闭） | 飞书群机器人 webhook（KVWO-97 资产日报推送）；**敏感凭据，只落在服务器 env 配置，勿写入仓库/文档；置空/未配置 = 关闭推送** |
+| `FRP_MONITOR_REPORT_TIMES` | `09:00` | 日报推送时刻（服务器本地时间，逗号分隔 HH:MM 支持多时刻；调度模式同采集时长 `FRP_MONITOR_COLLECT_TIMES`） |
+| `FRP_MONITOR_PANEL_TITLE` | 空 | 面板标题覆盖（浏览器标签与页头）；未设时启动后台线程用 lark-cli 查 Base 全称 best-effort，失败用兑底值「设备库存与流转管理」 |
 
 附件（处理流水附件/配件照片/签收证明）只入库元数据（file_token/name/size），
 **默认不主动下载**（体积大、资产页签验收不要求附件可访问）；本地若已存在
@@ -53,11 +57,15 @@ frps 主机名本身就是小写 `ep-000xxx`）。
   （探测版本：在线取当前探测值，离线取最后已知，否则 null）+
   `active_repairs`（关联未完结维修记录数，大小写不敏感）。
 - `GET /api/assets/stats` — `{registered_total, archived_total,
-  inventory:{unit_shanghai, unused_note}, deployed, by_status, by_type, by_unit,
-  repair_rate, damage_rate, last_sync_at, …}`。口径：在册=设备明细；
-  库存口径 A=所属单位「上海办公室」、口径 B=去向/备注含「未使用」；
-  deployed=在册−库存 A（一线部署=非上海办公室持有）；维修率=(维修中+待维修)/在册；
-  损坏率=(异常+维修中+待维修)/在册；归档不计入在册。`tables` 带按表同步状态。
+  inventory:{total, by_unit, units, unused_note}, deployed, by_status, by_type,
+  by_unit, repair_rate, damage_rate, last_sync_at, …}`。
+  口径（KVWO-97 修正）：在册=设备明细；**库存=所属单位
+  ∈ `units`（默认上海办公室+潍坊办公室，分单位明细 `by_unit`，配置单位
+  无设备时计 0，服务商等其他单位持有不计库存）**；`unused_note`
+  （备注含「未使用」）仅作参考；deployed=在册−库存；维修率=
+  (维修中+待维修)/在册；损坏率=(异常+维修中+待维修)/在册；归档不计入
+  在册。对账基线（2026-10-20）：在册 248、库存 149（上海 94+潍坊 55）、
+  部署 99（随台账实时变化）。`tables` 带按表同步状态。
 - `GET /api/assets/units` — 单位聚合 `{unit, total, normal_rate, repairing
   (=维修中+待维修), abnormal(=异常), last_updated}[]`，按设备数倒序；
   单位详情用 `/api/assets?unit=…` 过滤。
@@ -73,6 +81,30 @@ frps 主机名本身就是小写 `ep-000xxx`）。
   `transfers[]`（流转记录按单位关联：相等或互为包含——该列为自由文本，
   存在「构元服务商」vs「潍坊构元服务商」）。
 - `POST /api/assets/sync` — 手动触发一次 5 表同步（验证/运维用）。
+- `GET /api/assets/report` — 资产日报推送状态（KVWO-97）：
+  `{enabled, times, next_run_at, last, inventory_units, panel_title}`；
+  webhook 地址属敏感凭据，不回显。
+- `POST /api/assets/report/run` — 手动触发一次日报推送（测试验收用，
+  与定时调度串行互斥）；返回推送结果与消息全文便于核对文案；
+  未配置 webhook 时 400 拒绝（不盲发）。
+
+## 资产日报定时飞书推送（KVWO-97）
+
+服务端自行定时推送资产核心指标到飞书群机器人，不依赖外部 agent 轮询：
+
+- 调度模式与采集时长（19:00/21:00）一致：每轮从墙上时钟重推下一次时刻，
+  进程重启自然对齐；默认每日 **09:00（服务器本地时间）**，
+  `FRP_MONITOR_REPORT_TIMES` 支持多时刻。
+- 推送内容（中文 text）：库存（合计=分单位明细，注明口径：公司库存，
+  服务商持有不计）、在册硬件（附归档不计在册、一线部署）、维修率/
+  损坏率（含分子分母）、数据时间（最近一次飞书成功同步；同步异常时
+  如实提示 ⚠）——指标全部由 `/api/assets/stats` 同一数据源实时计算。
+- 推送在独立线程（`feishu-report`）、带退避重试（3 次）；失败只记日志与
+  状态（`GET /api/assets/report` / stdout），**不影响面板服务与飞书同步**；
+  webhook 置空即整体关闭（调度线程不启动）。
+- 面板更名（同需求）：浏览器标签与页头一致，默认取飞书台账
+  Base（`V0YwbaOzya0ADBsO2wSc8M9Cntf`）全称，`FRP_MONITOR_PANEL_TITLE`
+  可覆盖。
 
 ## 验证
 
@@ -83,14 +115,25 @@ python3 verify_assets.py --base http://127.0.0.1:9100   # 全量（需 server.py
 
 单测覆盖：列序打乱/表间列序互异下的按名对齐、select（两种形态）/多选/user/
 datetime/attachment/link/number/空值解析、SQLite 幂等与按表错误隔离、
-stats/units/versions 口径、360° 双路关联。在线校验与 lark-cli 直查逐字段
-比对、二次同步幂等、筛选/统计/单位/版本/详情/404、device_online/
-detected_version/active_repairs 与既有 API 交叉一致。本地可用
-`verify_mock_frps.py` 模拟 frps（版本探测依赖设备可达，mock 下版本为
-「未获取」桶，属如实返回）。
+stats/units/versions 口径（含 KVWO-97 库存=上海+潍坊分单位）、360° 双路
+关联；资产日报（单位清单/推送时刻解析、下一调度时刻、文案四项指标+
+数据时间+同步异常提示、webhook 成功/失败判定 monkeypatch、面板标题
+<title>/<h1> 同源）。在线校验与 lark-cli 直查逐字段比对、二次同步幂等、
+筛选/统计/单位/版本/详情/404、device_online/detected_version/
+active_repairs 与既有 API 交叉一致；日报状态端点/手动推送文案与首页
+标题一致性（webhook 已配置时手动推送会真发飞书群，验收时注意）。
+本地可用 `verify_mock_frps.py` 模拟 frps（版本探测依赖设备可达，mock 下
+版本为「未获取」桶，属如实返回）。前端另有 `verify_assets_ui.js` /
+`verify_assets_real_api.js`（node，先 `python3 -c "import server"` 导出
+`/tmp/panel_test.js`）：mock 基线（在册 248/库存 149=上海 94+潍坊 55/
+部署 99）与真实 API 路径、断供降级。
 
 ## 部署注意（124.222.147.63）
 
 - 与维修面板共用 lark-cli 凭证（见 REPAIRS.md）；同步失败按表记错误状态，
   面板其余页签不受影响，恢复后自动追平。
 - `assets.sqlite` 落在 `/opt/frp-monitor/`，已加 .gitignore。
+- 日报推送（KVWO-97）：在 `/etc/frp-monitor.env` 配置
+  `FRP_MONITOR_FEISHU_WEBHOOK`（群机器人地址，敏感凭据勿入仓库）后重启；
+  `POST /api/assets/report/run` 可立即验推一次；时刻用
+  `FRP_MONITOR_REPORT_TIMES` 调整（默认 09:00）。
