@@ -320,6 +320,33 @@ def unit_stats_tests(srv):
     text3 = srv.feishu_report_text(st2, now=_dt(2026, 10, 21, 9, 0))
     check("日报文案：闲置行（数量+口径）",
           "闲置：2 台（库存外超 30 天未上线，含从未上线）" in text3)
+    # 30 天边界：口径「超过 30 天」为严格大于——恰好 30 天整不算，超出即算
+    bnow = _dt(2026, 10, 21, 9, 0)
+    seen_30d = fmt(bnow - _td(days=30))                     # 恰好 30 天整 → 不算
+    seen_30d1m = fmt(bnow - _td(days=30) - _td(minutes=1))  # 30 天 + 1 分钟 → 算
+    check("30 天边界：恰好 30 天整不算闲置，超过即算（严格 >）",
+          srv._device_idle("EP-000010", "潍坊构元服务商",
+                           {"ep-000010": seen_30d}, now=bnow) is False
+          and srv._device_idle("EP-000010", "潍坊构元服务商",
+                               {"ep-000010": seen_30d1m}, now=bnow) is True)
+    # 阈值 env 可配生效（KVWO-98 F 组）：FRP_MONITOR_IDLE_DAYS=7 下，10 天未上线即闲置
+    proc = subprocess.run(
+        [sys.executable, "-c",
+         "import server; "
+         "assert server.IDLE_DAYS == 7, server.IDLE_DAYS; "
+         "from datetime import datetime, timedelta; "
+         "now = datetime(2026, 10, 21, 9, 0); "
+         "seen10 = (now - timedelta(days=10)).strftime('%Y-%m-%d %H:%M'); "
+         "ls = {'ep-000010': seen10}; "
+         "assert server._device_idle('EP-000010', '潍坊构元服务商', ls, now=now) is True; "
+         "assert server._idle_stats([{'device_no': 'EP-000010', 'unit': '潍坊构元服务商'}], ls, now=now)['threshold_days'] == 7; "
+         "print('OK')"],
+        capture_output=True, text=True, timeout=120,
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+        env={**os.environ, "FRP_MONITOR_IDLE_DAYS": "7"})
+    check("阈值 env FRP_MONITOR_IDLE_DAYS 可配生效（7 天阈值下 10 天未上线即闲置）",
+          proc.returncode == 0 and "OK" in (proc.stdout or ""),
+          detail=(proc.stderr or "")[-200:])
 
 
 def unit_detail_tests(srv):
