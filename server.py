@@ -161,8 +161,9 @@ def _parse_unit_list(spec):
 INVENTORY_UNITS = _parse_unit_list(os.getenv("FRP_MONITOR_INVENTORY_UNITS",
                                              "上海办公室,潍坊办公室"))
 # 闲置口径（需求 4）：库存外在册设备中，最后在线距今 > IDLE_DAYS（含从未上线）；
-# 阈值仅参数化不改口径（提出人 2026-10-20 确认：唯一判据 = 超 30 天未上线）
-IDLE_DAYS = max(1, int(os.getenv("FRP_MONITOR_IDLE_DAYS", "30")))
+# 阈值仅参数化不改口径（提出人 2026-10-20 确认：唯一判据 = 超阈值天数未上线）。
+# 第六波（KVWO-107，提出人 2026-10-21）：默认 30 → 15 天，env 覆盖机制保留。
+IDLE_DAYS = max(1, int(os.getenv("FRP_MONITOR_IDLE_DAYS", "15")))
 FEISHU_WEBHOOK = os.getenv("FRP_MONITOR_FEISHU_WEBHOOK", "").strip()
 # 群机器人若开启「签名校验」（实测推送返回 code 19021 sign match fail），
 # 需配签名密钥（机器人设置页展示的 secret，同为敏感凭据仅落服务器 env）。
@@ -1191,9 +1192,14 @@ applyTask(t){
    GET /api/assets?status=&type=&unit=&q=&archived=1 → {devices:[…],last_sync_at}
    GET /api/assets/stats → {registered_total,archived_total,inventory:{total,by_unit,units,unused_note},
                             deployed,by_status,by_type,by_unit,repair_rate,damage_rate,last_sync_at}
-   GET /api/assets/units → {units:[{unit,total,normal_rate,repairing,abnormal,last_updated}]}
+   GET /api/assets/units → {units:[{unit,total,normal,normal_rate,online,usage_rate,
+                            repairing,abnormal,last_updated}]}（KVWO-107：online=frps 在线
+                            快照数，usage_rate=online/total，在册 0 记 null）
    GET /api/assets/versions → {detected:[{version,count}],ledger:[…],ledger_empty,matched,
-                              detected_only:[…],ledger_missing:[…]}
+                              detected_only:[…],ledger_missing:[…],
+                              by_provider_top5:[{unit,total,versions:[{version,count,share}]}]}
+                              （KVWO-107：在册数前 5 单位，探测版本分桶，未探测归「未获取」，
+                              share=count/在册数两位小数）
    GET /api/assets/{device_code} → {ledger:{…},repairs:[…],flows:[…],parts:[…],transfers:[…]}
  接口未合并（404）时按契约 mock 并以横幅明示（绝不静默冒充生产数据）；后端合入后 404 消失
  即自动切真实数据，前端零改动。字段解析容错（候选键），联调以真实字段为准。
@@ -1569,7 +1575,7 @@ mockData(){
  const byStatus={},byType={},byUnit={};
  for(const s of this.STATUS_ORDER)byStatus[s]=devs.filter(d=>d.status===s).length;
  for(const d of devs){byType[d.device_type]=(byType[d.device_type]||0)+1;byUnit[d.unit]=(byUnit[d.unit]||0)+1}
- // 闲置口径（KVWO-97 需求 4）：库存外·从未上线/超 30 天未上线；mock 确定性抽样
+ // 闲置口径（KVWO-97 需求 4）：库存外·从未上线/超阈值未上线（默认 15 天，KVWO-107）；mock 确定性抽样
  const idleByUnit={};let idleTotal=0;
  for(const d of devs){
   const isInv=d.unit==='上海办公室'||d.unit==='潍坊办公室';
@@ -1584,7 +1590,7 @@ mockData(){
  const lastSync=new Date(base+5*60000).toISOString();
  const units=UNITS.map(u=>{const us=devs.filter(d=>d.unit===u[0]);const mx=us.reduce((m,d)=>Math.max(m,Date.parse(d.updated_at)||0),0);return{unit:u[0],total:us.length,normal_rate:us.length?us.filter(d=>d.status==='正常').length/us.length:null,repairing:us.filter(d=>d.status==='维修中').length,abnormal:us.filter(d=>d.status==='异常').length,last_updated:mx?new Date(mx).toISOString():null}});
  this._mockCache={devices:devs,archived:arch,lastSync:lastSync,
-  stats:{registered_total:devs.length,archived_total:arch.length,inventory:{total:invA,by_unit:{'上海办公室':byUnit['上海办公室']||0,'潍坊办公室':byUnit['潍坊办公室']||0},units:['上海办公室','潍坊办公室'],unused_note:invB},deployed:devs.length-invA,idle:{total:idleTotal,threshold_days:30,by_unit:idleByUnit},by_status:byStatus,by_type:byType,by_unit:byUnit,repair_rate:(byStatus['维修中']+byStatus['待维修'])/devs.length,damage_rate:(byStatus['异常']+byStatus['维修中']+byStatus['待维修'])/devs.length,last_sync_at:lastSync},
+  stats:{registered_total:devs.length,archived_total:arch.length,inventory:{total:invA,by_unit:{'上海办公室':byUnit['上海办公室']||0,'潍坊办公室':byUnit['潍坊办公室']||0},units:['上海办公室','潍坊办公室'],unused_note:invB},deployed:devs.length-invA,idle:{total:idleTotal,threshold_days:15,by_unit:idleByUnit},by_status:byStatus,by_type:byType,by_unit:byUnit,repair_rate:(byStatus['维修中']+byStatus['待维修'])/devs.length,damage_rate:(byStatus['异常']+byStatus['维修中']+byStatus['待维修'])/devs.length,last_sync_at:lastSync},
   units:units,
   versions:{detected:Object.entries(det).map(e=>({version:e[0],count:e[1]})),ledger:[],ledger_empty:devs.length,matched:devs.filter(d=>d.detected_version).length,detected_only:[{device_code:'ep-900201',version:'v0.5.0'},{device_code:'EP-900202',version:'v0.4.6'},{device_code:'EP-900203',version:'v0.5.0'}],ledger_missing:devs.filter(d=>!d.detected_version).map(d=>d.device_code)}};
  return this._mockCache;
@@ -5970,19 +5976,25 @@ def assets_stats_view():
 
 
 def assets_units_view():
-    """项目（所属单位）维度聚合：设备数 / 正常率 / 维修中 / 异常 / 最近更新时间。
+    """项目（所属单位）维度聚合：设备数 / 正常率 / 维修中 / 异常 / 使用率 / 最近更新时间。
 
     维修中数 = 状态为「维修中」+「待维修」；正常率 = 正常 / 该单位设备数；
+    使用率（KVWO-107 第六波，口径：frps 在线快照数 / 该单位在册设备数，
+    在册为 0 记 null；设备编号匹配与 /api/assets 同规则，大小写不敏感）；
     最近更新时间 = 该单位设备「最后更新时间」的最大值（ISO 字典序即时间序）。
     单位详情由前端引用 /api/assets?unit=… 过滤，不另设接口。
     """
     devices = asset_store.all_records("devices")
+    _, _, snap = _asset_fleet_lookup()
     units = {}
     for d in devices:
         name = d.get("unit") or "(未填写)"
         u = units.setdefault(name, {"unit": name, "total": 0, "normal": 0,
-                                    "repairing": 0, "abnormal": 0, "last_updated": None})
+                                    "repairing": 0, "abnormal": 0, "online": 0,
+                                    "last_updated": None})
         u["total"] += 1
+        if _dev_key(d.get("device_no")) in snap:
+            u["online"] += 1
         status = d.get("status") or ""
         if status == "正常":
             u["normal"] += 1
@@ -5996,7 +6008,8 @@ def assets_units_view():
     items = []
     for u in units.values():
         items.append({**u,
-                      "normal_rate": round(u["normal"] / u["total"], 4) if u["total"] else None})
+                      "normal_rate": round(u["normal"] / u["total"], 4) if u["total"] else None,
+                      "usage_rate": round(u["online"] / u["total"], 4) if u["total"] else None})
     items.sort(key=lambda x: (-x["total"], x["unit"]))
     return items
 
@@ -6036,12 +6049,35 @@ def assets_versions_view():
     ledger_missing = sorted(k for k in ledger if k not in detected_keys)
     detected_only = sorted(k for k in detected_keys
                            if k not in ledger and k not in archived_keys)
+    # 主要服务商版本占比（KVWO-107 第六波）：在册数前 5 单位的探测版本分桶。
+    # 口径：版本取 frps 在线快照的探测版本，空版本/未探测（离线、未接入）
+    # 一律归「未获取」桶（与 detected_by_version 同桶名）；share = count /
+    # 该单位在册数（保留两位小数）；排序 = 在册数降序、并列按单位名稳定
+    # 排序（与 units 同规则），恰取前 5（不足 5 家如实返回全部）。
+    units_ver = {}
+    for d in devices:
+        name = d.get("unit") or "(未填写)"
+        u = units_ver.setdefault(name, {"total": 0, "by_version": {}})
+        u["total"] += 1
+        info = snap.get(_dev_key(d.get("device_no")))
+        ver = (info.get("version") if info else None) or "未获取"
+        u["by_version"][ver] = u["by_version"].get(ver, 0) + 1
+    by_provider_top5 = []
+    for name, u in sorted(units_ver.items(),
+                           key=lambda kv: (-kv[1]["total"], kv[0]))[:5]:
+        versions = [{"version": ver, "count": cnt,
+                     "share": round(cnt / u["total"], 2)}
+                    for ver, cnt in sorted(u["by_version"].items(),
+                                           key=lambda kv: (-kv[1], kv[0]))]
+        by_provider_top5.append({"unit": name, "total": u["total"],
+                                 "versions": versions})
     return {
         "detected_by_version": detected_by_version,
         "detected_total": len(snap),
         "ledger_by_version": ledger_by_version,
         "ledger_registered": ledger_no_version + sum(ledger_by_version.values()),
         "ledger_no_version": ledger_no_version,
+        "by_provider_top5": by_provider_top5,
         "match": {"matched": matched, "ledger_missing": ledger_missing,
                   "detected_only": detected_only},
         "match_counts": {"matched": len(matched), "ledger_missing": len(ledger_missing),
