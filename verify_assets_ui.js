@@ -40,7 +40,7 @@ const intervals = [];
 const fetchLog = [];
 const fetchMock = async (path) => {
   fetchLog.push(path);
-  if (path === '/api/assets/report/run') return { status: 200, ok: true, json: async () => ({ ok: true, reason: 'manual', at: 1761072000, text: '【设备库存与流转管理 · 资产日报】测试\n库存：149 台（上海办公室 94 台 + 潍坊办公室 55 台）\n闲置：2 台（库存外超 30 天未上线，含从未上线）' }) };
+  if (path === '/api/assets/report/run') return { status: 200, ok: true, json: async () => ({ ok: true, reason: 'manual', at: 1761072000, text: '【设备库存与流转管理 · 资产日报】测试\n库存：149 台（上海办公室 94 台 + 潍坊办公室 55 台）\n主要服务商使用率（前 5 家，按在册数）：\n上海办公室：在线 0/在册 94（0.0%）\n苏州项目组：在线 14/在册 20（70.0%）\n主要服务商版本占比（前 5 家）：\n苏州项目组（20 台）：v0.5.0 9 台 45% / v0.4.6 5 台 25% / 未获取 6 台 30%\n闲置：2 台（库存外超 15 天未上线，含从未上线）' }) };
   if (path.startsWith('/api/assets')) return { status: 404, ok: false, json: async () => null };
   if (path.startsWith('/api/hosts')) return { status: 502, ok: false, json: async () => ({ error: 'frps 不可用' }) };
   return { status: 404, ok: false, json: async () => null };
@@ -71,7 +71,10 @@ const ok = (name, cond) => { if (!cond) { console.error('FAIL: ' + name); proces
   ok('指标卡：一线部署 99', met.includes('一线部署') && met.includes('>99<'));
   ok('指标卡：维修率 5.2% 带计算式', met.includes('5.2%') && met.includes('(维修中 10 + 待维修 3) / 在册 248'));
   ok('指标卡：损坏率 8.5% 带计算式', met.includes('8.5%') && met.includes('(异常 8 + 维修中 10 + 待维修 3) / 在册 248'));
-  ok('指标卡：闲置卡（超 30 天未上线口径）', met.includes('闲置') && met.includes('超 30 天未上线（含从未上线）') && met.includes('>' + A.stats.idleTotal + '<'));
+  ok('指标卡：闲置卡文案随 threshold_days（默认 15）动态显示', met.includes('闲置') && A.stats.idleDays === 15 && met.includes('超 15 天未上线（含从未上线）') && met.includes('>' + A.stats.idleTotal + '<'));
+  const idleDaysSaved = A.stats.idleDays; A.stats.idleDays = 7; A.renderMetrics();
+  ok('指标卡：闲置卡文案随阈值动态变化（7 天）', el('asMetrics').innerHTML.includes('超 7 天未上线（含从未上线）'));
+  A.stats.idleDays = idleDaysSaved; A.renderMetrics();
   ok('指标卡：统计时间 last_sync_at', met.includes('统计时间'));
   // 日报手动推送按钮（KVWO-97 评论区要求）：点击 → POST /api/assets/report/run → 状态 + 弹窗全文
   A.setTab('dashboard');
@@ -81,6 +84,10 @@ const ok = (name, cond) => { if (!cond) { console.error('FAIL: ' + name); proces
   const dist = el('asDists').innerHTML;
   ok('分布图：状态/类型/单位三组', dist.includes('状态分布') && dist.includes('设备类型分布') && dist.includes('所属单位 TOP 分布'));
   ok('分布图：类型短名', dist.includes('Stereo-V0') && dist.includes('Lite'));
+  // 第六波 KVWO-108：总览「主要服务商使用率」小节（在册数前 5，口径在线/在册（快照）+统计时间）
+  ok('总览：主要服务商使用率小节（前 5 家 + 口径标注）', dist.includes('主要服务商使用率（在册数前 5）') && dist.includes('在线/在册（快照）') && dist.includes('统计时间'));
+  ok('总览：使用率条目含前 5 单位与在线/在册 tooltip', dist.includes('上海办公室') && dist.includes('苏州项目组') && /在线 \d+ \/ 在册 \d+/.test(dist) && /使用率 \d+(\.\d+)?%/.test(dist));
+  ok('总览：库存单位 0% 使用率如实展示', /使用率 0%/.test(dist) || /title="[^"]*：在线 0 \/ 在册 \/ \d+[^"]*"/.test(dist) || dist.includes('在线 0 / 在册'));
   // 模块 2：台账
   const rows0 = el('asLedgerBody').innerHTML;
   const trs = rows0.split('<tr data-code=').length - 1;
@@ -130,6 +137,12 @@ const ok = (name, cond) => { if (!cond) { console.error('FAIL: ' + name); proces
   ok('版本视图：台账未登记 248 台醒目提示', vb.includes('台账「软件版本」当前全部未登记') && vb.includes('>248<'));
   ok('版本视图：detected_only / ledger_missing', vb.includes('detected_only') && vb.includes('ledger_missing') && vb.includes('ledger_missing') && vb.includes('展开设备列表'));
   ok('版本视图：升级入口按钮', vb.includes('前往升级视图'));
+  // 第六波 KVWO-108：主要服务商版本占比区块（by_provider_top5，在册数前 5）
+  ok('版本视图：主要服务商版本占比区块（前 5 家分组）', vb.includes('主要服务商版本占比（在册数前 5）') && vb.includes('苏州项目组') && vb.includes('杭州项目组') && vb.includes('南京项目组'));
+  ok('版本视图：版本名 + 台数 + 占比（含未获取桶）', vb.includes('未获取') && /\d+ 台 · \d+(\.\d+)?%/.test(vb) && vb.includes('占比 = 台数 / 该单位在册数'));
+  const t5saved = A.versions.byProviderTop5; A.versions.byProviderTop5 = []; A.renderVersions();
+  ok('版本视图：by_provider_top5 空态引导文案', el('asVersionBody').innerHTML.includes('暂无服务商版本分布数据'));
+  A.versions.byProviderTop5 = t5saved; A.renderVersions();
   // 模块 3：单位
   A.go('units');
   const ub = el('asUnitBody').innerHTML;
@@ -137,6 +150,12 @@ const ok = (name, cond) => { if (!cond) { console.error('FAIL: ' + name); proces
   ok('项目视图：上海/潍坊标注公司库存（94/55 台）', ub.includes('上海办公室') && ub.includes('公司库存单位 94 台（不计一线部署）') && ub.includes('公司库存单位 55 台（不计一线部署）'));
   ok('项目视图：上海备注细分（未使用/新组装）', ub.includes('未使用 ' + A.stats.invB) && ub.includes('新组装'));
   ok('项目视图：正常率/维修中/异常', ub.includes('正常') && ub.includes('维修中') && ub.includes('异常') && ub.includes('最近更新'));
+  // 第六波 KVWO-108：每单位卡片使用率（online/在册；三态：数值（含 0%）/ null → 「—」）
+  ok('项目视图：使用率与正常率并列展示（在线/在册口径 tooltip）', ub.includes('% 使用率') && ub.includes('frps 在线快照 / 在册'));
+  ok('项目视图：库存单位 0% 使用率如实展示', ub.includes('0% 使用率'));
+  const useSaved = A.units[2].usageRate; A.units[2].usageRate = null; A.renderUnits();
+  ok('项目视图：使用率 null 显示 —', el('asUnitBody').innerHTML.includes('>— 使用率<'));
+  A.units[2].usageRate = useSaved; A.renderUnits();
   // 下钻
   A.drill('上海办公室');
   const ud = el('asUnitDetail').innerHTML;
