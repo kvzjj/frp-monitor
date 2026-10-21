@@ -4,8 +4,9 @@
 const fs = require('fs'), vm = require('vm'), path = require('path');
 const { execFileSync } = require('child_process');
 execFileSync('python3', ['-c',
-  'import server; open("/tmp/panel_test.js","w").write(server.JS); ' +
-  'open("/tmp/panel_index.html","w").write(server.INDEX.format(css=server.CSS, js=server.JS))'],
+  'import html, server; open("/tmp/panel_test.js","w").write(server.JS); ' +
+  'open("/tmp/panel_index.html","w").write(server.INDEX.format(css=server.CSS, js=server.JS, ' +
+  'title=html.escape(server.panel_title(), quote=False)))'],   // INDEX 含 {title}（KVWO-97），与 server.py 渲染路径一致
   { cwd: path.join(__dirname), stdio: 'pipe' });
 const js = fs.readFileSync('/tmp/panel_test.js', 'utf8');
 const IDX = fs.readFileSync('/tmp/panel_index.html', 'utf8');

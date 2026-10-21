@@ -230,6 +230,7 @@ INDEX = """<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=
 <nav id=assetTabs class="vtabs asub"><button type=button data-atab=dashboard class=on>资产总览</button><button type=button data-atab=hardware>硬件台账</button><button type=button data-atab=repairs>维修看板</button><button type=button data-atab=versions>版本视图</button><button type=button data-atab=units>项目视图</button></nav>
 <div id=asSyncBar class="asyncbar ok" hidden></div>
 <section id=atabDashboard>
+<div class=toolbar><button type=button id=asReportPush class=listbtn title="立即向飞书群推送一次资产日报（测试用；需服务器已配置 FRP_MONITOR_FEISHU_WEBHOOK，未配置会如实报错）">📨 立即推送日报（测试）</button><span id=asReportState class=uhint></span></div>
 <section class=amcards id=asMetrics></section>
 <div class=adists id=asDists></div>
 </section>
@@ -323,6 +324,7 @@ CSS = """*{box-sizing:border-box}body{margin:0;background:#f4f7fb;color:#172033;
 .asub{margin:-4px 0 18px}
 .asub button{padding:6px 16px;font-size:13px}
 .asyncbar{font-size:12px;border-radius:8px;padding:8px 14px;margin-bottom:14px;display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;line-height:1.6}
+.rptext{white-space:pre-wrap;font:12px/1.7 ui-monospace,monospace;background:#f8fafc;border:1px solid #e5eaf1;border-radius:8px;padding:14px 16px;margin:12px 0 0;max-height:60vh;overflow:auto;word-break:break-all}
 .asyncbar.ok{background:#f0fdf4;border:1px solid #bbf7d0;color:#166534}
 .asyncbar.warn{background:#fffbeb;border:1px solid #fde68a;color:#92400e}
 .asyncbar.err{background:#fef2f2;border:1px solid #fecaca;color:#b91c1c}
@@ -1213,6 +1215,7 @@ init(){
  document.getElementById('asType').onchange=e=>{this.hw.type=e.target.value;this.renderLedger()};
  document.getElementById('asUnit').onchange=e=>{this.hw.unit=e.target.value;this.renderLedger()};
  document.getElementById('asArchived').onchange=e=>{this.hw.archived=e.target.checked;this.renderLedger()};
+ document.getElementById('asReportPush').onclick=()=>this.pushReport();
  document.getElementById('asLedgerHead').onclick=e=>{const th=e.target.closest('th[data-sk]');if(!th)return;if(this.hw.sortKey===th.dataset.sk)this.hw.sortDir*=-1;else{this.hw.sortKey=th.dataset.sk;this.hw.sortDir=1}this.renderLedger()};
  document.getElementById('asLedgerBody').onclick=e=>{this.rowClick(e)};
  document.getElementById('asUnitDetail').addEventListener('click',e=>{
@@ -1324,6 +1327,23 @@ render(){if(!this.loaded)return;this.renderMetrics();this.renderDists();this.ren
 invLabel(){
  const st=this.stats||{},bu=st.invByUnit||{};const parts=(st.invUnits&&st.invUnits.length?st.invUnits:['上海办公室','潍坊办公室']).map(u=>u+' '+((bu[u]!=null?bu[u]:0))+' 台');
  return (parts.length?parts.join(' + '):'—')+'（公司库存，服务商持有不计）'
+},
+/* ---------- 日报手动推送（测试按钮，KVWO-97 评论区要求）：POST /api/assets/report/run，成功弹窗展示消息全文 ---------- */
+async pushReport(){
+ const btn=document.getElementById('asReportPush'),st=document.getElementById('asReportState');
+ if(!btn||btn.disabled)return;
+ btn.disabled=true;st.textContent='推送中…';
+ try{
+  const r=await fetch('/api/assets/report/run',{method:'POST',cache:'no-store'});
+  const d=await r.json().catch(()=>null);
+  if(!r.ok||!d||!d.ok){st.textContent='推送失败：'+((d&&d.error)||('HTTP '+r.status));return}
+  st.textContent='已推送（'+(d.reason||'manual')+' · '+(this.fmtTs((d.at||0)*1000)||'')+'），消息全文见弹窗';
+  const m=document.getElementById('modal');
+  document.getElementById('modalBody').innerHTML='<header><div><span class=name>资产日报 · 推送成功（飞书群应已收到）</span></div><button class=x id=mClose>✕</button></header><pre class=rptext>'+esc(d.text||'')+'</pre>';
+  m.classList.add('show');
+  document.getElementById('mClose').onclick=()=>m.classList.remove('show');
+ }catch(e){st.textContent='推送失败：'+String(e.message||e)}
+ finally{btn.disabled=false}
 },
 /* ---------- 模块 1：总览仪表盘 ---------- */
 renderMetrics(){
