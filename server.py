@@ -145,6 +145,9 @@ ASSET_DB_PATH = os.getenv("FRP_MONITOR_ASSET_DB", os.path.join(_SCRIPT_DIR, "ass
 # - 飞书群机器人 webhook 属敏感凭据：只落在服务器 env 配置，不写入仓库/
 #   文档（置空/未配置 = 关闭推送）。默认每日 09:00（服务器本地时间）推送，
 #   FRP_MONITOR_REPORT_TIMES 支持多时刻（逗号分隔 HH:MM，与采集时长调度同模式）。
+# - 日报正文含主要服务商使用率与版本占比两段（KVWO-107 第六波追加，
+#   2026-10-21 提出人确认），与 /api/assets/units、/api/assets/versions 同口径；
+#   面板展示保留不变（见 feishu_report_text）。
 # - 面板标题：env 覆盖 > lark-cli 解析 Base 全称（启动后台线程 best-effort）
 #   > 兜底值（父需求 KVWO-78 记录的 Base 名称）。
 def _parse_unit_list(spec):
@@ -5540,7 +5543,15 @@ def _next_report_slot(now=None):
 
 
 def feishu_report_text(stats, now=None):
-    """由 /api/assets/stats 口径拼中文日报文本（与面板同一数据源，不另算死数）。"""
+    """由 /api/assets/stats·units·versions 口径拼中文日报文本（同一数据源，不另算死数）。
+
+    KVWO-107 追加（2026-10-21 提出人确认，日报必须体现）：正文含
+    「主要服务商使用率（前 5 家，按在册数）」与「主要服务商版本占比
+    （前 5 家）」两段，实时取 assets_units_view / assets_versions_view
+    同口径同排序（在册数降序、并列按单位名稳定），定时推送与手动推送
+    （POST /api/assets/report/run，含面板「立即推送日报」弹窗）共用本
+    函数，文案天然一致；不足 5 家如实全列，无在册设备时整段「—」。
+    """
     now = now or datetime.now()
     inv = stats.get("inventory") or {}
     by_unit = inv.get("by_unit") or {}
@@ -5573,6 +5584,25 @@ def feishu_report_text(stats, now=None):
     else:
         lines.append(f"闲置：{idle['total']} 台（库存外超 "
                      f"{idle.get('threshold_days', IDLE_DAYS)} 天未上线，含从未上线）")
+    # 主要服务商使用率 / 版本占比两段（KVWO-107 追加，置于闲置与数据时间之间）：
+    # 使用率行 = 在线快照数/在册（百分比与既有 pct 同保留 1 位）；版本行紧凑分布，
+    # share 取 API 同值（两位小数）展示为整数百分比；未探测/空版本归「未获取」桶。
+    top_units = assets_units_view()[:5]
+    lines.append("主要服务商使用率（前 5 家，按在册数）：")
+    if top_units:
+        lines.extend(f"{u['unit']}：在线 {u['online']}/在册 {u['total']}（{pct(u['usage_rate'])}）"
+                     for u in top_units)
+    else:
+        lines.append("—（无在册设备）")
+    top5 = assets_versions_view()["by_provider_top5"]
+    lines.append("主要服务商版本占比（前 5 家）：")
+    if top5:
+        lines.extend(f"{t['unit']}（{t['total']} 台）："
+                     + " / ".join(f"{v['version']} {v['count']} 台 {v['share'] * 100:.0f}%"
+                                   for v in t["versions"])
+                     for t in top5)
+    else:
+        lines.append("—（无在册设备）")
     ts = stats.get("last_sync_at")
     if ts:
         lines.append("数据时间：" + datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")

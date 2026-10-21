@@ -15,7 +15,8 @@ KVWO-107 第六波：闲置默认 15 天 + units 使用率 + versions 前 5 服�
      （matched / ledger_missing / detected_only）、单设备 360° 三源关联
      （编号匹配 + link 双路 + 单位模糊）。
    - 资产日报（KVWO-97）：库存单位清单/推送时刻解析、下一调度时刻、日报
-     文案（四项指标+数据时间+同步异常提示）、webhook 成功/失败判定
+     文案（四项指标 + KVWO-107 追加的主要服务商使用率/版本占比两段 +
+     数据时间 + 同步异常提示）、webhook 成功/失败判定
      （monkeypatch，不发真实请求）、面板标题兑底与 <title>/<h1> 同源。
 2. 在线校验（--base http://127.0.0.1:9100）：与 lark-cli 直查 5 表结果
    比对同步计数/字段值/统计口径/单位聚合/版本匹配，幂等、筛选、详情、
@@ -459,7 +460,35 @@ def unit_report_tests(srv):
     check("同步异常时日报如实提示（不吞错）",
           "⚠ 飞书同步异常" in text2 and "boom" in text2)
 
-    # webhook 成功/失败判定：monkeypatch urlopen，不发真实请求
+    # KVWO-107 追加两段：主要服务商使用率 / 版本占比（mock 在线快照与探测版本，
+    # 与 unit_stats_tests 同一组快照：上海 2 台在线，其余离线）
+    snap_hosts = [{"hostname": "ep-000001", "version": "v1.0.0"},
+                  {"hostname": "EP-000002", "version": ""},
+                  {"hostname": "ep-999999", "version": "v1.0.0"}]
+    orig_snap = srv.get_snapshot
+    srv.get_snapshot = lambda: (snap_hosts, 0.0)
+    try:
+        text3 = srv.feishu_report_text(srv.assets_stats_view(),
+                                       now=_dt(2026, 10, 21, 9, 0))
+    finally:
+        srv.get_snapshot = orig_snap
+    check("日报文案：主要服务商使用率段（前 5 家，在线/在册 + 1 位小数百分比）",
+          "主要服务商使用率（前 5 家，按在册数）：" in text3
+          and "上海办公室：在线 2/在册 5（40.0%）" in text3
+          and "潍坊办公室：在线 0/在册 3（0.0%）" in text3
+          and "潍坊构元服务商：在线 0/在册 3（0.0%）" in text3)
+    check("日报文案：主要服务商版本占比段（探测版本 + 未获取桶，整数百分比）",
+          "主要服务商版本占比（前 5 家）：" in text3
+          and "上海办公室（5 台）：未获取 4 台 80% / v1.0.0 1 台 20%" in text3
+          and "潍坊构元服务商（3 台）：未获取 3 台 100%" in text3)
+    check("日报段落顺序：两段新增位于闲置与数据时间之间（既有段落不变）",
+          text3.index("闲置：") < text3.index("主要服务商使用率")
+          < text3.index("主要服务商版本占比") < text3.index("数据时间："))
+
+    # webhook 成功/失败判定：monkeypatch urlopen，不发真实请求。
+    # 注：日报文案新增两段后 run_feishu_report 会轻 frps 快照（GET，经
+    # 同一 urlopen mock），放仅按 POST 请求数断言 webhook 推送次数
+    posts = lambda: [c for c in calls if c.get_method() == "POST"]
     calls = []
 
     class _Resp:
@@ -486,20 +515,22 @@ def unit_report_tests(srv):
     try:
         srv.urlopen = _ok_open
         ok1, code1, _ = srv._feishu_webhook_post("hello", attempts=2)
-        calls_after_post = len(calls)
+        posts_after_post = len(posts())
         out = srv.run_feishu_report("manual")
         srv.urlopen = _fail_open
         ok2, code2, _ = srv._feishu_webhook_post("hello", attempts=2)
     finally:
         srv.urlopen, srv.FEISHU_WEBHOOK = orig_open, orig_hook
     check("webhook 成功判定（HTTP 200 + 业务码 0，不重试）",
-          ok1 is True and code1 == 200 and calls_after_post == 1
-          and len(calls) == 2)   # run_feishu_report 复用同一判定链路再推一条
+          ok1 is True and code1 == 200 and posts_after_post == 1
+          and len(posts()) == 2)   # run_feishu_report 复用同一判定链路再推一条
     check("webhook 失败退避重试后如实返回失败（绝不抛出）",
           ok2 is False and code2 is None)
-    check("run_feishu_report：记录状态并回显全文",
+    check("run_feishu_report：记录状态并回显全文（手动推送含新增两段）",
           out["ok"] is True and out["reason"] == "manual"
           and "在册硬件：11 台" in out["text"]
+          and "主要服务商使用率（前 5 家，按在册数）：" in out["text"]
+          and "主要服务商版本占比（前 5 家）：" in out["text"]
           and srv._feishu_report_state["last"]["ok"] is True)
 
     # 签名校验（群机器人开启签名时必需，实测未签名会被拒 code=19021）
@@ -567,7 +598,8 @@ def unit_report_tests(srv):
 
 
 def unit_top5_tests(srv):
-    print("[5] 前 5 服务商版本占比单测（KVWO-107：恰 5 家/并列/share 舍入）")
+    print("[5] 前 5 服务商版本占比单测（KVWO-107：恰 5 家/并列/share 舍入 + 日报两段）")
+    from datetime import datetime as _dt
     # 6 单位在册数：A 6 / B 5 / C 5 / D 4 / E 2 / F 2（B/C、E/F 并列，F 应被截断）
     devices = {}
     plan = [("服务商A", 6), ("服务商B", 5), ("服务商C", 5),
@@ -590,6 +622,8 @@ def unit_top5_tests(srv):
     try:
         top5 = srv.assets_versions_view()["by_provider_top5"]
         units_top = {u["unit"]: u for u in srv.assets_units_view()}
+        text5 = srv.feishu_report_text(srv.assets_stats_view(),
+                                       now=_dt(2026, 10, 21, 9, 0))
     finally:
         srv.get_snapshot = orig
     check("恰 5 家：在册数降序、并列按单位名稳定（服务商F 2 台被截断）",
@@ -608,6 +642,18 @@ def unit_top5_tests(srv):
           units_top["服务商A"]["online"] == 4
           and abs(units_top["服务商A"]["usage_rate"] - 4 / 6) < 5e-5
           and units_top["服务商F"]["usage_rate"] == 0.0)
+    # 日报两段（KVWO-107 追加）在同一 6 单位数据上生成：恰 5 家、第 6 家截断
+    usage_lines = [l for l in text5.splitlines() if "：在线 " in l]
+    ver_lines = [l for l in text5.splitlines() if " 台）：" in l]
+    check("日报两段恰 5 家：在册降序、并列按单位名稳定（服务商F 截断不出现）",
+          len(usage_lines) == 5 and len(ver_lines) == 5
+          and usage_lines[0] == "服务商A：在线 4/在册 6（66.7%）"
+          and usage_lines[1] == "服务商B：在线 0/在册 5（0.0%）"
+          and all("服务商F" not in l for l in usage_lines + ver_lines))
+    check("日报版本行：紧凑分布 + share 展示整数百分比（与 API share 同值）",
+          ver_lines[0] == "服务商A（6 台）：v2.0.0 3 台 50% / 未获取 2 台 33%"
+                        " / v2.1.0 1 台 17%"
+          and ver_lines[1] == "服务商B（5 台）：未获取 5 台 100%")
 
 
 def unit_tests():
