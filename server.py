@@ -371,6 +371,9 @@ CSS = """*{box-sizing:border-box}body{margin:0;background:#f4f7fb;color:#172033;
 .aurow{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}
 .auinv{font-size:12px;color:#0f766e;background:#ccfbf1;border-radius:8px;padding:6px 10px;margin-bottom:8px}
 .aumut{font-size:11px;color:#98a2b3}
+.abarate.aurate{grid-template-columns:1fr 82px}
+.abarate.aurate span{color:#0e7490}
+.abar.vbar{grid-template-columns:minmax(88px,150px) 1fr 104px}
 .auhead2{display:flex;gap:12px;align-items:baseline;flex-wrap:wrap;margin-bottom:6px}
 .auhead2 b{font-size:16px}
 .auhead2 span{color:#718096;font-size:12px}
@@ -1187,13 +1190,14 @@ applyTask(t){
 }
 };
 /* ================= 资产管理视图（Assets.*，KVWO-84：总览仪表盘/硬件台账 360°/项目/版本） =================
- 契约对齐后端 KVWO-83（/api/assets 系列，KVWO-97 库存口径修正为上海+潍坊）：
+ 契约对齐后端 KVWO-83（/api/assets 系列，KVWO-97 库存口径修正为上海+潍坊；第六波 KVWO-107：闲置 threshold_days 默认 15）：
    GET /api/assets?status=&type=&unit=&q=&archived=1 → {devices:[…],last_sync_at}
    GET /api/assets/stats → {registered_total,archived_total,inventory:{total,by_unit,units,unused_note},
                             deployed,by_status,by_type,by_unit,repair_rate,damage_rate,last_sync_at}
-   GET /api/assets/units → {units:[{unit,total,normal_rate,repairing,abnormal,last_updated}]}
+   GET /api/assets/units → {units:[{unit,total,online,usage_rate,normal_rate,repairing,abnormal,last_updated}]}   (第六波 KVWO-107：usage_rate=frps 在线快照/在册，在册 0 或 fleet 不可用为 null)
    GET /api/assets/versions → {detected:[{version,count}],ledger:[…],ledger_empty,matched,
-                              detected_only:[…],ledger_missing:[…]}
+                              detected_only:[…],ledger_missing:[…],
+                              by_provider_top5:[{unit,total,versions:[{version,count,share}]}]}   (在册数降序恰 5 家；版本取探测值，未探测归「未获取」桶；share=count/在册)
    GET /api/assets/{device_code} → {ledger:{…},repairs:[…],flows:[…],parts:[…],transfers:[…]}
  接口未合并（404）时按契约 mock 并以横幅明示（绝不静默冒充生产数据）；后端合入后 404 消失
  即自动切真实数据，前端零改动。字段解析容错（候选键），联调以真实字段为准。
@@ -1272,6 +1276,8 @@ async loadAll(){
 },
 normList(d,archived){const arr=(d&&(d.devices||d.items||d.records))||(Array.isArray(d)?d:[]);return arr.map(r=>this.normDev(r,archived)).filter(x=>x.code)},
 nByKey(o,ks){for(const k of ks)if(o&&o[k]!=null)return o[k];return null},
+/* 闲置阈值天数：文案一律取后端 stats.idle.threshold_days（KVWO-107 起默认 15），无返回才兑底 15，不写死 */
+idleDays(){const d=this.stats&&this.stats.idleDays;return d!=null?d:15},
 normDev(r,archived){
  const on=r?(r.device_online!==undefined?r.device_online:r.online):null;
  return{code:String(this.nByKey(r,['device_code','device_id','code'])||'').trim(),
@@ -1299,12 +1305,15 @@ normStats(s){return{
 normUnits(u){const arr=(u&&(u.units||u.items))||(Array.isArray(u)?u:[]);return arr.map(x=>({
  unit:String(this.nByKey(x,['unit','name'])||''),total:this.nByKey(x,['total','count']),
  normalRate:this.nByKey(x,['normal_rate']),repairing:this.nByKey(x,['repairing']),abnormal:this.nByKey(x,['abnormal']),
+ online:this.nByKey(x,['online','online_count']),usageRate:this.nByKey(x,['usage_rate']),   // 第六波 KVWO-107：在线数与使用率（在线/在册，null → 「—」）
  lastUpdated:this.nByKey(x,['last_updated','updated_at'])}))
 },
 normVers(v){const arr=a=>Array.isArray(a)?a:[];return{
  detected:arr(v&&v.detected),ledger:arr(v&&v.ledger),
  ledgerEmpty:this.nByKey(v,['ledger_empty']),matched:this.nByKey(v,['matched']),
- detectedOnly:arr(v&&v.detected_only),ledgerMissing:arr(v&&v.ledger_missing)}
+ detectedOnly:arr(v&&v.detected_only),ledgerMissing:arr(v&&v.ledger_missing),
+ byProviderTop5:arr(v&&v.by_provider_top5).map(p=>({unit:String(this.nByKey(p,['unit','name'])||''),total:this.nByKey(p,['total','count']),
+  versions:arr(p&&p.versions).map(x=>({version:this.nByKey(x,['version']),count:this.nByKey(x,['count']),share:this.nByKey(x,['share'])}))}))}   // 第六波 KVWO-107：主要服务商版本占比（在册数前 5）
 },
 fmtTs(v){
  if(v==null||v==='')return null;
@@ -1358,7 +1367,7 @@ renderMetrics(){
   {v:s.deployed,l:'一线部署',sub:'口径：在册 − 库存（库存单位持有不计部署）'},
   {v:pctv(s.repairRate),l:'维修率',rate:1,c:'#ea580c',sub:'计算式：(维修中 '+n('维修中')+' + 待维修 '+n('待维修')+') / 在册 '+s.total},
   {v:pctv(s.damageRate),l:'损坏率',rate:1,c:'#dc2626',sub:'计算式：(异常 '+n('异常')+' + 维修中 '+n('维修中')+' + 待维修 '+n('待维修')+') / 在册 '+s.total},
-  {v:s.idleTotal,l:'闲置',sub:'口径：库存外·超 '+(s.idleDays!=null?s.idleDays:30)+' 天未上线（含从未上线）；fleet 库未启用时不可计算',c:'#7c3aed'},
+  {v:s.idleTotal,l:'闲置',sub:'口径：库存外·超 '+this.idleDays()+' 天未上线（含从未上线）；fleet 库未启用时不可计算',c:'#7c3aed'},
  ];
  el.innerHTML=cards.map(m=>'<div class="amcard'+(m.rate?' rate':'')+'" style="--c:'+(m.c||'')+'" title="'+esc(m.sub)+'\\n'+esc(st)+'"><b>'+esc(m.v==null?'—':m.v)+'</b><span class=albl>'+esc(m.l)+'</span><div class=asub2>'+esc(m.sub)+'<br>'+esc(st)+'</div></div>').join('');
 },
@@ -1370,10 +1379,17 @@ renderDists(){
  const stE=this.STATUS_ORDER.filter(k=>s.byStatus[k]).map(k=>[k,s.byStatus[k]]).concat(Object.entries(s.byStatus).filter(e=>this.STATUS_ORDER.indexOf(e[0])<0));
  const tyE=Object.entries(s.byType).sort((a,b)=>b[1]-a[1]);
  const unE=Object.entries(s.byUnit).sort((a,b)=>b[1]-a[1]);
+ // 第六波 KVWO-108：主要服务商使用率（在册数前 5，口径：在线/在册（快照），null → 「—」）
+ const uTop=(this.units||[]).slice().sort((a,b)=>(b.total||0)-(a.total||0)||String(a.unit).localeCompare(String(b.unit),'zh')).slice(0,5);
+ const uHtml=uTop.length?uTop.map(u=>{
+  const use=u.usageRate==null?null:Math.round(u.usageRate*1000)/10;
+  return '<div class=abar title="'+esc(u.unit)+'：在线 '+(u.online!=null?u.online:'—')+' / 在册 '+(u.total!=null?u.total:'—')+' · 使用率 '+(use==null?'—（不可计算）':use+'%')+'（在线/在册（快照））"><span class=albl2>'+esc(u.unit)+'</span><div class=atrack><i style="width:'+(use==null?0:Math.min(use,100))+'%;--c:#0891b2"></i></div><span class=an>'+(use==null?'—':use+'%')+'</span></div>'
+ }).join(''):'<p class=eempty>暂无单位数据</p>';
  el.innerHTML='<div class=adists>'+
   '<div class=apanel><h3>状态分布（在册 '+(s.total!=null?s.total:'—')+' 台）</h3>'+(stE.length?bars(stE,k=>this.ST_COLOR[k]||'#64748b'):'<p class=eempty>暂无数据</p>')+'</div>'+
   '<div class=apanel><h3>设备类型分布</h3>'+(tyE.length?bars(tyE,k=>this.TYPE_COLOR[k]||'#2563eb',k=>this.shortType(k)):'<p class=eempty>暂无数据</p>')+'</div>'+
   '<div class=apanel><h3>所属单位 TOP 分布</h3>'+(unE.length?bars(unE,null):'<p class=eempty>暂无数据</p>')+'</div>'+
+  '<div class=apanel><h3>主要服务商使用率（在册数前 5）</h3><p class=uhint style="margin:0 0 10px">口径：在线/在册（快照） · 统计时间：'+esc(this.fmtTs(s.lastSync)||'—')+'</p>'+uHtml+'</div>'+
  '</div>';
 },
 /* ---------- 模块 2：硬件台账（筛选/自然排序/360°） ---------- */
@@ -1414,7 +1430,7 @@ ledgerRowHtml(d){
  const c=this.ST_COLOR[d.status]||'#64748b';
  const on=d.online===true?'<span class=aon title=在线>●</span>':d.online===false?'<span class=aoff title=离线>○</span>':'<span class=anull title=未匹配>—</span>';
  const rep=d.openRepairs>0?'<button class=abadge data-gorep="'+esc(d.code)+'" title="点击查看维修看板">'+d.openRepairs+'</button>':'<span class=anull>0</span>';
- const idl=d.idle===true?'<span class=stag style="--c:#7c3aed" title="库存外·超 '+((this.stats&&this.stats.idleDays)!=null?this.stats.idleDays:30)+' 天未上线">闲置</span>':'<span class=anull title="不在闲置口径或不可判定">—</span>';
+ const idl=d.idle===true?'<span class=stag style="--c:#7c3aed" title="库存外·超 '+this.idleDays()+' 天未上线">闲置</span>':'<span class=anull title="不在闲置口径或不可判定">—</span>';
  return '<tr data-code="'+esc(d.code)+'"'+(d.archived?' class=aarch':'')+'><td class=mono>'+esc(d.code.toUpperCase())+'</td><td>'+esc(this.shortType(d.type)||'—')+'</td><td><span class=stag style="--c:'+c+'">'+esc(d.status||'—')+'</span></td><td>'+esc(d.unit||'—')+'</td><td class=wrap title="'+esc(d.parts||'')+'">'+esc(d.parts||'—')+'</td><td class=wrap title="'+esc(d.remark||'')+'">'+esc(d.remark||'—')+'</td><td>'+esc(d.ledgerVer||'—')+'</td><td>'+esc(d.detVer||'—')+'</td><td>'+on+'</td><td>'+idl+'</td><td>'+rep+'</td><td class=mut>'+esc(this.fmtTs(d.updatedAt)||'—')+'</td></tr>'
 },
 renderLedger(){
@@ -1450,7 +1466,7 @@ async open360(code){
   '<span>探测版本</span><b>'+v(dev.detVer)+'</b>'+
   '<span>在线状态</span><b>'+(dev.online===true?'<span style="color:#16a34a">● 在线</span>':dev.online===false?'<span style="color:#dc2626">○ 离线</span>':'—（未匹配）')+'</b>'+
   '<span>最后在线</span><b>'+(dev.lastSeen?esc(this.fmtTs(dev.lastSeen)):'—（从未上线或 fleet 未启用）')+'</b>'+
-  '<span>闲置</span><b>'+(dev.idle===true?'<span style="color:#7c3aed">是（超 '+((this.stats&&this.stats.idleDays)!=null?this.stats.idleDays:30)+' 天未上线）</span>':dev.idle===false?'否':'—（不可判定）')+'</b>'+
+  '<span>闲置</span><b>'+(dev.idle===true?'<span style="color:#7c3aed">是（超 '+this.idleDays()+' 天未上线）</span>':dev.idle===false?'否':'—（不可判定）')+'</b>'+
   '<span>未完结维修</span><b>'+(dev.openRepairs||0)+' 条</b>'+
   '<span>最后更新</span><b>'+v(this.fmtTs(dev.updatedAt))+'</b>'+
   '<span>修改人</span><b>'+v(dev.modifier)+'</b>'+
@@ -1476,10 +1492,12 @@ renderUnits(){
  const inv=this.shanghaiInv();
  el.innerHTML='<div class=aunitgrid>'+us.map(u=>{
   const rate=u.normalRate==null?null:Math.round(u.normalRate*1000)/10;
+  const use=u.usageRate==null?null:Math.round(u.usageRate*1000)/10;
   const st=this.stats||{},isInv=((st.invUnits)||[]).indexOf(u.unit)>=0,icnt=((st.invByUnit)||{})[u.unit];
   return '<div class=aunit data-unit="'+esc(u.unit)+'" title="点击下钻该单位设备列表">'+
    '<div class=auhead><b>'+esc(u.unit)+'</b><span>'+(u.total!=null?u.total:'—')+' 台</span></div>'+
    '<div class=abarate><div class=atrack><i style="width:'+(rate==null?0:Math.min(rate,100))+'%;--c:#16a34a"></i></div><span>'+(rate==null?'—':rate+'%')+' 正常</span></div>'+
+   '<div class="abarate aurate" title="使用率 = frps 在线快照 / 在册（在线 '+(u.online!=null?u.online:'—')+' / '+(u.total!=null?u.total:'—')+'，快照口径；fleet 未启用或无法计算时为 —）"><div class=atrack><i style="width:'+(use==null?0:Math.min(use,100))+'%;--c:#0891b2"></i></div><span>'+(use==null?'—':use+'%')+' 使用率</span></div>'+
    '<div class=aurow>'+this.stagN('维修中',u.repairing)+this.stagN('异常',u.abnormal)+'</div>'+
    (isInv?'<div class=auinv>公司库存单位'+(icnt!=null?' '+icnt+' 台':'')+'（不计一线部署）'+(u.unit==='上海办公室'&&inv?' · 备注细分：未使用 '+inv.unused+' · 新组装 '+inv.newBuild:'')+'</div>':'')+
    '<div class=aumut>最近更新：'+esc(this.fmtTs(u.lastUpdated)||'—')+'</div></div>'
@@ -1510,13 +1528,25 @@ renderVersions(){
  const codeOf=x=>typeof x==='string'?x:String((x&&(x.device_code||x.code||x.hostname))||'');
  const chip=x=>{const s=codeOf(x);return '<span class=chip2 title="'+esc(s)+'">'+esc(s.toUpperCase())+'</span>'};
  const only=v.detectedOnly||[],miss=v.ledgerMissing||[];
+ // 第六波 KVWO-108：主要服务商版本占比（by_provider_top5，在册数前 5；未探测归「未获取」桶如实展示）
+ const t5=v.byProviderTop5||[];
+ const provHtml=t5.length?'<div class=apanel><h3>主要服务商版本占比（在册数前 5）</h3><p class=uhint style="margin:0 0 4px">口径：探测版本（未探测计入「未获取」桶） · 占比 = 台数 / 该单位在册数 · 统计时间：'+esc(this.fmtTs(this.stats&&this.stats.lastSync)||'—')+'</p>'+
+  t5.map(p=>{
+   const vers=(p.versions||[]),vmax=Math.max.apply(null,vers.map(x=>(x&&x.count)||0).concat([1]));
+   return '<h4>'+esc(p.unit)+'（在册 '+(p.total!=null?p.total:'—')+' 台）</h4>'+(vers.length?vers.map(x=>{
+    const c=(x&&x.count)||0,share=(x&&x.share!=null)?x.share:(p.total?c/p.total:null),spct=share==null?'—':(Math.round(share*1000)/10)+'%';
+    const vn=String((x&&x.version)||'—'),isUn=vn==='未获取';
+    return '<div class="abar vbar" title="'+esc(p.unit)+' · '+esc(vn)+'：'+c+' 台（占比 '+spct+'）"><span class="albl2 mono'+(isUn?' mut':'')+'">'+esc(vn)+'</span><div class=atrack><i style="width:'+(c/vmax*100).toFixed(1)+'%;--c:'+(isUn?'#94a3b8':'#2563eb')+'"></i></div><span class=an>'+c+' 台 · '+spct+'</span></div>'
+   }).join(''):'<p class=eempty>该单位暂无版本数据</p>')
+  }).join('')+'</div>':
+  '<div class=apanel><h3>主要服务商版本占比（在册数前 5）</h3><p class=eempty>暂无服务商版本分布数据——版本来自 fleet 在线探测（未探测计入「未获取」桶）；后端 by_provider_top5 就绪后此处自动展示，前端无需改动。</p></div>';
  el.innerHTML='<div class=adists>'+
   '<div class=apanel><h3>探测版本分布（在线设备）</h3>'+(det.length?det.map(x=>'<div class=abar><span class="albl2 mono">'+esc(x.version||'—')+'</span><div class=atrack><i style="width:'+((x.count||0)/dmax*100).toFixed(1)+'%"></i></div><span class=an>'+(x.count||0)+'</span></div>').join(''):'<p class=eempty>暂无探测数据</p>')+'</div>'+
   '<div class=apanel><h3>台账登记版本</h3>'+(v.ledgerEmpty?'<div class=uwarn style="margin:0 0 12px">台账「软件版本」当前全部未登记：<b>'+v.ledgerEmpty+'</b> 台为空（如实展示，待台账补录后此处显示分布）</div>':'')+(led.length?led.map(x=>'<div class=abar><span class="albl2 mono">'+esc(x.version||'—')+'</span><div class=atrack><i style="width:'+((x.count||0)/lmax*100).toFixed(1)+'%;--c:#0f766e"></i></div><span class=an>'+(x.count||0)+'</span></div>').join(''):'<p class=eempty>无已登记版本</p>')+'</div>'+
   '<div class=apanel><h3>台账 × 探测对照</h3><div class=acards3><div><b>'+esc(v.matched!=null?v.matched:'—')+'</b>版本匹配</div><div><b>'+only.length+'</b>在线但台账未登记</div><div><b>'+miss.length+'</b>台账有但探测不到</div></div>'+
   '<h4>detected_only · 在线但台账未登记</h4>'+(only.length?only.map(chip).join(''):'<p class=eempty>无</p>')+
   '<h4>ledger_missing · 台账有但探测不到（离线 / 未部署）</h4>'+(miss.length?'<p class=uhint>共 '+miss.length+' 台</p><details><summary style="cursor:pointer;font-size:12px;color:#2563eb">展开设备列表</summary><div style="margin-top:8px">'+miss.map(chip).join('')+'</div></details>':'<p class=eempty>无</p>')+
-  '<p style="margin-top:14px"><button class=listbtn id=asGoUpg>▶ 前往升级视图（版本批量升级入口）</button></p></div></div>';
+  '<p style="margin-top:14px"><button class=listbtn id=asGoUpg>▶ 前往升级视图（版本批量升级入口）</button></p></div></div>'+provHtml;
  const b=document.getElementById('asGoUpg');if(b)b.onclick=()=>{location.hash='view=upgrade'};
 },
 /* ---------- 维修看板子页签：KVWO-80 Rep.* 看板实装（槽位填充，KVWO-88；全站唯一维修入口） ---------- */
@@ -1569,7 +1599,7 @@ mockData(){
  const byStatus={},byType={},byUnit={};
  for(const s of this.STATUS_ORDER)byStatus[s]=devs.filter(d=>d.status===s).length;
  for(const d of devs){byType[d.device_type]=(byType[d.device_type]||0)+1;byUnit[d.unit]=(byUnit[d.unit]||0)+1}
- // 闲置口径（KVWO-97 需求 4）：库存外·从未上线/超 30 天未上线；mock 确定性抽样
+ // 闲置口径（KVWO-97 需求 4；第六波 KVWO-107 阈值默认 30 → 15）：库存外·从未上线/超 15 天未上线；mock 确定性抽样
  const idleByUnit={};let idleTotal=0;
  for(const d of devs){
   const isInv=d.unit==='上海办公室'||d.unit==='潍坊办公室';
@@ -1581,12 +1611,17 @@ mockData(){
  const invA=(byUnit['上海办公室']||0)+(byUnit['潍坊办公室']||0);
  const invB=devs.filter(d=>(d.unit==='上海办公室'||d.unit==='潍坊办公室')&&String(d.remark||'').indexOf('未使用')>=0).length;
  const det={};for(const d of devs)if(d.detected_version)det[d.detected_version]=(det[d.detected_version]||0)+1;
+ // 第六波 KVWO-107 契约：units 增 online/usage_rate（在线/在册）；versions 增 by_provider_top5（在册数前 5 家，未探测归「未获取」桶，share=count/在册保留两位）
+ const units=UNITS.map(u=>{const us=devs.filter(d=>d.unit===u[0]);const mx=us.reduce((m,d)=>Math.max(m,Date.parse(d.updated_at)||0),0);const onc=us.filter(d=>d.device_online===true).length;return{unit:u[0],total:us.length,online:onc,usage_rate:us.length?onc/us.length:null,normal_rate:us.length?us.filter(d=>d.status==='正常').length/us.length:null,repairing:us.filter(d=>d.status==='维修中').length,abnormal:us.filter(d=>d.status==='异常').length,last_updated:mx?new Date(mx).toISOString():null}});
+ const provTop5=UNITS.slice().sort((a,b)=>b[1]-a[1]||String(a[0]).localeCompare(String(b[0]),'zh')).slice(0,5).map(u=>{
+  const us=devs.filter(d=>d.unit===u[0]),cnt={};
+  for(const d of us){const k=d.detected_version||'未获取';cnt[k]=(cnt[k]||0)+1}
+  return{unit:u[0],total:us.length,versions:Object.entries(cnt).sort((x,y)=>y[1]-x[1]).map(e=>({version:e[0],count:e[1],share:Math.round(e[1]/us.length*100)/100}))}});
  const lastSync=new Date(base+5*60000).toISOString();
- const units=UNITS.map(u=>{const us=devs.filter(d=>d.unit===u[0]);const mx=us.reduce((m,d)=>Math.max(m,Date.parse(d.updated_at)||0),0);return{unit:u[0],total:us.length,normal_rate:us.length?us.filter(d=>d.status==='正常').length/us.length:null,repairing:us.filter(d=>d.status==='维修中').length,abnormal:us.filter(d=>d.status==='异常').length,last_updated:mx?new Date(mx).toISOString():null}});
  this._mockCache={devices:devs,archived:arch,lastSync:lastSync,
-  stats:{registered_total:devs.length,archived_total:arch.length,inventory:{total:invA,by_unit:{'上海办公室':byUnit['上海办公室']||0,'潍坊办公室':byUnit['潍坊办公室']||0},units:['上海办公室','潍坊办公室'],unused_note:invB},deployed:devs.length-invA,idle:{total:idleTotal,threshold_days:30,by_unit:idleByUnit},by_status:byStatus,by_type:byType,by_unit:byUnit,repair_rate:(byStatus['维修中']+byStatus['待维修'])/devs.length,damage_rate:(byStatus['异常']+byStatus['维修中']+byStatus['待维修'])/devs.length,last_sync_at:lastSync},
+  stats:{registered_total:devs.length,archived_total:arch.length,inventory:{total:invA,by_unit:{'上海办公室':byUnit['上海办公室']||0,'潍坊办公室':byUnit['潍坊办公室']||0},units:['上海办公室','潍坊办公室'],unused_note:invB},deployed:devs.length-invA,idle:{total:idleTotal,threshold_days:15,by_unit:idleByUnit},by_status:byStatus,by_type:byType,by_unit:byUnit,repair_rate:(byStatus['维修中']+byStatus['待维修'])/devs.length,damage_rate:(byStatus['异常']+byStatus['维修中']+byStatus['待维修'])/devs.length,last_sync_at:lastSync},
   units:units,
-  versions:{detected:Object.entries(det).map(e=>({version:e[0],count:e[1]})),ledger:[],ledger_empty:devs.length,matched:devs.filter(d=>d.detected_version).length,detected_only:[{device_code:'ep-900201',version:'v0.5.0'},{device_code:'EP-900202',version:'v0.4.6'},{device_code:'EP-900203',version:'v0.5.0'}],ledger_missing:devs.filter(d=>!d.detected_version).map(d=>d.device_code)}};
+  versions:{detected:Object.entries(det).map(e=>({version:e[0],count:e[1]})),ledger:[],ledger_empty:devs.length,matched:devs.filter(d=>d.detected_version).length,detected_only:[{device_code:'ep-900201',version:'v0.5.0'},{device_code:'EP-900202',version:'v0.4.6'},{device_code:'EP-900203',version:'v0.5.0'}],ledger_missing:devs.filter(d=>!d.detected_version).map(d=>d.device_code),by_provider_top5:provTop5}};
  return this._mockCache;
 },
 mockDetail(dev){
