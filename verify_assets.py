@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""资产多表同步与聚合 API 验证脚本（KVWO-83）。
+"""资产多表同步与聚合 API 验证脚本（KVWO-83；KVWO-97 增补日报/口径/标题）。
 
 两部分：
 1. 单测（不依赖服务、不依赖 lark-cli）：
@@ -9,12 +9,17 @@
      小数/脏值）、text 与各形态空值 → None。
    - AssetStore：record_id 幂等 upsert、删除飞书已删记录、按表隔离的
      同步错误状态。
-   - stats 口径（库存 A/B、deployed、维修率、损坏率）、units 聚合、
-     versions 匹配（matched / ledger_missing / detected_only）、
-     单设备 360° 三源关联（编号匹配 + link 双路 + 单位模糊）。
+   - stats 口径（KVWO-97：库存 = 上海办公室+潍坊办公室分单位明细，服务商
+     不计；deployed、维修率、损坏率）、units 聚合、versions 匹配
+     （matched / ledger_missing / detected_only）、单设备 360° 三源关联
+     （编号匹配 + link 双路 + 单位模糊）。
+   - 资产日报（KVWO-97）：库存单位清单/推送时刻解析、下一调度时刻、日报
+     文案（四项指标+数据时间+同步异常提示）、webhook 成功/失败判定
+     （monkeypatch，不发真实请求）、面板标题兑底与 <title>/<h1> 同源。
 2. 在线校验（--base http://127.0.0.1:9100）：与 lark-cli 直查 5 表结果
    比对同步计数/字段值/统计口径/单位聚合/版本匹配，幂等、筛选、详情、
-   404、device_online/detected_version/active_repairs 联动一致性。
+   404、device_online/detected_version/active_repairs 联动一致性；
+   日报状态端点/手动推送文案与首页标题一致性。
 
 用法：
   python3 verify_assets.py                     # 仅单测
@@ -175,7 +180,8 @@ def unit_store_tests(srv):
 def unit_stats_tests(srv):
     print("[3] stats / units / versions 口径单测（合成数据）")
     # 合成在册数据：11 台 → 正常 8 / 异常 1 / 维修中 1 / 待维修 1
-    # 单位：上海办公室 5（其中备注「未使用」2）、潍坊办公室 6
+    # 单位：上海办公室 5（其中备注「未使用」2）、潍坊办公室 3、潍坊构元服务商 3
+    # （库存口径：上海+潍坊均为公司库存；服务商持有不计库存，计入一线部署）
     devices = {}
     for i in range(1, 9):
         devices[f"rec{i}"] = {"device_no": f"EP-00000{i}", "device_type": "EgoPortal-Stereo-V0",
@@ -184,10 +190,13 @@ def unit_stats_tests(srv):
                               "note": "未使用" if i <= 2 else None, "software_version": None,
                               "modified_by": None, "updated_at": "2026-09-01T00:00:00.000+08:00"}
     devices["rec9"] = dict(devices["rec8"], device_no="EP-000009", status="异常",
+                           unit="潍坊构元服务商",
                            updated_at="2026-09-02T00:00:00.000+08:00")
     devices["rec10"] = dict(devices["rec8"], device_no="EP-000010", status="维修中",
+                            unit="潍坊构元服务商",
                             updated_at="2026-09-03T00:00:00.000+08:00")
     devices["rec11"] = dict(devices["rec8"], device_no="EP-000011", status="待维修",
+                            unit="潍坊构元服务商",
                             updated_at="2026-09-04T00:00:00.000+08:00")
     srv.asset_store.replace_all("devices", devices, synced_at=1.0)
     srv.asset_store.replace_all("archived", {"recA": dict(devices["rec1"], device_no="EP-900001")},
@@ -209,9 +218,12 @@ def unit_stats_tests(srv):
     stats = srv.assets_stats_view()
     check("registered_total 在册=设备明细", stats["registered_total"] == 11)
     check("archived_total 归档不计入在册", stats["archived_total"] == 1)
-    check("库存口径 A（上海办公室）", stats["inventory"]["unit_shanghai"] == 5)
-    check("库存口径 B（备注含未使用）", stats["inventory"]["unused_note"] == 2)
-    check("deployed = 在册 − 库存A", stats["deployed"] == 6)
+    check("库存口径（上海+潍坊分单位明细，服务商不计）",
+          stats["inventory"]["total"] == 8
+          and stats["inventory"]["by_unit"] == {"上海办公室": 5, "潍坊办公室": 3}
+          and stats["inventory"]["units"] == ["上海办公室", "潍坊办公室"])
+    check("库存口径 B（备注含未使用，仅参考）", stats["inventory"]["unused_note"] == 2)
+    check("deployed = 在册 − 库存（服务商持有计部署）", stats["deployed"] == 3)
     check("维修率 = (维修中+待维修)/在册", abs(stats["repair_rate"] - 2 / 11) < 5e-5,
           str(stats["repair_rate"]))
     check("损坏率 = (异常+维修中+待维修)/在册", abs(stats["damage_rate"] - 3 / 11) < 5e-5,
@@ -220,14 +232,17 @@ def unit_stats_tests(srv):
 
     units = srv.assets_units_view()
     by_unit = {u["unit"]: u for u in units}
-    check("units 两单位聚合", set(by_unit) == {"上海办公室", "潍坊办公室"})
+    check("units 三单位聚合", set(by_unit) ==
+          {"上海办公室", "潍坊办公室", "潍坊构元服务商"})
     check("单位设备数", by_unit["上海办公室"]["total"] == 5
-          and by_unit["潍坊办公室"]["total"] == 6)
-    check("正常率", abs(by_unit["潍坊办公室"]["normal_rate"] - 3 / 6) < 5e-5,
+          and by_unit["潍坊办公室"]["total"] == 3
+          and by_unit["潍坊构元服务商"]["total"] == 3)
+    check("正常率", abs(by_unit["潍坊办公室"]["normal_rate"] - 1.0) < 5e-5,
           str(by_unit["潍坊办公室"]["normal_rate"]))
     check("维修中=维修中+待维修 / 异常数",
-          by_unit["潍坊办公室"]["repairing"] == 2 and by_unit["潍坊办公室"]["abnormal"] == 1)
-    check("最近更新时间取最大", by_unit["潍坊办公室"]["last_updated"]
+          by_unit["潍坊构元服务商"]["repairing"] == 2
+          and by_unit["潍坊构元服务商"]["abnormal"] == 1)
+    check("最近更新时间取最大", by_unit["潍坊构元服务商"]["last_updated"]
           == "2026-09-04T00:00:00.000+08:00")
 
     # versions：快照 mock（大小写混杂），MySQL 台账未启用 → registered 空
@@ -269,6 +284,42 @@ def unit_stats_tests(srv):
           items["EP-000010"]["active_repairs"] == 2
           and items["EP-000009"]["active_repairs"] == 0
           and items["EP-000001"]["active_repairs"] == 0)
+
+    # 闲置口径（KVWO-97 需求 4）：库存外·超 30 天未上线（含从未上线）
+    from datetime import datetime as _dt, timedelta as _td
+    check("fleet 库未启用 → idle.total 如实为 None（不合成）",
+          stats["idle"]["total"] is None
+          and stats["idle"]["threshold_days"] == 30
+          and srv._device_idle("EP-000001", "上海办公室", None) is None)
+    now = _dt.now()
+    fmt = lambda d: d.strftime("%Y-%m-%d %H:%M")
+    seen_40d, seen_now, seen_3d = fmt(now - _td(days=40)), fmt(now), fmt(now - _td(days=3))
+    fake_seen = {"ep-000001": seen_40d,   # 库存（上海）超 30 天未上线 → 不算闲置
+                 "ep-000002": seen_now,    # 库存（上海）刚在线 → 不算
+                 "ep-000009": seen_3d}    # 服务商 3 天前在线 → 不算；其余无记录=从未上线
+    orig_ls = srv._fleet_last_seen
+    srv._fleet_last_seen = lambda: fake_seen
+    try:
+        st2 = srv.assets_stats_view()
+        items2 = {i["device_no"]: i for i in srv.assets_list_view({})}
+        arch2 = {i["device_no"]: i for i in srv.assets_list_view({"include_archived": "1"})
+                 if i["archived"]}
+    finally:
+        srv._fleet_last_seen = orig_ls
+    check("闲置=库存外从未上线/超阈值；库存设备即使从未上线也不算",
+          st2["idle"]["total"] == 2                      # rec10/rec11（服务商，从未上线）
+          and st2["idle"]["by_unit"] == {"潍坊构元服务商": 2}
+          and items2["EP-000010"]["idle"] is True       # 从未上线 → 闲置
+          and items2["EP-000001"]["idle"] is False      # 库存超 30 天未上线 → 不算
+          and items2["EP-000006"]["idle"] is False)     # 库存从未上线 → 不算（边界）
+    check("最近在线不闲置（3 天前）+ last_seen 原样返回",
+          items2["EP-000009"]["idle"] is False
+          and items2["EP-000009"]["last_seen"] == seen_3d
+          and items2["EP-000010"]["last_seen"] is None)
+    check("归档设备 idle=null（在册口径外）", arch2["EP-900001"]["idle"] is None)
+    text3 = srv.feishu_report_text(st2, now=_dt(2026, 10, 21, 9, 0))
+    check("日报文案：闲置行（数量+口径）",
+          "闲置：2 台（库存外超 30 天未上线，含从未上线）" in text3)
 
 
 def unit_detail_tests(srv):
@@ -316,12 +367,160 @@ def unit_detail_tests(srv):
           and srv.ASSET_TABLES["devices"]["table_id"] in detail["feishu_url"])
 
 
+def unit_report_tests(srv):
+    print("[4] 资产日报推送与面板标题单测（文案/调度/标题，不发真实请求）")
+    from datetime import datetime as _dt
+
+    # 配置解析：库存单位清单 / 推送时刻（与采集时长调度同模式）
+    check("库存单位清单：空/默认 → 上海+潍坊",
+          srv._parse_unit_list("") == ["上海办公室", "潍坊办公室"]
+          and srv._parse_unit_list("上海办公室,潍坊办公室") == ["上海办公室", "潍坊办公室"])
+    check("库存单位清单：env 扩展 + 去重保序",
+          srv._parse_unit_list(" 上海办公室 , 苏州项目组 ,潍坊办公室,苏州项目组, ")
+          == ["上海办公室", "苏州项目组", "潍坊办公室"])
+    check("推送时刻解析：默认 09:00 / 多时刻 / 非法项忽略",
+          srv._parse_report_slots("") == [(9, 0)]
+          and srv._parse_report_slots("09:00,21:30") == [(9, 0), (21, 30)]
+          and srv._parse_report_slots("9:00,25:00,xx,,09:00") == [(9, 0)])
+    check("下一推送时刻：当日未到取当日 / 已过滚存次日",
+          srv._next_report_slot(_dt(2026, 10, 21, 8, 59, 30)) == _dt(2026, 10, 21, 9, 0)
+          and srv._next_report_slot(_dt(2026, 10, 21, 9, 0, 0)) == _dt(2026, 10, 22, 9, 0))
+    check("webhook 未配置时调度线程直接退出（置空=关闭）",
+          srv.FEISHU_WEBHOOK == "" and srv._feishu_report_loop() is None)
+
+    # 日报文案：沿用 unit_stats_tests 落库的合成数据（在册 11/库存 8/部署 3）
+    stats = srv.assets_stats_view()
+    text = srv.feishu_report_text(stats, now=_dt(2026, 10, 21, 9, 0))
+    check("日报文案：库存合计 + 分单位 + 口径说明",
+          "库存：8 台（上海办公室 5 台 + 潍坊办公室 3 台）" in text
+          and "服务商等其他单位持有不计库存" in text)
+    check("日报文案：在册 / 部署 / 归档不计在册",
+          "在册硬件：11 台（一线部署 3 台；另有归档 1 台不计在册）" in text)
+    check("日报文案：维修率 / 损坏率（分母在册）",
+          "维修率：18.2%（维修中 1 台 + 待维修 1 台，分母在册 11 台）" in text
+          and "损坏率：27.3%（异常 1 台 + 维修中 1 台 + 待维修 1 台，分母在册 11 台）" in text)
+    check("日报文案：数据时间取最近一次成功同步",
+          "数据时间：" in text and "（飞书台账最近一次成功同步）" in text
+          and "同步异常" not in text)
+    srv.asset_store.set_error("devices", "boom")   # 同步异常须如实提示
+    text2 = srv.feishu_report_text(srv.assets_stats_view(), now=_dt(2026, 10, 21, 9, 0))
+    check("同步异常时日报如实提示（不吞错）",
+          "⚠ 飞书同步异常" in text2 and "boom" in text2)
+
+    # webhook 成功/失败判定：monkeypatch urlopen，不发真实请求
+    calls = []
+
+    class _Resp:
+        status = 200
+
+        def read(self, n=-1):
+            return b'{"code":0,"msg":"success"}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _ok_open(req, timeout=None):
+        calls.append(req)
+        return _Resp()
+
+    def _fail_open(req, timeout=None):
+        raise srv.URLError("no route to host")
+
+    orig_open, orig_hook = srv.urlopen, srv.FEISHU_WEBHOOK
+    srv.FEISHU_WEBHOOK = "https://example.invalid/hook"
+    try:
+        srv.urlopen = _ok_open
+        ok1, code1, _ = srv._feishu_webhook_post("hello", attempts=2)
+        calls_after_post = len(calls)
+        out = srv.run_feishu_report("manual")
+        srv.urlopen = _fail_open
+        ok2, code2, _ = srv._feishu_webhook_post("hello", attempts=2)
+    finally:
+        srv.urlopen, srv.FEISHU_WEBHOOK = orig_open, orig_hook
+    check("webhook 成功判定（HTTP 200 + 业务码 0，不重试）",
+          ok1 is True and code1 == 200 and calls_after_post == 1
+          and len(calls) == 2)   # run_feishu_report 复用同一判定链路再推一条
+    check("webhook 失败退避重试后如实返回失败（绝不抛出）",
+          ok2 is False and code2 is None)
+    check("run_feishu_report：记录状态并回显全文",
+          out["ok"] is True and out["reason"] == "manual"
+          and "在册硬件：11 台" in out["text"]
+          and srv._feishu_report_state["last"]["ok"] is True)
+
+    # 签名校验（群机器人开启签名时必需，实测未签名会被拒 code=19021）
+    import base64 as _b64, hashlib as _hl, hmac as _hmac, time as _time
+    ts = "1761021000"
+    expect_sign = _b64.b64encode(_hmac.new(f"{ts}\n/test-secret".encode(),
+                                         digestmod=_hl.sha256).digest()).decode()
+    check("签名算法与飞书官方一致（key=timestamp\nsecret，空消息体）",
+          srv._feishu_webhook_sign("/test-secret", ts) == expect_sign)
+
+    bodies = []
+
+    def _sign_open(req, timeout=None):
+        bodies.append(json.loads(req.data.decode("utf-8")))
+        return _Resp()
+
+    class _Resp19021(_Resp):
+        def read(self, n=-1):
+            return b'{"code":19021,"msg":"sign match fail or timestamp is not within one hour"}'
+
+    def _open_19021(req, timeout=None):
+        bodies.append(json.loads(req.data.decode("utf-8")))
+        return _Resp19021()
+
+    orig_secret = srv.FEISHU_WEBHOOK_SECRET
+    srv.FEISHU_WEBHOOK = "https://example.invalid/hook"
+    try:
+        srv.FEISHU_WEBHOOK_SECRET = ""     # 未配密钥：不带签名字段
+        srv.urlopen = _sign_open
+        ok_ns, _, _ = srv._feishu_webhook_post("hi", attempts=1)
+        unsigned = dict(bodies[-1])
+        srv.FEISHU_WEBHOOK_SECRET = "/test-secret"
+        ok3, _, _ = srv._feishu_webhook_post("hi", attempts=2)
+        n_ok = len(bodies)
+        srv.urlopen = _open_19021
+        ok4, code4, detail4 = srv._feishu_webhook_post("hi", attempts=3)
+        n_19021 = len(bodies) - n_ok
+    finally:
+        srv.urlopen, srv.FEISHU_WEBHOOK_SECRET = orig_open, orig_secret
+        srv.FEISHU_WEBHOOK = orig_hook
+    sent = bodies[n_ok - 1]   # 最后一次成功签名推送的载荷
+    check("未配密钥时不带 timestamp/sign 字段（关闭签名校验的机器人可用）",
+          ok_ns is True and unsigned.get("msg_type") == "text"
+          and "sign" not in unsigned and "timestamp" not in unsigned)
+    check("配密钥后载荷带 timestamp+sign（官方算法）",
+          ok3 is True and sent.get("timestamp") and sent.get("sign")
+          and sent["msg_type"] == "text"
+          and abs(int(sent["timestamp"]) - int(_time.time())) < 60)
+    check("code=19021 → 明示签名问题且不空转重试（1 次即停）",
+          ok4 is False and code4 == 200 and "19021" in detail4
+          and "签名" in detail4 and n_19021 == 1)
+
+    # 面板标题：env 未设 → 兑底值；模板标签与页头一致
+    title = srv.panel_title()
+    check("面板标题：env 未设时用兑底值（台账全称）",
+          title == (srv.PANEL_TITLE_ENV or srv.PANEL_TITLE_FALLBACK)
+          and title == "设备库存与流转管理")
+    doc = srv.INDEX.format(css="", js="", title=title)
+    check("首页模板：<title> 与 <h1> 同源一致",
+          f"<title>{title}</title>" in doc and f"<h1>{title}</h1>" in doc)
+    check("Base 名称浅层解析（lark 返回 JSON）",
+          srv._find_base_name({"data": {"app": {"name": "设备库存与流转管理"}}})
+          == "设备库存与流转管理"
+          and srv._find_base_name({"data": {"tables": [{"name": "设备明细"}]}}) is None)
+
+
 def unit_tests():
     import server as srv
     unit_parse_tests(srv)
     unit_store_tests(srv)
     unit_stats_tests(srv)
     unit_detail_tests(srv)
+    unit_report_tests(srv)
 
 
 # ---------------------------------------------------------------- 在线校验 --
@@ -432,20 +631,30 @@ def online_tests(base):
           and get_json(f"{base}/api/assets?include_archived=1")["total"]
           == len(dev_parsed) + len(parsed["archived"]))
 
-    # stats 口径与直查一致
+    # stats 口径与直查一致（KVWO-97：库存 = 上海+潍坊，服务商不计）
     stats = get_json(f"{base}/api/assets/stats")
     n = len(dev_parsed)
     arch_n = len(parsed["archived"])
-    inv_a = sum(1 for r in dev_parsed.values() if r["unit"] == "上海办公室")
+    inv_units = ["上海办公室", "潍坊办公室"]   # 提出人确认口径（env 可扩展）
+    inv_by_unit = {u: sum(1 for r in dev_parsed.values() if r["unit"] == u)
+                   for u in inv_units}
+    inv_total = sum(inv_by_unit.values())
     inv_b = sum(1 for r in dev_parsed.values() if "未使用" in (r["note"] or ""))
     repairing = sum(1 for r in dev_parsed.values() if r["status"] in ("维修中", "待维修"))
     damaged = sum(1 for r in dev_parsed.values() if r["status"] in ("异常", "维修中", "待维修"))
     check("stats.registered_total", stats["registered_total"] == n)
     check("stats.archived_total", stats["archived_total"] == arch_n)
-    check("stats.inventory 口径 A/B",
-          stats["inventory"]["unit_shanghai"] == inv_a
+    check("stats.inventory 口径（上海+潍坊分单位，服务商不计）",
+          stats["inventory"]["total"] == inv_total
+          and stats["inventory"]["by_unit"] == inv_by_unit
+          and stats["inventory"]["units"] == inv_units
           and stats["inventory"]["unused_note"] == inv_b)
-    check("stats.deployed = 在册 − 库存A", stats["deployed"] == n - inv_a)
+    check("stats.deployed = 在册 − 库存", stats["deployed"] == n - inv_total)
+    check("stats.idle 形状与台账列表联动（KVWO-97 需求 4）",
+          stats["idle"]["threshold_days"] >= 1
+          and (stats["idle"]["total"] is None
+               or stats["idle"]["total"] == sum(1 for i in listing["items"]
+                                               if i.get("idle") is True)))
     check("stats.repair_rate / damage_rate",
           abs(stats["repair_rate"] - repairing / n) < 5e-4
           and abs(stats["damage_rate"] - damaged / n) < 5e-4)
@@ -455,8 +664,50 @@ def online_tests(base):
                                    for k in {r["device_type"] or "" for r in dev_parsed.values()}}
           and stats["by_unit"] == {k: sum(1 for r in dev_parsed.values() if r["unit"] == k)
                                    for k in {r["unit"] or "" for r in dev_parsed.values()}})
-    print(f"    · 基线参考：在册 {n}、归档 {arch_n}、库存A {inv_a}、"
-          f"维修率 {repairing}/{n}、损坏率 {damaged}/{n}")
+    print(f"    · 基线参考：在册 {n}、归档 {arch_n}、库存 {inv_total}"
+          f"（{' + '.join(f'{u} {c}' for u, c in inv_by_unit.items())}）、"
+          f"部署 {n - inv_total}、维修率 {repairing}/{n}、损坏率 {damaged}/{n}")
+
+    # 日报推送（KVWO-97）：状态端点 + 手动触发（enabled 时真推 webhook）
+    rep = get_json(f"{base}/api/assets/report")
+    check("report 状态端点：时刻/库存口径/标题齐备，不回显 webhook",
+          set(rep) >= {"enabled", "times", "next_run_at", "last",
+                       "inventory_units", "panel_title"}
+          and rep["inventory_units"] == inv_units and rep["times"]
+          and rep["panel_title"] and "webhook" not in rep)
+    if rep["enabled"]:
+        push_req = urllib.request.Request(f"{base}/api/assets/report/run",
+                                          method="POST", data=b"")
+        with urllib.request.urlopen(push_req, timeout=120) as resp:
+            push = json.loads(resp.read())
+        txt = push.get("text") or ""
+        check("手动推送成功且文案齐全（四项指标+数据时间+分单位）",
+              push.get("ok") is True
+              and all(k in txt for k in ("库存：", "在册硬件：", "维修率：",
+                                        "损坏率：", "数据时间："))
+              and f"上海办公室 {inv_by_unit['上海办公室']} 台" in txt
+              and f"潍坊办公室 {inv_by_unit['潍坊办公室']} 台" in txt
+              and f"一线部署 {n - inv_total} 台" in txt)
+        rep2 = get_json(f"{base}/api/assets/report")
+        check("推送结果状态可查（last.ok）",
+              (rep2.get("last") or {}).get("ok") is True
+              and rep2["last"]["reason"] == "manual")
+    else:
+        push_req = urllib.request.Request(f"{base}/api/assets/report/run",
+                                          method="POST", data=b"")
+        try:
+            with urllib.request.urlopen(push_req, timeout=60) as resp:
+                push_code = resp.status
+        except urllib.error.HTTPError as exc:
+            push_code = exc.code
+        check("未配置 webhook 时手动推送如实拒绝（400，不盲发）", push_code == 400)
+
+    # 面板更名（KVWO-97）：浏览器标签与页头一致，均为台账全称
+    title = rep["panel_title"]
+    _, _, body = get(base + "/")
+    doc = body.decode("utf-8", "replace")
+    check("面板标题：浏览器标签与页头一致（台账全称）",
+          f"<title>{title}</title>" in doc and f"<h1>{title}</h1>" in doc)
 
     # units 聚合
     units = get_json(f"{base}/api/assets/units")["units"]
@@ -466,7 +717,7 @@ def online_tests(base):
           and len(units) == len({r["unit"] or "(未填写)" for r in dev_parsed.values()}))
     check("units 设备数合计 = 在册", units_total == n)
     u0 = next(u for u in units if u["unit"] == "上海办公室")
-    check("上海办公室聚合与库存口径 A 一致", u0["total"] == inv_a)
+    check("上海办公室聚合与库存分单位一致", u0["total"] == inv_by_unit["上海办公室"])
 
     # versions：台账版本计数与直查一致；匹配恒等式
     ver = get_json(f"{base}/api/assets/versions")
