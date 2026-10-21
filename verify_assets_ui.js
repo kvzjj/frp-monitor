@@ -40,6 +40,7 @@ const intervals = [];
 const fetchLog = [];
 const fetchMock = async (path) => {
   fetchLog.push(path);
+  if (path === '/api/assets/report/run') return { status: 200, ok: true, json: async () => ({ ok: true, reason: 'manual', at: 1761072000, text: '【设备库存与流转管理 · 资产日报】测试\n库存：149 台（上海办公室 94 台 + 潍坊办公室 55 台）\n闲置：2 台（库存外超 30 天未上线，含从未上线）' }) };
   if (path.startsWith('/api/assets')) return { status: 404, ok: false, json: async () => null };
   if (path.startsWith('/api/hosts')) return { status: 502, ok: false, json: async () => ({ error: 'frps 不可用' }) };
   return { status: 404, ok: false, json: async () => null };
@@ -72,6 +73,11 @@ const ok = (name, cond) => { if (!cond) { console.error('FAIL: ' + name); proces
   ok('指标卡：损坏率 8.5% 带计算式', met.includes('8.5%') && met.includes('(异常 8 + 维修中 10 + 待维修 3) / 在册 248'));
   ok('指标卡：闲置卡（超 30 天未上线口径）', met.includes('闲置') && met.includes('超 30 天未上线（含从未上线）') && met.includes('>' + A.stats.idleTotal + '<'));
   ok('指标卡：统计时间 last_sync_at', met.includes('统计时间'));
+  // 日报手动推送按钮（KVWO-97 评论区要求）：点击 → POST /api/assets/report/run → 状态 + 弹窗全文
+  A.setTab('dashboard');
+  await A.pushReport();
+  ok('推送按钮：成功后状态提示 + 弹窗展示消息全文', el('asReportState').textContent.includes('已推送（manual') && el('modalBody').innerHTML.includes('rptext') && el('modalBody').innerHTML.includes('闲置：2 台'));
+  ok('推送按钮：请求打到 /api/assets/report/run（POST）', fetchLog.includes('/api/assets/report/run'));
   const dist = el('asDists').innerHTML;
   ok('分布图：状态/类型/单位三组', dist.includes('状态分布') && dist.includes('设备类型分布') && dist.includes('所属单位 TOP 分布'));
   ok('分布图：类型短名', dist.includes('Stereo-V0') && dist.includes('Lite'));
