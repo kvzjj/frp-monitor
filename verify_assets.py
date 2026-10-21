@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""资产多表同步与聚合 API 验证脚本（KVWO-83；KVWO-97 增补日报/口径/标题）。
+"""资产多表同步与聚合 API 验证脚本（KVWO-83；KVWO-97 增补日报/口径/标题；
+KVWO-107 第六波：闲置默认 15 天 + units 使用率 + versions 前 5 服务商版本占比）。
 
 两部分：
 1. 单测（不依赖服务、不依赖 lark-cli）：
@@ -14,7 +15,8 @@
      （matched / ledger_missing / detected_only）、单设备 360° 三源关联
      （编号匹配 + link 双路 + 单位模糊）。
    - 资产日报（KVWO-97）：库存单位清单/推送时刻解析、下一调度时刻、日报
-     文案（四项指标+数据时间+同步异常提示）、webhook 成功/失败判定
+     文案（四项指标 + KVWO-107 追加的主要服务商使用率/版本占比两段 +
+     数据时间 + 同步异常提示）、webhook 成功/失败判定
      （monkeypatch，不发真实请求）、面板标题兑底与 <title>/<h1> 同源。
 2. 在线校验（--base http://127.0.0.1:9100）：与 lark-cli 直查 5 表结果
    比对同步计数/字段值/统计口径/单位聚合/版本匹配，幂等、筛选、详情、
@@ -253,6 +255,7 @@ def unit_stats_tests(srv):
     srv.get_snapshot = lambda: (snap_hosts, 0.0)
     try:
         ver = srv.assets_versions_view()
+        units_snap = srv.assets_units_view()
     finally:
         srv.get_snapshot = orig
     check("探测版本计数（未获取单列一桶）",
@@ -266,6 +269,26 @@ def unit_stats_tests(srv):
     check("detected_only = 探测 − 在册 − 归档", mc["detected_only"] == 1
           and ver["match"]["detected_only"] == ["ep-999999"])
     check("matched + ledger_missing = 在册总数", mc["matched"] + mc["ledger_missing"] == 11)
+
+    # units 使用率（KVWO-107 第六波）：frps 在线快照数 / 在册，大小写不敏感
+    by_unit_snap = {u["unit"]: u for u in units_snap}
+    check("units.online/usage_rate = 在线快照数/在册（快照大写也命中）",
+          by_unit_snap["上海办公室"]["online"] == 2      # ep-000001 + EP-000002
+          and abs(by_unit_snap["上海办公室"]["usage_rate"] - 0.4) < 5e-5
+          and by_unit_snap["潍坊办公室"]["online"] == 0
+          and by_unit_snap["潍坊办公室"]["usage_rate"] == 0.0
+          and by_unit_snap["潍坊构元服务商"]["usage_rate"] == 0.0)
+    # by_provider_top5：在册数降序、并列按单位名稳定；未探测/空版本归「未获取」
+    top5 = ver["by_provider_top5"]
+    check("by_provider_top5 排序（在册降序、并列按单位名，不足 5 家如实全列）",
+          [t["unit"] for t in top5] == ["上海办公室", "潍坊办公室", "潍坊构元服务商"]
+          and [t["total"] for t in top5] == [5, 3, 3])
+    check("by_provider_top5 版本分桶（计数降序）+ share=数量/在册（两位小数）",
+          top5[0]["versions"] == [{"version": "未获取", "count": 4, "share": 0.8},
+                                 {"version": "v1.0.0", "count": 1, "share": 0.2}]
+          and top5[1]["versions"] == [{"version": "未获取", "count": 3, "share": 1.0}]
+          and all(sum(v["count"] for v in t["versions"]) == t["total"]
+                  for t in top5))
 
     # 列表联动：device_online / detected_version / active_repairs（大小写不敏感）
     srv.get_snapshot = lambda: (snap_hosts, 0.0)
@@ -285,16 +308,18 @@ def unit_stats_tests(srv):
           and items["EP-000009"]["active_repairs"] == 0
           and items["EP-000001"]["active_repairs"] == 0)
 
-    # 闲置口径（KVWO-97 需求 4）：库存外·超 30 天未上线（含从未上线）
+    # 闲置口径（KVWO-97 需求 4）：库存外·超阈值天数未上线（含从未上线）；
+    # 第六波（KVWO-107）：默认 30 → 15 天，env 覆盖机制保留
     from datetime import datetime as _dt, timedelta as _td
-    check("fleet 库未启用 → idle.total 如实为 None（不合成）",
+    check("fleet 库未启用 → idle.total 如实为 None（不合成）；默认阈值 15",
           stats["idle"]["total"] is None
-          and stats["idle"]["threshold_days"] == 30
+          and stats["idle"]["threshold_days"] == 15
+          and srv.IDLE_DAYS == 15
           and srv._device_idle("EP-000001", "上海办公室", None) is None)
     now = _dt.now()
     fmt = lambda d: d.strftime("%Y-%m-%d %H:%M")
     seen_40d, seen_now, seen_3d = fmt(now - _td(days=40)), fmt(now), fmt(now - _td(days=3))
-    fake_seen = {"ep-000001": seen_40d,   # 库存（上海）超 30 天未上线 → 不算闲置
+    fake_seen = {"ep-000001": seen_40d,   # 库存（上海）超阈值未上线 → 不算闲置
                  "ep-000002": seen_now,    # 库存（上海）刚在线 → 不算
                  "ep-000009": seen_3d}    # 服务商 3 天前在线 → 不算；其余无记录=从未上线
     orig_ls = srv._fleet_last_seen
@@ -310,7 +335,7 @@ def unit_stats_tests(srv):
           st2["idle"]["total"] == 2                      # rec10/rec11（服务商，从未上线）
           and st2["idle"]["by_unit"] == {"潍坊构元服务商": 2}
           and items2["EP-000010"]["idle"] is True       # 从未上线 → 闲置
-          and items2["EP-000001"]["idle"] is False      # 库存超 30 天未上线 → 不算
+          and items2["EP-000001"]["idle"] is False      # 库存超阈值未上线 → 不算
           and items2["EP-000006"]["idle"] is False)     # 库存从未上线 → 不算（边界）
     check("最近在线不闲置（3 天前）+ last_seen 原样返回",
           items2["EP-000009"]["idle"] is False
@@ -318,17 +343,18 @@ def unit_stats_tests(srv):
           and items2["EP-000010"]["last_seen"] is None)
     check("归档设备 idle=null（在册口径外）", arch2["EP-900001"]["idle"] is None)
     text3 = srv.feishu_report_text(st2, now=_dt(2026, 10, 21, 9, 0))
-    check("日报文案：闲置行（数量+口径）",
-          "闲置：2 台（库存外超 30 天未上线，含从未上线）" in text3)
-    # 30 天边界：口径「超过 30 天」为严格大于——恰好 30 天整不算，超出即算
+    check("日报文案：闲置行（数量+口径，阈值随默认值 15）",
+          "闲置：2 台（库存外超 15 天未上线，含从未上线）" in text3)
+    # 15 天边界（KVWO-107 默认）：「超过 15 天」为严格大于——恰好 15 天整
+    # 不算，超出即算
     bnow = _dt(2026, 10, 21, 9, 0)
-    seen_30d = fmt(bnow - _td(days=30))                     # 恰好 30 天整 → 不算
-    seen_30d1m = fmt(bnow - _td(days=30) - _td(minutes=1))  # 30 天 + 1 分钟 → 算
-    check("30 天边界：恰好 30 天整不算闲置，超过即算（严格 >）",
+    seen_15d = fmt(bnow - _td(days=15))                     # 恰好 15 天整 → 不算
+    seen_15d1m = fmt(bnow - _td(days=15) - _td(minutes=1))  # 15 天 + 1 分钟 → 算
+    check("15 天边界：恰好 15 天整不算闲置，超过即算（严格 >）",
           srv._device_idle("EP-000010", "潍坊构元服务商",
-                           {"ep-000010": seen_30d}, now=bnow) is False
+                           {"ep-000010": seen_15d}, now=bnow) is False
           and srv._device_idle("EP-000010", "潍坊构元服务商",
-                               {"ep-000010": seen_30d1m}, now=bnow) is True)
+                               {"ep-000010": seen_15d1m}, now=bnow) is True)
     # 阈值 env 可配生效（KVWO-98 F 组）：FRP_MONITOR_IDLE_DAYS=7 下，10 天未上线即闲置
     proc = subprocess.run(
         [sys.executable, "-c",
@@ -434,7 +460,35 @@ def unit_report_tests(srv):
     check("同步异常时日报如实提示（不吞错）",
           "⚠ 飞书同步异常" in text2 and "boom" in text2)
 
-    # webhook 成功/失败判定：monkeypatch urlopen，不发真实请求
+    # KVWO-107 追加两段：主要服务商使用率 / 版本占比（mock 在线快照与探测版本，
+    # 与 unit_stats_tests 同一组快照：上海 2 台在线，其余离线）
+    snap_hosts = [{"hostname": "ep-000001", "version": "v1.0.0"},
+                  {"hostname": "EP-000002", "version": ""},
+                  {"hostname": "ep-999999", "version": "v1.0.0"}]
+    orig_snap = srv.get_snapshot
+    srv.get_snapshot = lambda: (snap_hosts, 0.0)
+    try:
+        text3 = srv.feishu_report_text(srv.assets_stats_view(),
+                                       now=_dt(2026, 10, 21, 9, 0))
+    finally:
+        srv.get_snapshot = orig_snap
+    check("日报文案：主要服务商使用率段（前 5 家，在线/在册 + 1 位小数百分比）",
+          "主要服务商使用率（前 5 家，按在册数）：" in text3
+          and "上海办公室：在线 2/在册 5（40.0%）" in text3
+          and "潍坊办公室：在线 0/在册 3（0.0%）" in text3
+          and "潍坊构元服务商：在线 0/在册 3（0.0%）" in text3)
+    check("日报文案：主要服务商版本占比段（探测版本 + 未获取桶，整数百分比）",
+          "主要服务商版本占比（前 5 家）：" in text3
+          and "上海办公室（5 台）：未获取 4 台 80% / v1.0.0 1 台 20%" in text3
+          and "潍坊构元服务商（3 台）：未获取 3 台 100%" in text3)
+    check("日报段落顺序：两段新增位于闲置与数据时间之间（既有段落不变）",
+          text3.index("闲置：") < text3.index("主要服务商使用率")
+          < text3.index("主要服务商版本占比") < text3.index("数据时间："))
+
+    # webhook 成功/失败判定：monkeypatch urlopen，不发真实请求。
+    # 注：日报文案新增两段后 run_feishu_report 会轻 frps 快照（GET，经
+    # 同一 urlopen mock），放仅按 POST 请求数断言 webhook 推送次数
+    posts = lambda: [c for c in calls if c.get_method() == "POST"]
     calls = []
 
     class _Resp:
@@ -461,20 +515,22 @@ def unit_report_tests(srv):
     try:
         srv.urlopen = _ok_open
         ok1, code1, _ = srv._feishu_webhook_post("hello", attempts=2)
-        calls_after_post = len(calls)
+        posts_after_post = len(posts())
         out = srv.run_feishu_report("manual")
         srv.urlopen = _fail_open
         ok2, code2, _ = srv._feishu_webhook_post("hello", attempts=2)
     finally:
         srv.urlopen, srv.FEISHU_WEBHOOK = orig_open, orig_hook
     check("webhook 成功判定（HTTP 200 + 业务码 0，不重试）",
-          ok1 is True and code1 == 200 and calls_after_post == 1
-          and len(calls) == 2)   # run_feishu_report 复用同一判定链路再推一条
+          ok1 is True and code1 == 200 and posts_after_post == 1
+          and len(posts()) == 2)   # run_feishu_report 复用同一判定链路再推一条
     check("webhook 失败退避重试后如实返回失败（绝不抛出）",
           ok2 is False and code2 is None)
-    check("run_feishu_report：记录状态并回显全文",
+    check("run_feishu_report：记录状态并回显全文（手动推送含新增两段）",
           out["ok"] is True and out["reason"] == "manual"
           and "在册硬件：11 台" in out["text"]
+          and "主要服务商使用率（前 5 家，按在册数）：" in out["text"]
+          and "主要服务商版本占比（前 5 家）：" in out["text"]
           and srv._feishu_report_state["last"]["ok"] is True)
 
     # 签名校验（群机器人开启签名时必需，实测未签名会被拒 code=19021）
@@ -541,6 +597,65 @@ def unit_report_tests(srv):
           and srv._find_base_name({"data": {"tables": [{"name": "设备明细"}]}}) is None)
 
 
+def unit_top5_tests(srv):
+    print("[5] 前 5 服务商版本占比单测（KVWO-107：恰 5 家/并列/share 舍入 + 日报两段）")
+    from datetime import datetime as _dt
+    # 6 单位在册数：A 6 / B 5 / C 5 / D 4 / E 2 / F 2（B/C、E/F 并列，F 应被截断）
+    devices = {}
+    plan = [("服务商A", 6), ("服务商B", 5), ("服务商C", 5),
+            ("服务商D", 4), ("服务商E", 2), ("服务商F", 2)]
+    seq = 0
+    for unit, count in plan:
+        for _ in range(count):
+            seq += 1
+            devices[f"recT{seq}"] = {
+                "device_no": f"EP-{seq:06d}", "device_type": "EgoPortal-Stereo-V0",
+                "status": "正常", "unit": unit, "accessories": None, "note": None,
+                "software_version": None, "modified_by": None,
+                "updated_at": "2026-10-01T00:00:00.000+08:00"}
+    srv.asset_store.replace_all("devices", devices, synced_at=1.0)
+    # 快照：服务商A 前 3 台 v2.0.0 + 第 4 台 v2.1.0 在线（大写混杂），其余全离线
+    snap_hosts = [{"hostname": f"ep-{i:06d}", "version": "v2.0.0"} for i in (1, 2, 3)]
+    snap_hosts.append({"hostname": "EP-000004", "version": "v2.1.0"})
+    orig = srv.get_snapshot
+    srv.get_snapshot = lambda: (snap_hosts, 0.0)
+    try:
+        top5 = srv.assets_versions_view()["by_provider_top5"]
+        units_top = {u["unit"]: u for u in srv.assets_units_view()}
+        text5 = srv.feishu_report_text(srv.assets_stats_view(),
+                                       now=_dt(2026, 10, 21, 9, 0))
+    finally:
+        srv.get_snapshot = orig
+    check("恰 5 家：在册数降序、并列按单位名稳定（服务商F 2 台被截断）",
+          [t["unit"] for t in top5] == ["服务商A", "服务商B", "服务商C",
+                                       "服务商D", "服务商E"]
+          and [t["total"] for t in top5] == [6, 5, 5, 4, 2])
+    check("服务商A 分桶：探测版本计数降序，未探测归「未获取」，share 两位小数",
+          top5[0]["versions"] == [{"version": "v2.0.0", "count": 3, "share": 0.5},
+                                 {"version": "未获取", "count": 2, "share": 0.33},
+                                 {"version": "v2.1.0", "count": 1, "share": 0.17}])
+    check("未接入单位整桶「未获取」share=1.0；计数合计恒等于在册数",
+          top5[1]["versions"] == [{"version": "未获取", "count": 5, "share": 1.0}]
+          and all(sum(v["count"] for v in t["versions"]) == t["total"]
+                  for t in top5))
+    check("使用率与 top5 口径同源（服务商A 4/6）",
+          units_top["服务商A"]["online"] == 4
+          and abs(units_top["服务商A"]["usage_rate"] - 4 / 6) < 5e-5
+          and units_top["服务商F"]["usage_rate"] == 0.0)
+    # 日报两段（KVWO-107 追加）在同一 6 单位数据上生成：恰 5 家、第 6 家截断
+    usage_lines = [l for l in text5.splitlines() if "：在线 " in l]
+    ver_lines = [l for l in text5.splitlines() if " 台）：" in l]
+    check("日报两段恰 5 家：在册降序、并列按单位名稳定（服务商F 截断不出现）",
+          len(usage_lines) == 5 and len(ver_lines) == 5
+          and usage_lines[0] == "服务商A：在线 4/在册 6（66.7%）"
+          and usage_lines[1] == "服务商B：在线 0/在册 5（0.0%）"
+          and all("服务商F" not in l for l in usage_lines + ver_lines))
+    check("日报版本行：紧凑分布 + share 展示整数百分比（与 API share 同值）",
+          ver_lines[0] == "服务商A（6 台）：v2.0.0 3 台 50% / 未获取 2 台 33%"
+                        " / v2.1.0 1 台 17%"
+          and ver_lines[1] == "服务商B（5 台）：未获取 5 台 100%")
+
+
 def unit_tests():
     import server as srv
     unit_parse_tests(srv)
@@ -548,6 +663,7 @@ def unit_tests():
     unit_stats_tests(srv)
     unit_detail_tests(srv)
     unit_report_tests(srv)
+    unit_top5_tests(srv)
 
 
 # ---------------------------------------------------------------- 在线校验 --
@@ -590,7 +706,7 @@ def lark_direct(table_id):
 
 
 def online_tests(base):
-    print(f"[5] 在线校验（{base}）")
+    print(f"[6] 在线校验（{base}）")
     import server as srv
 
     direct = {}
@@ -763,10 +879,34 @@ def online_tests(base):
           + (ver["match_counts"].get("detected_archived", 0) or 0)
           + max(0, ver["detected_total"] - ver["match_counts"]["matched"]
                 - ver["match_counts"]["detected_only"]))
+    # by_provider_top5（KVWO-107 第六波）：与直查在册分单位排序一致、share 两位小数
+    top5 = ver.get("by_provider_top5") or []
+    n_by_unit = {}
+    for r in dev_parsed.values():
+        k = r["unit"] or "(未填写)"
+        n_by_unit[k] = n_by_unit.get(k, 0) + 1
+    want_top5 = sorted(n_by_unit.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+    check("by_provider_top5 与直查一致（恰 5 家/在册降序/并列按名）",
+          [(t["unit"], t["total"]) for t in top5] == want_top5
+          and all(sum(v["count"] for v in t["versions"]) == t["total"]
+                  for t in top5)
+          and all(v["share"] == round(v["count"] / t["total"], 2)
+                  for t in top5 for v in t["versions"]))
     hosts = get_json(f"{base}/api/hosts")
     online_hosts = {h["hostname"].casefold() for h in hosts["hosts"]}
     check("versions.matched ⊆ 在线快照",
           set(ver["match"]["matched"]) <= online_hosts)
+    # units.online / usage_rate 与快照在线数一致（KVWO-107 第六波）
+    bad_ur = []
+    for u in units:
+        want_online = sum(1 for i in listing["items"]
+                          if (i["unit"] or "(未填写)") == u["unit"]
+                          and i["device_online"] is True)
+        want_rate = round(want_online / u["total"], 4) if u["total"] else None
+        if u.get("online") != want_online or u.get("usage_rate") != want_rate:
+            bad_ur.append((u["unit"], u.get("online"), want_online,
+                           u.get("usage_rate"), want_rate))
+    check("units.online/usage_rate 与快照在线数一致", not bad_ur, str(bad_ur[:3]))
 
     # 单设备 360°：取一台在异常处理流转里有记录的设备（编号或 link 双路）
     repairs_by_id = {}
