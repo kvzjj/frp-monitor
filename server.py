@@ -1195,7 +1195,8 @@ applyTask(t){
 };
 /* ================= 资产管理视图（Assets.*，KVWO-84：总览仪表盘/硬件台账 360°/项目/版本） =================
  契约对齐后端 KVWO-83（/api/assets 系列，KVWO-97 库存口径修正为上海+潍坊；第六波 KVWO-107：闲置 threshold_days 默认 15）：
-   GET /api/assets?status=&type=&unit=&q=&archived=1 → {devices:[…],last_sync_at}
+   GET /api/assets?status=&type=&unit=&q= → {items:[…],total,last_sync_at,…}（编号字段 device_no，KVWO-111 对齐）
+   GET /api/assets?include_archived=1 → 在册+归档全量 items，条目自带 archived 标记（前端按标记拆分出归档列表）
    GET /api/assets/stats → {registered_total,archived_total,inventory:{total,by_unit,units,unused_note},
                             deployed,by_status,by_type,by_unit,repair_rate,damage_rate,last_sync_at}
    GET /api/assets/units → {units:[{unit,total,normal,normal_rate,online,usage_rate,
@@ -1206,7 +1207,9 @@ applyTask(t){
                               by_provider_top5:[{unit,total,versions:[{version,count,share}]}]}
                               （KVWO-107：在册数前 5 单位，探测版本分桶，未探测归「未获取」，
                               share=count/在册数两位小数）
-   GET /api/assets/{device_code} → {ledger:{…},repairs:[…],flows:[…],parts:[…],transfers:[…]}
+   GET /api/assets/{device_no} → 单设备 360°：台账条目本身（device_no 等全字段）
+                            + repairs[]（problem/owner_name/last_followup_note）
+                            + actions[]（处理流水）+ parts_checks[]（配件核对）+ transfers[]（occurred_at/quantity）
  接口未合并（404）时按契约 mock 并以横幅明示（绝不静默冒充生产数据）；后端合入后 404 消失
  即自动切真实数据，前端零改动。字段解析容错（候选键），联调以真实字段为准。
  导航：顶栏「资产」页签 + 子页签（总览/硬件/维修/版本/项目）。「维修看板」槽位由 KVWO-80 的 Rep.*
@@ -1275,9 +1278,10 @@ async api(path){
 },
 async loadAll(){
  try{
-  const res=await Promise.all([this.api('/api/assets/stats'),this.api('/api/assets/units'),this.api('/api/assets/versions'),this.api('/api/assets'),this.api('/api/assets?archived=1')]);
+  const res=await Promise.all([this.api('/api/assets/stats'),this.api('/api/assets/units'),this.api('/api/assets/versions'),this.api('/api/assets'),this.api('/api/assets?include_archived=1')]);
   this.stats=this.normStats(res[0]);this.units=this.normUnits(res[1]);this.versions=this.normVers(res[2]);
-  this.devices=this.normList(res[3],false);this.archived=this.normList(res[4],true);
+  this.devices=this.normList(res[3],false);
+  this.archived=this.normList(res[4],false).filter(x=>x.archived);   /* KVWO-111：真实契约 include_archived=1 返回在册+归档全量、条目自带 archived 标记，按标记拆分（原 ?archived=1 后端不识别，归档列表实为在册重复） */
   this.err='';this.loaded=true;this.lastGoodAt=Date.now();
  }catch(e){this.err=String(e.message||e)}
  this.syncBar();this.render();
@@ -1288,12 +1292,12 @@ nByKey(o,ks){for(const k of ks)if(o&&o[k]!=null)return o[k];return null},
 idleDays(){const d=this.stats&&this.stats.idleDays;return d!=null?d:15},
 normDev(r,archived){
  const on=r?(r.device_online!==undefined?r.device_online:r.online):null;
- return{code:String(this.nByKey(r,['device_code','device_id','code'])||'').trim(),
+ return{code:String(this.nByKey(r,['device_code','device_no','device_id','code'])||'').trim(),   /* KVWO-111：真实契约列表编号字段为 device_no（ASSET_DEVICE_ITEM_FIELDS），与 360° 路径候选键对齐 */
   type:this.nByKey(r,['device_type','type']),status:this.nByKey(r,['status']),
   unit:this.nByKey(r,['unit','organization']),parts:this.nByKey(r,['accessories','parts']),
   remark:this.nByKey(r,['remark','note']),ledgerVer:this.nByKey(r,['ledger_version','software_version']),
   detVer:this.nByKey(r,['detected_version']),online:on===true?true:(on===false?false:null),
-  openRepairs:Number(this.nByKey(r,['open_repairs','repair_count'])||0),
+  openRepairs:Number(this.nByKey(r,['open_repairs','active_repairs','repair_count'])||0),   /* KVWO-111：真实契约为 active_repairs */
   updatedAt:this.nByKey(r,['updated_at','last_updated']),modifier:this.nByKey(r,['modifier']),
   lastSeen:this.nByKey(r,['last_seen','lastSeen']),idle:this.nByKey(r,['idle']),
   archived:!!(archived||(r&&r.archived))}
@@ -1457,10 +1461,10 @@ async open360(code){
  const dev=this.normDev(led,!!(d&&d.archived));
  const v=x=>(x==null||x==='')?'—':esc(String(x));
  const tbl=(cols,rows,empty)=>'<div class=twrap><table class=astable><thead><tr>'+cols.map(c=>'<th>'+c+'</th>').join('')+'</tr></thead><tbody>'+(rows.length?rows.join(''):'<tr><td colspan='+cols.length+' class=eempty>'+(empty||'暂无数据')+'</td></tr>')+'</tbody></table></div>';
- const repRows=(d&&d.repairs||[]).map(r=>'<tr><td>'+v(r.stage)+'</td><td class=wrap>'+v(r.issue_description||r.issue)+'</td><td>'+v(Array.isArray(r.repair_owners)?r.repair_owners.join('、'):(r.repair_owners||r.owner))+'</td><td>'+v(this.fmtTs(r.last_followed_at))+'</td><td class=wrap>'+v(r.last_follow_note)+'</td></tr>');
- const flowRows=(d&&d.flows||[]).map(r=>'<tr><td>'+v(r.action)+'</td><td>'+v(r.operator)+'</td><td>'+v(this.fmtTs(r.ts||r.time||r.operated_at))+'</td><td class=wrap>'+v(r.note||r.summary)+'</td></tr>');
- const partRows=(d&&d.parts||[]).map(r=>'<tr><td>'+v(r.part||r.accessory)+'</td><td>'+v(r.arrival||r.arrival_status)+'</td><td>'+v(r.item||r.check_item)+'</td><td class=wrap>'+v(r.note||r.status_note)+'</td><td>'+v(this.fmtTs(r.checked_at||r.time))+'</td></tr>');
- const trRows=(d&&d.transfers||[]).map(r=>'<tr><td>'+v(this.fmtTs(r.ts||r.time))+'</td><td>'+v(r.unit)+'</td><td>'+v(r.item)+'</td><td>'+v(r.qty!=null?r.qty:null)+'</td><td class=wrap>'+v(r.note)+'</td></tr>');
+ const repRows=(d&&d.repairs||[]).map(r=>'<tr><td>'+v(r.stage)+'</td><td class=wrap>'+v(r.issue_description||r.issue||r.problem)+'</td><td>'+v(Array.isArray(r.repair_owners)?r.repair_owners.join('、'):(r.repair_owners||r.owner||r.owner_name))+'</td><td>'+v(this.fmtTs(r.last_followed_at))+'</td><td class=wrap>'+v(r.last_follow_note||r.last_followup_note)+'</td></tr>');   /* KVWO-111：后三键为真实契约（problem/owner_name/last_followup_note），mock 字段仍优先 */
+ const flowRows=(d&&(d.flows||d.actions)||[]).map(r=>'<tr><td>'+v(r.action)+'</td><td>'+v(r.operator)+'</td><td>'+v(this.fmtTs(r.ts||r.time||r.operated_at))+'</td><td class=wrap>'+v(r.note||r.summary)+'</td></tr>');   /* KVWO-111：真实契约为 actions */
+ const partRows=(d&&(d.parts||d.parts_checks)||[]).map(r=>'<tr><td>'+v(r.part||r.accessory)+'</td><td>'+v(r.arrival||r.arrival_status)+'</td><td>'+v(r.item||r.check_item)+'</td><td class=wrap>'+v(r.note||r.status_note)+'</td><td>'+v(this.fmtTs(r.checked_at||r.time))+'</td></tr>');   /* KVWO-111：真实契约为 parts_checks */
+ const trRows=(d&&d.transfers||[]).map(r=>'<tr><td>'+v(this.fmtTs(r.ts||r.time||r.occurred_at))+'</td><td>'+v(r.unit)+'</td><td>'+v(r.item)+'</td><td>'+v(r.qty!=null?r.qty:r.quantity)+'</td><td class=wrap>'+v(r.note)+'</td></tr>');   /* KVWO-111：occurred_at/quantity 为真实契约 */
  const stc=this.ST_COLOR[dev.status]||'#64748b';
  body.innerHTML=
   '<header><div><span class=name>'+esc(dev.code.toUpperCase())+'</span> <span class=stag style="--c:'+stc+'">'+esc(dev.status||'—')+'</span>'+(dev.archived?' <span class=stag style="--c:#64748b">归档</span>':'')+'</div><button class=x id=mClose>✕</button></header>'+
@@ -1603,7 +1607,7 @@ mockData(){
   devs.push({device_code:code,device_type:type,status:status,unit:unit,accessories:pickR(PARTS)+(rnd()<0.5?'、'+pickR(PARTS):''),remark:remark,ledger_version:null,detected_version:detVer,device_online:online,open_repairs:openRep,updated_at:new Date(base-k*37*60000).toISOString(),modifier:pickR(['张伟','李娜','王强','刘敏','陈晨'])})
  }
  const arch=[];
- for(let i=0;i<69;i++)arch.push({device_code:i===49?'ep-000298':'EP-'+String(249+i).padStart(6,'0'),device_type:pickR(['EgoPortal-Stereo-V0','EgoPortal-Stereo-V1','EgoPortal-Lite']),status:'已拆解',unit:pickR(UNITS.map(u=>u[0])),accessories:'',remark:'已拆解归档',ledger_version:null,detected_version:null,device_online:false,open_repairs:0,updated_at:new Date(base-400*3600000-i*3600000).toISOString(),modifier:'李娜'});
+ for(let i=0;i<69;i++)arch.push({archived:true,device_code:i===49?'ep-000298':'EP-'+String(249+i).padStart(6,'0'),device_type:pickR(['EgoPortal-Stereo-V0','EgoPortal-Stereo-V1','EgoPortal-Lite']),status:'已拆解',unit:pickR(UNITS.map(u=>u[0])),accessories:'',remark:'已拆解归档',ledger_version:null,detected_version:null,device_online:false,open_repairs:0,updated_at:new Date(base-400*3600000-i*3600000).toISOString(),modifier:'李娜'});
  const byStatus={},byType={},byUnit={};
  for(const s of this.STATUS_ORDER)byStatus[s]=devs.filter(d=>d.status===s).length;
  for(const d of devs){byType[d.device_type]=(byType[d.device_type]||0)+1;byUnit[d.unit]=(byUnit[d.unit]||0)+1}

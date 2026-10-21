@@ -145,6 +145,12 @@ active_repairs 与既有 API 交叉一致；日报状态端点/手动推送文�
 `verify_assets_real_api.js`（node，先 `python3 -c "import server"` 导出
 `/tmp/panel_test.js`）：mock 基线（在册 248/库存 149=上海 94+潍坊 55/
 部署 99）与真实 API 路径、断供降级。
+`verify_assets_contract.js`（node，自包含）：起真实 server.py + SQLite 夹具，
+把 `/api/assets` 系列真实响应原样喂前端渲染（KVWO-111 真实契约回归：
+列表编号字段 device_no、include_archived=1 拆分归档、360°
+actions/parts_checks/repairs 字段、下钻 N 台在册）——不再用自造载荷
+冒充真实契约（旧两套 mock/自造载荷均测不到字段名差异，曾致台账恒为空
+而套件全绿）。
 
 ## 部署注意（124.222.147.63）
 
