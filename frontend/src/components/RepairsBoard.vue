@@ -291,8 +291,8 @@ onUnmounted(() => clearInterval(timer))
       <p v-else-if="st.loading && !st.rows.length" class="uempty rkanhint">加载中…</p>
       <p v-else-if="!st.rows.length && hasFilter()" class="uempty rkanhint">没有匹配的维修记录——调整筛选或搜索词，或点「重新加载」</p>
       <p v-else-if="!st.rows.length" class="uempty rkanhint">暂无维修记录——飞书维修表同步到数据后此处展示</p>
-      <div v-for="col in kanbanCols" :key="col.stage" :ref="el => { if (el) colRefs[col.stage] = el }" class="rkcol" :data-col="col.stage">
-        <h3><span class="rkt" :style="{ '--c': col.color }">{{ col.stage }}</span><span class="rkn">{{ col.list.length }}</span></h3>
+      <div v-for="col in kanbanCols" :key="col.stage" :ref="el => { if (el) colRefs[col.stage] = el }" class="rkcol" :data-col="col.stage" :style="{ '--c': col.color }">
+        <h3><span class="rkt">{{ col.stage }}</span><span class="rkn">{{ col.list.length }}</span></h3>
         <div v-for="r in col.list" :key="r.record_id" class="rcard" @click="openDetail(r.record_id)">
           <div class="rd">{{ r.device_id || '（无编号）' }}<span v-if="r.device_type" class="rtyp" :class="r.device_type === '双目' ? 'rt2' : (r.device_type === '单目' ? 'rt1' : '')">{{ r.device_type }}</span></div>
           <div v-if="r.problem" class="rprob" :title="r.problem">{{ r.problem }}</div>

@@ -168,13 +168,13 @@ const metricCards = computed(() => {
   const pctv = v => v == null ? '—' : (Math.round(v * 1000) / 10) + '%'
   const stime = '统计时间：' + (fmtClockOf(s.lastSync) || '—')
   return [
-    { v: s.total, l: '在册总数', sub: '口径：设备明细表（不含归档）' },
-    { v: s.archived, l: '归档（已拆解）', sub: '口径：设备归档数据表，不参与在册指标' },
-    { v: s.invTotal, l: '库存', sub: '口径：' + invLabel() + (s.invB != null ? '；参考：备注含「未使用」' + s.invB + ' 台' : ''), c: '#0f766e' },
-    { v: s.deployed, l: '一线部署', sub: '口径：在册 − 库存（库存单位持有不计部署）' },
-    { v: pctv(s.repairRate), l: '维修率', rate: 1, c: '#ea580c', sub: '计算式：(维修中 ' + n('维修中') + ' + 待维修 ' + n('待维修') + ') / 在册 ' + s.total },
-    { v: pctv(s.damageRate), l: '损坏率', rate: 1, c: '#dc2626', sub: '计算式：(异常 ' + n('异常') + ' + 维修中 ' + n('维修中') + ' + 待维修 ' + n('待维修') + ') / 在册 ' + s.total },
-    { v: s.idleTotal, l: '闲置', sub: '口径：库存外·超 ' + idleDays() + ' 天未上线（含从未上线）；fleet 库未启用时不可计算', c: '#7c3aed' }
+    { v: s.total, l: '在册总数', short: '设备明细表 · 不含归档', sub: '口径：设备明细表（不含归档）' },
+    { v: s.archived, l: '归档（已拆解）', short: '不参与在册指标', sub: '口径：设备归档数据表，不参与在册指标' },
+    { v: s.invTotal, l: '库存', short: (s.invUnits && s.invUnits.length ? s.invUnits.join('+') : '公司库存') + ' · 服务商不计', sub: '口径：' + invLabel() + (s.invB != null ? '；参考：备注含「未使用」' + s.invB + ' 台' : ''), c: '#0f766e' },
+    { v: s.deployed, l: '一线部署', short: '在册 − 库存', sub: '口径：在册 − 库存（库存单位持有不计部署）' },
+    { v: pctv(s.repairRate), l: '维修率', rate: 1, c: '#ea580c', short: '(维修中' + n('维修中') + '+待维修' + n('待维修') + ') / 在册', sub: '计算式：(维修中 ' + n('维修中') + ' + 待维修 ' + n('待维修') + ') / 在册 ' + s.total },
+    { v: pctv(s.damageRate), l: '损坏率', rate: 1, c: '#dc2626', short: '(异常+维修中+待维修) / 在册', sub: '计算式：(异常 ' + n('异常') + ' + 维修中 ' + n('维修中') + ' + 待维修 ' + n('待维修') + ') / 在册 ' + s.total },
+    { v: s.idleTotal, l: '闲置', short: '库存外 · 超 ' + idleDays() + ' 天未上线', sub: '口径：库存外·超 ' + idleDays() + ' 天未上线（含从未上线）；fleet 库未启用时不可计算', c: '#7c3aed' }
   ].map(m => ({ ...m, stime }))
 })
 
@@ -450,10 +450,10 @@ watch(() => st.tab, t => {
         <span id="asReportState" class="uhint">{{ st.reportState }}</span>
       </div>
       <section v-if="st.stats" class="amcards" id="asMetrics">
-        <div v-for="(m, i) in metricCards" :key="i" class="amcard" :class="{ rate: m.rate }" :style="{ '--c': m.c || '' }" :title="m.sub + '\n' + m.stime">
-          <b>{{ m.v == null ? '—' : m.v }}</b>
+        <div v-for="(m, i) in metricCards" :key="i" class="amcard" :class="{ rate: m.rate }" :style="{ '--c': m.c || '' }" :title="m.l + '\n' + m.sub + '\n' + m.stime">
           <span class="albl">{{ m.l }}</span>
-          <div class="asub2">{{ m.sub }}<br>{{ m.stime }}</div>
+          <b>{{ m.v == null ? '—' : m.v }}</b>
+          <div class="asub2" :title="m.sub + '\n' + m.stime">{{ m.short }}</div>
         </div>
       </section>
       <div v-if="st.stats" class="adists" id="asDists">
@@ -807,3 +807,560 @@ watch(() => st.tab, t => {
     </div>
   </section>
 </template>
+
+<style>
+/* ============================================================
+   资产视图 UI 重构（2026-10-26）：仅作用于 #viewAssets，
+   不影响设备总览 / 升级视图；类名与 DOM 结构不变，功能零改动。
+   设计语言：分段页签 · 指标大卡 · 圆角进度条 · 贴头表格 · 彩色看板列
+   ============================================================ */
+#viewAssets {
+  --az-card: #fff;
+  --az-border: #e6ebf2;
+  --az-ink: #172033;
+  --az-sub: #667085;
+  --az-faint: #98a2b3;
+  --az-track: #f1f5f9;
+  --az-primary: #2563eb;
+  --az-radius: 14px;
+  --az-shadow: 0 1px 2px rgba(23, 32, 51, .04), 0 8px 24px rgba(23, 32, 51, .05);
+  --az-shadow-lg: 0 4px 10px rgba(23, 32, 51, .06), 0 16px 40px rgba(23, 32, 51, .10);
+}
+
+/* ---------- 子页签：分段控件 ---------- */
+#viewAssets .vtabs.asub {
+  display: inline-flex;
+  background: #eef2f7;
+  border: 1px solid #e4e9f1;
+  border-radius: 13px;
+  padding: 4px;
+  gap: 4px;
+  margin: -4px 0 20px;
+}
+#viewAssets .vtabs.asub button {
+  background: transparent;
+  border: 0;
+  border-radius: 9px;
+  padding: 8px 18px;
+  font-size: 13.5px;
+  color: #52627a;
+  transition: color .15s, background .15s, box-shadow .15s;
+}
+#viewAssets .vtabs.asub button:hover { color: var(--az-ink); }
+#viewAssets .vtabs.asub button.on {
+  background: #fff;
+  color: var(--az-ink);
+  font-weight: 600;
+  box-shadow: 0 1px 3px rgba(23, 32, 51, .14);
+}
+
+/* ---------- 同步状态条 ---------- */
+#viewAssets .asyncbar {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  border-radius: 11px;
+  padding: 9px 15px;
+  font-size: 12.5px;
+  border: 1px solid transparent;
+  margin-bottom: 16px;
+}
+#viewAssets .asyncbar::before {
+  content: '';
+  flex: none;
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+#viewAssets .asyncbar.ok   { background: #f0fdf4; border-color: #c8f0d4; color: #15803d; }
+#viewAssets .asyncbar.warn { background: #fffbeb; border-color: #fde8b8; color: #b45309; }
+#viewAssets .asyncbar.err  { background: #fef2f2; border-color: #fbd5d5; color: #b91c1c; }
+
+/* ---------- 工具栏（台账/维修筛选） ---------- */
+#viewAssets .toolbar {
+  background: var(--az-card);
+  border: 1px solid var(--az-border);
+  border-radius: 13px;
+  padding: 10px;
+  box-shadow: var(--az-shadow);
+}
+#viewAssets .toolbar input {
+  border-color: transparent;
+  background: var(--az-track);
+  border-radius: 9px;
+}
+#viewAssets .toolbar input:focus { background: #fff; border-color: var(--az-primary); }
+#viewAssets .toolbar select {
+  border: 0;
+  background: var(--az-track);
+  border-radius: 9px;
+  padding: 9px 10px;
+  font-size: 13px;
+  color: #344054;
+  cursor: pointer;
+}
+#viewAssets .toolbar select:hover { background: #e7edf4; }
+#viewAssets .toolbar .listbtn { border: 0; }
+#viewAssets .aswitch { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--az-sub); cursor: pointer; user-select: none; }
+
+/* ---------- 指标大卡 ---------- */
+#viewAssets .amcards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(172px, 1fr));
+  gap: 12px;
+}
+#viewAssets .amcard {
+  position: relative;
+  background: var(--az-card);
+  border: 1px solid var(--az-border);
+  border-radius: var(--az-radius);
+  padding: 16px 18px 14px;
+  box-shadow: var(--az-shadow);
+  overflow: hidden;
+  cursor: default;
+  transition: transform .16s ease, box-shadow .16s ease;
+}
+#viewAssets .amcard:hover { transform: translateY(-2px); box-shadow: var(--az-shadow-lg); }
+#viewAssets .amcard::before {
+  content: '';
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 3.5px;
+  background: var(--c, #2563eb);
+}
+#viewAssets .amcard .albl {
+  display: block;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--az-sub);
+  letter-spacing: .01em;
+}
+#viewAssets .amcard b {
+  display: block;
+  margin: 7px 0 5px;
+  font-size: 30px;
+  font-weight: 750;
+  letter-spacing: -.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--az-ink);
+  line-height: 1.1;
+}
+#viewAssets .amcard.rate b { color: var(--c, #ea580c); }
+#viewAssets .amcard .asub2 {
+  font-size: 11.5px;
+  color: var(--az-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---------- 分布面板 / 进度条 ---------- */
+#viewAssets .adists {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(310px, 1fr));
+  gap: 14px;
+  margin-top: 14px;
+}
+#viewAssets .apanel {
+  background: var(--az-card);
+  border: 1px solid var(--az-border);
+  border-radius: var(--az-radius);
+  padding: 16px 18px;
+  box-shadow: var(--az-shadow);
+}
+#viewAssets .apanel h3 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 12px;
+  font-size: 13.5px;
+  font-weight: 650;
+  color: var(--az-ink);
+}
+#viewAssets .apanel h3::before {
+  content: '';
+  flex: none;
+  width: 4px; height: 14px;
+  border-radius: 2px;
+  background: var(--az-primary);
+}
+#viewAssets h4 { margin: 14px 0 8px; font-size: 12.5px; color: var(--az-sub); font-weight: 600; }
+#viewAssets .abar {
+  display: grid;
+  grid-template-columns: minmax(56px, 118px) 1fr minmax(40px, auto);
+  align-items: center;
+  gap: 10px;
+  padding: 4.5px 0;
+}
+#viewAssets .albl2 {
+  font-size: 12.5px;
+  color: #344054;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: right;
+}
+#viewAssets .atrack {
+  height: 8px;
+  background: var(--az-track);
+  border-radius: 99px;
+  overflow: hidden;
+}
+#viewAssets .atrack i {
+  display: block;
+  height: 100%;
+  border-radius: 99px;
+  background: var(--c, var(--az-primary));
+  transition: width .55s cubic-bezier(.22,.61,.36,1);
+}
+#viewAssets .abar:hover .atrack { box-shadow: inset 0 0 0 1px #d6dee8; }
+#viewAssets .an {
+  font-size: 12px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  color: var(--az-sub);
+  text-align: left;
+  white-space: nowrap;
+}
+
+/* 版本对照三格 */
+#viewAssets .acards3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 4px 0 12px; }
+#viewAssets .acards3 > div {
+  background: #f8fafc;
+  border: 1px solid var(--az-border);
+  border-radius: 11px;
+  padding: 10px 12px;
+  font-size: 12px;
+  color: var(--az-sub);
+  text-align: center;
+}
+#viewAssets .acards3 b { display: block; font-size: 22px; font-weight: 750; color: var(--az-ink); margin-bottom: 2px; font-variant-numeric: tabular-nums; }
+#viewAssets .chip2 {
+  display: inline-block;
+  margin: 0 6px 6px 0;
+  padding: 3px 10px;
+  border-radius: 7px;
+  background: #f1f5f9;
+  border: 1px solid #e2e8f0;
+  font-family: ui-monospace, monospace;
+  font-size: 11.5px;
+  color: #475569;
+}
+
+/* ---------- 表格（台账 / 维修列表） ---------- */
+#viewAssets .twrap {
+  border: 1px solid var(--az-border);
+  border-radius: 13px;
+  overflow: auto;
+  max-height: 660px;
+  background: var(--az-card);
+  box-shadow: var(--az-shadow);
+}
+#viewAssets .twrap table { min-width: 560px; }
+#viewAssets .astable th, #viewAssets .rtable th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: #f8fafc;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--az-sub);
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--az-border);
+  white-space: nowrap;
+}
+#viewAssets .astable td, #viewAssets .rtable td {
+  padding: 9px 12px;
+  font-size: 12.5px;
+  border-bottom: 1px solid #f2f5f9;
+}
+#viewAssets .astable tbody tr, #viewAssets .rtable tbody tr { cursor: pointer; transition: background .1s; }
+#viewAssets .astable tbody tr:hover, #viewAssets .rtable tbody tr:hover { background: #f6f9fc; }
+#viewAssets .astable th.sort { cursor: pointer; user-select: none; }
+#viewAssets .astable th.sort:hover { color: var(--az-primary); }
+#viewAssets tr.aarch td { color: #9aa7b8; background: #fbfcfd; }
+#viewAssets tr.aarch td:first-child { box-shadow: inset 3px 0 0 #cbd5e1; }
+#viewAssets .sarr { color: var(--az-primary); font-size: 10px; }
+#viewAssets .uhint { color: var(--az-faint); font-size: 12px; }
+#viewAssets #asLedgerHint { display: block; margin: 10px 2px 0; }
+#viewAssets .rprob-cell { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---------- 维修看板 ---------- */
+#viewAssets .rbanner {
+  border: 1px solid #fbd5d5;
+  background: #fef2f2;
+  color: #b91c1c;
+  border-radius: 12px;
+  padding: 10px 15px;
+  font-size: 12.5px;
+  margin-bottom: 14px;
+}
+#viewAssets .rbanner div { margin: 2px 0; }
+#viewAssets .sitesbar { gap: 7px; margin-bottom: 14px; }
+#viewAssets .rchip { cursor: pointer; transition: transform .12s, box-shadow .12s; }
+#viewAssets .rchip:hover { transform: translateY(-1px); box-shadow: 0 2px 8px rgba(23,32,51,.10); }
+#viewAssets .rkan {
+  display: flex;
+  gap: 12px;
+  overflow-x: auto;
+  padding: 4px 2px 10px;
+  align-items: flex-start;
+  scrollbar-width: thin;
+}
+#viewAssets .rkcol {
+  flex: 1 0 252px;
+  min-width: 252px;
+  background: #f6f8fb;
+  border: 1px solid var(--az-border);
+  border-radius: 13px;
+  padding: 10px;
+}
+#viewAssets .rkcol h3 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 2px 4px 10px;
+}
+#viewAssets .rkt {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  font-weight: 650;
+  color: var(--c, #64748b);
+}
+#viewAssets .rkt::before {
+  content: '';
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--c, #64748b);
+}
+#viewAssets .rkn {
+  margin-left: auto;
+  min-width: 24px;
+  text-align: center;
+  font-size: 11.5px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: #52627a;
+  background: #fff;
+  border: 1px solid var(--az-border);
+  border-radius: 99px;
+  padding: 2px 8px;
+}
+#viewAssets .rcard {
+  background: var(--az-card);
+  border: 1px solid var(--az-border);
+  border-left: 3px solid var(--c, #94a3b8);
+  border-radius: 11px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  cursor: pointer;
+  box-shadow: 0 1px 2px rgba(23,32,51,.05);
+  transition: transform .14s ease, box-shadow .14s ease;
+}
+#viewAssets .rcard:hover { transform: translateY(-1.5px); box-shadow: var(--az-shadow-lg); }
+#viewAssets .rcard .rd {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-weight: 650;
+  font-size: 13px;
+  color: var(--az-ink);
+  font-family: ui-monospace, monospace;
+}
+#viewAssets .rtyp {
+  font-family: inherit;
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 1.5px 8px;
+  border-radius: 99px;
+}
+#viewAssets .rt1 { background: #eff6ff; color: #1d4ed8; border: 1px solid #dbeafe; }
+#viewAssets .rt2 { background: #f5f3ff; color: #6d28d9; border: 1px solid #ede9fe; }
+#viewAssets .rprob {
+  margin: 6px 0 7px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #475569;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+#viewAssets .rmeta {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--az-faint);
+}
+#viewAssets .ronrow { margin-top: 7px; }
+#viewAssets .ron {
+  font-size: 11px;
+  padding: 2px 9px;
+  border-radius: 99px;
+  font-weight: 600;
+}
+#viewAssets .ron.on  { background: #ecfdf3; color: #067647; border: 1px solid #d3f2df; }
+#viewAssets .ron.off { background: #fef3f2; color: #b42318; border: 1px solid #fde0dd; }
+#viewAssets .ron.na  { background: #f2f4f7; color: #8290a5; border: 1px solid #e6eaf0; }
+#viewAssets .ron.link { cursor: pointer; }
+#viewAssets .rvswitch {
+  display: inline-flex;
+  background: #eef2f7;
+  border-radius: 9px;
+  padding: 3px;
+  gap: 3px;
+  margin-left: auto;
+}
+#viewAssets .rvswitch button {
+  border: 0;
+  background: transparent;
+  border-radius: 7px;
+  padding: 6px 13px;
+  font-size: 12px;
+  color: #52627a;
+}
+#viewAssets .rvswitch button.on { background: #fff; color: var(--az-ink); font-weight: 600; box-shadow: 0 1px 3px rgba(23,32,51,.14); }
+#viewAssets .rdonewrap { margin-top: 12px; }
+#viewAssets .rempty { text-align: center; color: var(--az-faint); padding: 18px; }
+#viewAssets .rkempty {
+  text-align: center;
+  color: #b6c1d1;
+  font-size: 12px;
+  padding: 14px 0 10px;
+}
+#viewAssets .rkanhint { padding: 30px 0; }
+
+/* ---------- 项目（单位）卡片 ---------- */
+#viewAssets .aunitgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(248px, 1fr));
+  gap: 12px;
+}
+#viewAssets .aunit {
+  background: var(--az-card);
+  border: 1px solid var(--az-border);
+  border-radius: var(--az-radius);
+  padding: 15px 17px;
+  box-shadow: var(--az-shadow);
+  cursor: pointer;
+  transition: transform .16s ease, box-shadow .16s ease, border-color .16s;
+}
+#viewAssets .aunit:hover { transform: translateY(-2px); box-shadow: var(--az-shadow-lg); border-color: #c9d8e9; }
+#viewAssets .auhead {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 11px;
+}
+#viewAssets .auhead b { font-size: 14.5px; font-weight: 700; }
+#viewAssets .auhead > span {
+  flex: none;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--az-sub);
+  background: var(--az-track);
+  border-radius: 99px;
+  padding: 2.5px 10px;
+}
+#viewAssets .abarate { display: grid; grid-template-columns: 44px 1fr auto; align-items: center; gap: 8px; margin: 7px 0; font-size: 11.5px; color: var(--az-sub); }
+#viewAssets .abarate .atrack { height: 6px; }
+#viewAssets .abarate span:last-child { font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
+#viewAssets .aurow { display: flex; gap: 6px; margin-top: 9px; flex-wrap: wrap; }
+#viewAssets .auinv {
+  margin-top: 9px;
+  font-size: 11px;
+  color: #0f766e;
+  background: #f0fdfa;
+  border: 1px dashed #b5eae0;
+  border-radius: 8px;
+  padding: 5px 9px;
+}
+#viewAssets .aumut { margin-top: 9px; font-size: 11px; color: var(--az-faint); }
+#viewAssets .auhead2 { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+#viewAssets .auhead2 b { font-size: 15px; }
+#viewAssets .auhead2 span { color: var(--az-sub); font-size: 12.5px; }
+#viewAssets .apanel .listbtn { border: 0; }
+
+/* ---------- 维修统计四小卡（复用 .summary） ---------- */
+#viewAssets .summary {
+  gap: 12px;
+  margin-bottom: 14px;
+}
+#viewAssets .summary div {
+  border: 1px solid var(--az-border);
+  border-radius: 12px;
+  box-shadow: var(--az-shadow);
+  min-width: 116px;
+}
+#viewAssets .summary b { font-size: 24px; font-weight: 750; font-variant-numeric: tabular-nums; }
+
+/* ---------- 杂项 ---------- */
+#viewAssets .stag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 9px;
+  white-space: nowrap;
+}
+#viewAssets .stag::before {
+  content: '';
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--c, #64748b);
+  background: color-mix(in srgb, var(--c, #64748b) 85%, white);
+}
+#viewAssets .aon  { color: #16a34a; }
+#viewAssets .aoff { color: #dc2626; }
+#viewAssets .anull { color: #c0c9d6; }
+#viewAssets .abadge {
+  border: 0;
+  border-radius: 99px;
+  padding: 2px 9px;
+  font-size: 11.5px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  background: #fef3f2;
+  color: #b42318;
+  cursor: pointer;
+}
+#viewAssets .abadge:hover { background: #fde0dd; }
+#viewAssets .mono { font-family: ui-monospace, monospace; }
+#viewAssets .mut { color: var(--az-faint); }
+#viewAssets .wrap { white-space: normal; word-break: break-all; }
+#viewAssets .uempty { color: var(--az-faint); text-align: center; padding: 18px; }
+#viewAssets .uwarn {
+  background: #fffbeb;
+  border: 1px solid #fde8b8;
+  color: #92400e;
+  border-radius: 10px;
+  padding: 9px 13px;
+  font-size: 12.5px;
+}
+#viewAssets .rattach { gap: 8px; }
+#viewAssets .rptext {
+  background: #0f172a;
+  color: #d5e3f3;
+  border-radius: 10px;
+  padding: 14px;
+  font-size: 12.5px;
+  line-height: 1.7;
+  max-height: 60vh;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+#viewAssets .twrap::-webkit-scrollbar, #viewAssets .rkan::-webkit-scrollbar { width: 8px; height: 8px; }
+#viewAssets .twrap::-webkit-scrollbar-thumb, #viewAssets .rkan::-webkit-scrollbar-thumb { background: #cdd7e2; border-radius: 99px; }
+#viewAssets .twrap::-webkit-scrollbar-track, #viewAssets .rkan::-webkit-scrollbar-track { background: transparent; }
+
+@media (max-width: 720px) {
+  #viewAssets .acards3 { grid-template-columns: 1fr; }
+  #viewAssets .amcards { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
+}
+</style>
