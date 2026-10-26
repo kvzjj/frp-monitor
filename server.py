@@ -8,18 +8,21 @@ are returned. Results are naturally sorted by hostname/proxy name.
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 from urllib.request import Request, urlopen
 from datetime import datetime, timedelta, timezone
 import base64
 import hashlib
 import hmac
+import html
 import json
+import mimetypes
 import os
 import queue
 import re
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -91,6 +94,87 @@ BACKUP_DIR = os.getenv("FRP_MONITOR_BACKUP_DIR", "/opt/frp-monitor/backups")
 BACKUP_KEEP = max(1, int(os.getenv("FRP_MONITOR_BACKUP_KEEP", "7")))
 MAINTENANCE_TIME = os.getenv("FRP_MONITOR_MAINTENANCE_TIME", "03:30")
 
+# --- webfix：缺失 web 代理设备的自动检测与一次性补配（KVWO-17/19/44）--------
+# 触发时机（KVWO-44，需求方定稿 2026-10-16）：上线事件 + 稳定窗口，不再周期
+# 扫描命中即触发——设备从离线转在线（且 ssh 代理在、web 代理缺、无 auto 台账
+# 记录）→ 启动稳定计时；连续在线满 WEBFIX_DELAY 秒且期间未掉线（掉线计时
+# 作废、重新上线重计）→ 仍缺 web 代理 → 触发；面板启动时已在线的存量设备
+# 从首次观测起算同样窗口。
+# 检测判据：在线 + 有 SSH 代理端口 + 无 web 代理端口（仅 version_error 属探测
+# 瞬时失败，不触发）；每台设备自动触发严格一次（webfix_tasks 台账防重，永不
+# 清理），失败不自动重试，面板 POST /api/webfix/retry 手动重试。补配只动设备侧
+# frpc.toml（网关 allowPorts 30000-30999 已由 DevOps 预放宽，见兄弟任务），单机
+# 隧道秒级闪断为预期行为；不触碰 frps / 网关任何配置。
+WEBFIX_AUTO = os.getenv("FRP_MONITOR_WEBFIX_AUTO", "1").strip().lower() not in ("0", "false", "no", "off")
+WEBFIX_PORT_BASE = int(os.getenv("FRP_MONITOR_WEBFIX_PORT_BASE", "30000"))  # web 端口 = 基数 + 设备编号
+WEBFIX_PORT_MAX = int(os.getenv("FRP_MONITOR_WEBFIX_PORT_MAX", "30999"))     # 网关预放宽段上界
+WEBFIX_VERIFY_TIMEOUT = float(os.getenv("FRP_MONITOR_WEBFIX_VERIFY_TIMEOUT", "180"))  # 重启回连+闭环校验上限(秒)
+WEBFIX_MAX_PARALLEL = max(1, int(os.getenv("FRP_MONITOR_WEBFIX_MAX_PARALLEL", "2")))
+# 上线后稳定窗口（秒，默认 60）：连续在线满窗且期间未掉线才自动触发，线上
+# 可经环境变量调整（KVWO-44）；0 = 满窗判定退化为下一轮刷新即触发
+WEBFIX_DELAY = max(0.0, float(os.getenv("FRP_MONITOR_WEBFIX_DELAY", "60")))
+
+# --- 维修面板（KVWO-78/79）：飞书维修表 lark-cli 定时同步 → 本地 SQLite + 只读 API
+# 数据源为飞书多维表（唯一维护入口，面板只读不写回）。同步命令 / base / table /
+# 本地库路径全部走环境变量，不硬编码凭证（lark-cli 自身凭证由其配置目录管理，
+# 与本服务解耦）。同步失败只记录错误状态、保留上次成功数据继续服务，不影响
+# 面板其他页签。配置说明见仓库 REPAIRS.md。
+REPAIR_SYNC_ENABLED = os.getenv("FRP_MONITOR_REPAIR_SYNC", "1").strip().lower() not in ("0", "false", "no", "off")
+REPAIR_SYNC_INTERVAL = max(60.0, float(os.getenv("FRP_MONITOR_REPAIR_INTERVAL", "300")))  # 默认 5 分钟
+REPAIR_LARK_CMD = os.getenv("FRP_MONITOR_REPAIR_LARK_CMD", "lark-cli")
+REPAIR_BASE_TOKEN = os.getenv("FRP_MONITOR_REPAIR_BASE_TOKEN", "V0YwbaOzya0ADBsO2wSc8M9Cntf")
+REPAIR_TABLE_ID = os.getenv("FRP_MONITOR_REPAIR_TABLE_ID", "tblf1nlwkHhMX1V9")
+REPAIR_VIEW_ID = os.getenv("FRP_MONITOR_REPAIR_VIEW", "vewVBaWePF")  # 仅用于拼飞书原记录链接
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPAIR_DB_PATH = os.getenv("FRP_MONITOR_REPAIR_DB", os.path.join(_SCRIPT_DIR, "repairs.sqlite"))
+REPAIR_ATTACH_DIR = os.getenv("FRP_MONITOR_REPAIR_ATTACH_DIR", os.path.join(_SCRIPT_DIR, "repair-attachments"))
+
+# 资产多表同步（KVWO-83）：复用维修面板（KVWO-79）的 lark-cli 同步机制与调度模式，
+# 在同一 Base 上增量接入 5 张资产表（设备明细/归档/异常处理流转/配件核对/流转记录）。
+# 同一 Base 与 lark-cli 命令直接沿用维修面板配置，仅同步开关/间隔/库路径独立，
+# 便于资产侧故障隔离。配置说明见 ASSETS.md。
+ASSET_SYNC_ENABLED = os.getenv("FRP_MONITOR_ASSET_SYNC", "1").strip().lower() not in ("0", "false", "no", "off")
+ASSET_SYNC_INTERVAL = max(60.0, float(os.getenv("FRP_MONITOR_ASSET_INTERVAL", "300")))  # 默认 5 分钟
+ASSET_BASE_TOKEN = os.getenv("FRP_MONITOR_ASSET_BASE_TOKEN", REPAIR_BASE_TOKEN)  # 与维修表同一 Base
+ASSET_DB_PATH = os.getenv("FRP_MONITOR_ASSET_DB", os.path.join(_SCRIPT_DIR, "assets.sqlite"))
+
+# 资产报告推送与面板标题（KVWO-97）：
+# - 库存口径 = 所属单位 ∈ INVENTORY_UNITS（提出人 2026-10-20 确认上海办公室+
+#   潍坊办公室均为公司库存未使用；服务商等其他单位持有不计库存）。
+#   单位清单走 env 可扩展，逗号分隔。
+# - 飞书群机器人 webhook 属敏感凭据：只落在服务器 env 配置，不写入仓库/
+#   文档（置空/未配置 = 关闭推送）。默认每日 09:00（服务器本地时间）推送，
+#   FRP_MONITOR_REPORT_TIMES 支持多时刻（逗号分隔 HH:MM，与采集时长调度同模式）。
+# - 日报正文含主要服务商使用率与版本占比两段（KVWO-107 第六波追加，
+#   2026-10-21 提出人确认），与 /api/assets/units、/api/assets/versions 同口径；
+#   面板展示保留不变（见 feishu_report_text）。
+# - 面板标题：env 覆盖 > lark-cli 解析 Base 全称（启动后台线程 best-effort）
+#   > 兜底值（父需求 KVWO-78 记录的 Base 名称）。
+def _parse_unit_list(spec):
+    """解析逗号分隔单位清单（FRP_MONITOR_INVENTORY_UNITS），去重保序。"""
+    seen, out = set(), []
+    for part in (spec or "").split(","):
+        name = part.strip()
+        if name and name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out or ["上海办公室", "潍坊办公室"]
+
+
+INVENTORY_UNITS = _parse_unit_list(os.getenv("FRP_MONITOR_INVENTORY_UNITS",
+                                             "上海办公室,潍坊办公室"))
+# 闲置口径（需求 4）：库存外在册设备中，最后在线距今 > IDLE_DAYS（含从未上线）；
+# 阈值仅参数化不改口径（提出人 2026-10-20 确认：唯一判据 = 超阈值天数未上线）。
+# 第六波（KVWO-107，提出人 2026-10-21）：默认 30 → 15 天，env 覆盖机制保留。
+IDLE_DAYS = max(1, int(os.getenv("FRP_MONITOR_IDLE_DAYS", "15")))
+FEISHU_WEBHOOK = os.getenv("FRP_MONITOR_FEISHU_WEBHOOK", "").strip()
+# 群机器人若开启「签名校验」（实测推送返回 code 19021 sign match fail），
+# 需配签名密钥（机器人设置页展示的 secret，同为敏感凭据仅落服务器 env）。
+FEISHU_WEBHOOK_SECRET = os.getenv("FRP_MONITOR_FEISHU_WEBHOOK_SECRET", "").strip()
+REPORT_TIMES = os.getenv("FRP_MONITOR_REPORT_TIMES", "09:00")
+PANEL_TITLE_ENV = os.getenv("FRP_MONITOR_PANEL_TITLE", "").strip()
+PANEL_TITLE_FALLBACK = "设备库存与流转管理"  # Base 全称兑底（lark-cli 解析失败时）
+
 V0_HOSTS = {
     "ep-000101", "ep-000102", "ep-000103", "ep-000104", "ep-000105",
     "ep-000107", "ep-000110", "ep-000111", "ep-000112", "ep-000113",
@@ -135,9 +219,9 @@ def ssh_user_for_device(hardware="", hw_model=""):
     arch = ARCH_BY_HW.get(hw) or ARCH_BY_HW.get(hw.casefold() if hw else "")
     return _ssh_user_for_arch(arch)
 
-INDEX = """<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>EGO 设备面板</title><style>{css}</style></head><body><main>
-<header><div><h1>EGO 设备面板</h1><p id=sub>正在加载…</p></div><button id=refresh>立即刷新</button></header>
-<nav id=viewTabs class=vtabs><button type=button data-view=overview class=on>设备总览</button><button type=button data-view=upgrade>升级</button></nav>
+INDEX = """<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>{title}</title><style>{css}</style></head><body><main>
+<header><div><h1>{title}</h1><p id=sub>正在加载…</p></div><button id=refresh>立即刷新</button></header>
+<nav id=viewTabs class=vtabs><button type=button data-view=overview class=on>设备总览</button><button type=button data-view=assets>资产</button><button type=button data-view=upgrade>升级</button></nav>
 <section id=viewOverview>
 <section class=summary><div><b id=online>0</b><span>在线设备</span></div><div><b id=registered>0</b><span>登记设备</span></div><div><b id=pendingN>0</b><span id=targetLbl>待升级</span></div><div><b id=sitesN>0</b><span>站点</span></div><div><b id=missingN>0</b><span>未上线</span></div></section>
 <div class=toolbar><input id=q placeholder="搜索 hostname / device_id / 设备名 / IP"><select id=statusFilter><option value=all>全部状态</option><option value=online selected>仅在线</option><option value=offline>仅未上线</option></select><select id=targetSel title="升级目标版本"></select><button id=copyPending class=listbtn title="按当前筛选（站点/状态/版本/搜索）复制：设备号 站点 IP SSH端口 device_id 当前版本">复制待升级清单</button><button id=copyCmds class=listbtn title="按当前筛选复制 SSH 跳板登录命令">复制跳板命令</button><button id=copyList class=listbtn title="按当前筛选复制设备编号">复制编号</button></div>
@@ -145,6 +229,33 @@ INDEX = """<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=
 <nav id=vers class=sitesbar></nav>
 <div id=grid class=grid></div>
 <section id=events><h2>最近事件（24 小时）</h2><div id=eventsBody class=elist><p class=eempty>加载中…</p></div></section>
+</section>
+<section id=viewAssets hidden>
+<nav id=assetTabs class="vtabs asub"><button type=button data-atab=dashboard class=on>资产总览</button><button type=button data-atab=hardware>硬件台账</button><button type=button data-atab=repairs>维修看板</button><button type=button data-atab=versions>版本视图</button><button type=button data-atab=units>项目视图</button></nav>
+<div id=asSyncBar class="asyncbar ok" hidden></div>
+<section id=atabDashboard>
+<div class=toolbar><button type=button id=asReportPush class=listbtn title="立即向飞书群推送一次资产日报（测试用；需服务器已配置 FRP_MONITOR_FEISHU_WEBHOOK，未配置会如实报错）">📨 立即推送日报（测试）</button><span id=asReportState class=uhint></span></div>
+<section class=amcards id=asMetrics></section>
+<div class=adists id=asDists></div>
+</section>
+<section id=atabHardware hidden>
+<div class=toolbar><input id=asQ placeholder="搜索设备编号 / 去向备注 / 单位"><select id=asStatus></select><select id=asType></select><select id=asUnit></select><label class=aswitch title="归档（已拆解）设备默认隐藏，勾选后追加在表格底部"><input type=checkbox id=asArchived>显示归档设备</label></div>
+<div class=twrap><table class=astable><thead id=asLedgerHead></thead><tbody id=asLedgerBody></tbody></table></div>
+<p class=uhint id=asLedgerHint></p>
+</section>
+<section id=atabRepairs hidden>
+<section class=summary><div><b id=repActive>—</b><span>未完结维修</span></div><div><b id=repTotal>—</b><span>维修记录</span></div><div><b id=repDoneN>—</b><span>已完结</span></div><div><b id=repSync>—</b><span>最后同步</span></div></section>
+<div id=repBanner class=rbanner hidden></div>
+<nav id=repStageStats class=sitesbar></nav>
+<div class=toolbar><input id=repQ placeholder="搜索设备编号 / 问题描述" spellcheck=false autocomplete=off><select id=repStageF title="按流转阶段筛选（仅列表视图）"><option value=all>全部阶段</option></select><select id=repTypeF><option value=all>全部类型</option></select><select id=repUnitF><option value=all>全部单位</option></select><select id=repOwnerF><option value=all>全部负责人</option></select><button id=repReload class=listbtn title="重新拉取维修列表与统计（后端默认每 5 分钟从飞书表同步一次）">重新加载</button><span class=rvswitch><button type=button id=repVKanban class=on>看板</button><button type=button id=repVList>列表</button></span></div>
+<div id=repKanban class=rkan><p class="uempty rkanhint">加载中…</p></div>
+<div id=repListWrap hidden>
+<div class=twrap><table class=rtable><thead><tr><th>设备编号</th><th>类型</th><th>阶段</th><th>所属单位</th><th>问题描述</th><th>负责人</th><th>最后跟进</th><th>台账</th></tr></thead><tbody id=repTbody></tbody></table></div>
+<div id=repDoneWrap class=rdonewrap hidden><button type=button id=repDoneToggle class=listbtn>已完结记录</button><div class=twrap id=repDoneTable hidden><table class=rtable><thead><tr><th>设备编号</th><th>类型</th><th>阶段</th><th>所属单位</th><th>问题描述</th><th>负责人</th><th>最后跟进</th><th>台账</th></tr></thead><tbody id=repDoneTbody></tbody></table></div></div>
+</div>
+</section>
+<section id=atabVersions hidden><div id=asVersionBody><p class=eempty>加载中…</p></div></section>
+<section id=atabUnits hidden><div id=asUnitBody><p class=eempty>加载中…</p></div><div id=asUnitDetail hidden></div></section>
 </section>
 <section id=viewUpgrade hidden>
 <section class=upanel id=upgParamPanel><div class=uhead><h2>① 升级参数</h2><span class=uhint id=upgRegState></span></div>
@@ -163,6 +274,7 @@ INDEX = """<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=
 </main>
 <div id=modal class=modal><div id=modalBody class=mbody></div></div>
 <div id=upgModal class=modal><div id=upgModalBody class=mbody></div></div>
+<div id=repModal class=modal><div id=repModalBody class=mbody></div></div>
 <script>{js}</script></body></html>"""
 CSS = """*{box-sizing:border-box}body{margin:0;background:#f4f7fb;color:#172033;font:14px system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif}main{max-width:1100px;margin:0 auto;padding:32px 20px}header{display:flex;justify-content:space-between;align-items:center;margin-bottom:22px}h1{margin:0 0 7px;font-size:28px}p{margin:0;color:#718096}button{border:0;border-radius:8px;padding:10px 16px;background:#2563eb;color:white;cursor:pointer;font-size:14px}input,select{font:inherit;padding:9px 12px;border:1px solid #cbd5e1;border-radius:8px;background:white;color:#172033;outline:none}input:focus,select:focus{border-color:#2563eb}.summary{display:flex;gap:14px;margin-bottom:18px;flex-wrap:wrap}.summary div{background:white;border:1px solid #e5eaf1;border-radius:12px;padding:14px 22px;min-width:120px;box-shadow:0 2px 8px #1720330a}.summary b{display:block;font-size:26px}.summary span{color:#718096;font-size:12px}.toolbar{display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap}.toolbar input{flex:1;min-width:180px}.listbtn{background:#f1f5f9;color:#334155;border:1px solid #cbd5e1;white-space:nowrap}.listbtn:hover{background:#e2e8f0}.sitesbar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px}.chip{border:1px solid #e5eaf1;background:white;color:#334155;border-radius:999px;padding:6px 14px;font-size:13px;cursor:pointer}.chip b{color:var(--c,#2563eb)}.chip.on{background:var(--c,#2563eb);border-color:var(--c,#2563eb);color:white}.chip.on b{color:white}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:14px}.card{background:white;border:1px solid #e5eaf1;border-radius:12px;padding:16px;box-shadow:0 2px 8px #1720330a;cursor:pointer;transition:transform .08s}.card:hover{transform:translateY(-1px);border-color:#b9cbdf}.card.offline{opacity:.72;background:#fafbfc}.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;gap:6px}.name{font-weight:700;font-size:16px;word-break:break-all}.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px;background:#16a34a}.dot.off{background:#dc2626}.stag{font-size:11px;padding:2px 9px;border-radius:999px;background:color-mix(in srgb,var(--c,#64748b) 12%,white);color:var(--c,#64748b);border:1px solid color-mix(in srgb,var(--c,#64748b) 35%,white);white-space:nowrap}.row{display:flex;justify-content:space-between;color:#667085;padding-top:7px;font-size:13px;gap:8px}.value{font-family:monospace;color:#344054;text-align:right;word-break:break-all}.value.bad{color:#dc2626}small{color:#98a2b3}.empty{grid-column:1/-1;background:white;border:1px dashed #cbd5e1;border-radius:12px;padding:30px;text-align:center;color:#718096}#events{margin-top:26px;background:white;border:1px solid #e5eaf1;border-radius:12px;padding:18px 20px}#events h2{margin:0 0 10px;font-size:16px}#events .elist{max-height:320px;overflow:auto}.erow{display:flex;gap:10px;align-items:baseline;padding:7px 0;border-bottom:1px dashed #eef2f7;font-size:13px}.erow:last-child{border-bottom:0}.erow b{font-family:monospace}.etag{display:inline-block;min-width:64px;text-align:center;padding:2px 8px;border-radius:999px;font-size:12px;white-space:nowrap}.etag.online,.etag.first_seen{background:#dcfce7;color:#15803d}.etag.offline{background:#fee2e2;color:#b91c1c}.etag.version_change{background:#dbeafe;color:#1d4ed8}.edetail{color:#475569;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.erow time{color:#98a2b3;font-size:12px;white-space:nowrap}.eempty{color:#718096;margin:6px 0}.modal{display:none;position:fixed;inset:0;background:#0f172ac9;z-index:50;padding:24px;overflow:auto}.modal.show{display:flex;align-items:flex-start;justify-content:center}.mbody{width:min(760px,100%);background:white;border-radius:14px;padding:22px 24px;box-shadow:0 30px 90px #0006}.mbody header{margin-bottom:6px}.mbody .name{font-size:19px}.mbody .x{background:#f1f5f9;color:#475569;padding:6px 12px;font-size:15px}.mbody h3{margin:18px 0 8px;font-size:14px;color:#334155}.mgrid{display:grid;grid-template-columns:auto 1fr;gap:6px 16px;margin:12px 0;font-size:13px}.mgrid span{color:#718096}.mgrid b{font-family:ui-monospace,monospace;font-weight:600;word-break:break-all}.cmd{display:flex;gap:8px;align-items:center;background:#0f172a;border-radius:8px;padding:10px 12px;margin:10px 0}.cmd code{flex:1;color:#7dd3fc;font-size:12px;font-family:ui-monospace,monospace;word-break:break-all}.cmd button{padding:7px 12px;font-size:12px;background:#0369a1;white-space:nowrap}.twrap{overflow:auto;border:1px solid #e5eaf1;border-radius:8px}.twrap table{width:100%;border-collapse:collapse;font-size:12px;min-width:420px}.twrap th,.twrap td{padding:7px 10px;border-bottom:1px solid #eef2f7;text-align:left}.twrap th{color:#718096;font-weight:500;background:#f8fafc}.mbody .elist{max-height:240px;overflow:auto}@media(max-width:640px){.toolbar{flex-direction:column}.summary div{min-width:100px;flex:1}}
 /* ---- 升级管理视图（Upg） ---- */
@@ -198,7 +310,128 @@ CSS = """*{box-sizing:border-box}body{margin:0;background:#f4f7fb;color:#172033;
 .shaorigin{font-size:12px;padding:2px 10px;border-radius:999px;background:#f1f5f9;color:#667085;white-space:nowrap}.shaorigin.registry{background:#dcfce7;color:#15803d}.shaorigin.manual{background:#dbeafe;color:#1d4ed8}.shaorigin.server{background:#ccfbf1;color:#0f766e}
 .psummary{display:flex;gap:14px;flex-wrap:wrap;align-items:center;background:#f8fafc;border:1px solid #e5eaf1;border-radius:8px;padding:10px 12px;margin-top:10px;font-size:13px;color:#475569}.psummary:empty{display:none}.psummary b{color:#172033}.psummary .shalink{gap:4px}
 .mism{font-size:11px;padding:1px 8px;border-radius:999px;background:#fef3c7;color:#b45309;border:1px solid #fde68a;white-space:nowrap}
-@media(max-width:640px){.vrows{grid-template-columns:1fr}.ucardgrid{grid-template-columns:1fr}.stepper{flex-wrap:wrap}.step{flex:1 1 30%}.prow label{width:auto;text-align:left}.pmeta{margin-left:0}}"""
+/* ---- web 代理补配标记（KVWO-18）：卡片小标 + 详情重试 ---- */
+.wfix{display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:2px 9px;border-radius:999px;background:#f1f5f9;color:#667085;border:1px solid #cbd5e1;white-space:nowrap}
+.wfix.running{background:#dbeafe;color:#1d4ed8;border-color:#bfdbfe}
+.wfix.failed{background:#fee2e2;color:#b91c1c;border-color:#fecaca;cursor:help}
+.wspin{display:inline-block;width:9px;height:9px;border:2px solid #93c5fd;border-top-color:transparent;border-radius:50%;animation:wspin .8s linear infinite;vertical-align:-1px}
+@keyframes wspin{to{transform:rotate(360deg)}}
+.wfixbar{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin:-4px 0 10px}
+.wfixbar small{color:#98a2b3}
+.wfixbar button{padding:6px 16px;font-size:12px;background:#dc2626}
+.wfixbar button:hover:not(:disabled){background:#b91c1c}
+.wfixbar button.arm{background:#b45309}
+.wfixbar button.arm:hover:not(:disabled){background:#92400e}
+.wfixbar button.err{background:#475569;color:#fff;cursor:default;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+@media(max-width:640px){.vrows{grid-template-columns:1fr}.ucardgrid{grid-template-columns:1fr}.stepper{flex-wrap:wrap}.step{flex:1 1 30%}.prow label{width:auto;text-align:left}.pmeta{margin-left:0}}
+/* ---- 资产管理视图（Assets，KVWO-84）：子页签/指标卡/分布条/台账/单位卡/mock 横幅 ---- */
+.asub{margin:-4px 0 18px}
+.asub button{padding:6px 16px;font-size:13px}
+.asyncbar{font-size:12px;border-radius:8px;padding:8px 14px;margin-bottom:14px;display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;line-height:1.6}
+.rptext{white-space:pre-wrap;font:12px/1.7 ui-monospace,monospace;background:#f8fafc;border:1px solid #e5eaf1;border-radius:8px;padding:14px 16px;margin:12px 0 0;max-height:60vh;overflow:auto;word-break:break-all}
+.asyncbar.ok{background:#f0fdf4;border:1px solid #bbf7d0;color:#166534}
+.asyncbar.warn{background:#fffbeb;border:1px solid #fde68a;color:#92400e}
+.asyncbar.err{background:#fef2f2;border:1px solid #fecaca;color:#b91c1c}
+.amcards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:18px}
+.amcard{background:white;border:1px solid #e5eaf1;border-radius:12px;padding:14px 16px;box-shadow:0 2px 8px #1720330a;cursor:help}
+.amcard b{display:block;font-size:26px;color:#172033;font-variant-numeric:tabular-nums}
+.amcard.rate b{color:var(--c,#2563eb)}
+.amcard .albl{color:#718096;font-size:12px}
+.amcard .asub2{color:#98a2b3;font-size:11px;margin-top:7px;line-height:1.55}
+.adists{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
+.apanel{background:white;border:1px solid #e5eaf1;border-radius:12px;padding:16px 18px;box-shadow:0 2px 8px #1720330a;margin-bottom:14px}
+.apanel h3{margin:0 0 12px;font-size:14px;color:#334155}
+.apanel h4{margin:14px 0 8px;font-size:12px;color:#475569}
+.abar{display:grid;grid-template-columns:minmax(72px,120px) 1fr 44px;gap:8px;align-items:center;font-size:12px;margin-bottom:7px}
+.abar .albl2{color:#475569;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.abar .atrack{background:#f1f5f9;border-radius:999px;height:14px;position:relative;overflow:hidden}
+.abar .atrack i{position:absolute;left:0;top:0;bottom:0;border-radius:999px;background:var(--c,#2563eb);min-width:2px}
+.abar .an{color:#667085;text-align:right;font-variant-numeric:tabular-nums}
+.astable{width:100%;border-collapse:collapse;font-size:12px}
+.astable th,.astable td{padding:7px 10px;border-bottom:1px solid #eef2f7;text-align:left;white-space:nowrap}
+.astable th{color:#718096;font-weight:500;background:#f8fafc;user-select:none}
+.astable th.sort{cursor:pointer}
+.astable th.sort:hover{color:#2563eb}
+.astable th .sarr{color:#2563eb;margin-left:2px;font-size:10px}
+.astable td.wrap{max-width:180px;overflow:hidden;text-overflow:ellipsis}
+.astable tr[data-code]{cursor:pointer}
+.astable tr[data-code]:hover td{background:#f8fafc}
+.astable tr.aarch td{opacity:.66;background:#fafbfc}
+.mono{font-family:ui-monospace,monospace}
+.mut{color:#98a2b3}
+.aon{color:#16a34a}.aoff{color:#dc2626}.anull{color:#98a2b3}
+.abadge{border:1px solid #fde68a;background:#fef3c7;color:#b45309;border-radius:999px;padding:1px 9px;font-size:11px;cursor:pointer}
+.abadge:hover{background:#fde68a}
+.aswitch{display:inline-flex;gap:6px;align-items:center;font-size:13px;color:#475569;white-space:nowrap;cursor:pointer}
+.aswitch input{accent-color:#2563eb;width:15px;height:15px}
+.aunitgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px}
+.aunit{background:white;border:1px solid #e5eaf1;border-radius:12px;padding:14px 16px;box-shadow:0 2px 8px #1720330a;cursor:pointer;transition:transform .08s}
+.aunit:hover{transform:translateY(-1px);border-color:#b9cbdf}
+.auhead{display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin-bottom:10px}
+.auhead b{font-size:15px}
+.auhead span{color:#98a2b3;font-size:12px}
+.abarate{display:grid;grid-template-columns:1fr 64px;gap:8px;align-items:center;margin-bottom:10px}
+.abarate span{font-size:12px;color:#166534;text-align:right;font-variant-numeric:tabular-nums}
+.aurow{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+.auinv{font-size:12px;color:#0f766e;background:#ccfbf1;border-radius:8px;padding:6px 10px;margin-bottom:8px}
+.aumut{font-size:11px;color:#98a2b3}
+.abarate.aurate{grid-template-columns:1fr 82px}
+.abarate.aurate span{color:#0e7490}
+.abar.vbar{grid-template-columns:minmax(88px,150px) 1fr 104px}
+.auhead2{display:flex;gap:12px;align-items:baseline;flex-wrap:wrap;margin-bottom:6px}
+.auhead2 b{font-size:16px}
+.auhead2 span{color:#718096;font-size:12px}
+.chip2{display:inline-block;border:1px solid #e5eaf1;background:white;border-radius:999px;padding:2px 10px;font-size:11px;font-family:ui-monospace,monospace;color:#475569;margin:2px 4px 2px 0}
+.acards3{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:4px}
+.acards3 div{background:#f8fafc;border:1px solid #e5eaf1;border-radius:10px;padding:8px 16px;font-size:12px;color:#475569}
+.acards3 b{display:block;font-size:18px;color:#172033;font-variant-numeric:tabular-nums}
+@media(max-width:640px){.abar{grid-template-columns:80px 1fr 40px}.amcards{grid-template-columns:repeat(auto-fit,minmax(140px,1fr))}}
+/* ---- 维修流转视图（Rep，KVWO-80）：统计 / 看板 / 列表 / 详情 ---- */
+.rbanner{background:#fef2f2;border:1px solid #fecaca;color:#b91c1c;border-radius:10px;padding:10px 14px;font-size:13px;margin-bottom:14px;line-height:1.7}
+.rvswitch{display:inline-flex;border:1px solid #cbd5e1;border-radius:8px;overflow:hidden;flex:none}
+.rvswitch button{background:#f8fafc;color:#475569;border-radius:0;padding:9px 16px;font-size:13px}
+.rvswitch button.on{background:#2563eb;color:white}
+.rchip:hover{border-color:var(--c,#2563eb)}
+.rkan{display:grid;grid-template-columns:repeat(7,minmax(160px,1fr));gap:10px;align-items:start;overflow-x:auto;padding-bottom:6px}
+.rkanhint{grid-column:1/-1}
+.rkcol{background:#f8fafc;border:1px solid #e5eaf1;border-radius:10px;padding:8px;min-width:0}
+.rkcol h3{margin:0 0 8px;font-size:12px;display:flex;justify-content:space-between;align-items:center;gap:6px}
+.rkt{font-size:11px;padding:2px 8px;border-radius:999px;background:color-mix(in srgb,var(--c,#64748b) 12%,white);color:var(--c,#64748b);border:1px solid color-mix(in srgb,var(--c,#64748b) 35%,white);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rkn{background:#e2e8f0;border-radius:999px;font-size:11px;padding:1px 8px;color:#475569;flex:none}
+.rkempty{color:#b6c0cf;font-size:11px;text-align:center;padding:8px 0}
+.rcard{background:white;border:1px solid #e5eaf1;border-radius:8px;padding:9px 10px;margin-bottom:8px;cursor:pointer;font-size:12px;transition:transform .08s}
+.rcard:hover{transform:translateY(-1px);border-color:#b9cbdf}
+.rcard:last-child{margin-bottom:0}
+.rd{font-weight:700;font-family:ui-monospace,monospace;font-size:12px;word-break:break-all;display:flex;align-items:center;gap:5px;flex-wrap:wrap}
+.rtyp{font-size:10px;padding:1px 7px;border-radius:999px;background:#f1f5f9;color:#475569;white-space:nowrap;flex:none}
+.rtyp.rt2{background:#dbeafe;color:#1d4ed8}
+.rtyp.rt1{background:#fef3c7;color:#b45309}
+.rprob{color:#475569;margin-top:4px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.5}
+.rmeta{color:#98a2b3;font-size:11px;display:flex;justify-content:space-between;gap:6px;margin-top:6px}
+.ronrow{margin-top:6px}
+.ron{display:inline-block;font-size:10px;padding:1px 8px;border-radius:999px;white-space:nowrap}
+.ron.on{background:#dcfce7;color:#15803d}
+.ron.off{background:#fee2e2;color:#b91c1c}
+.ron.na{background:#f1f5f9;color:#98a2b3}
+.ron.link{cursor:pointer;border:1px solid transparent}
+.ron.link:hover{border-color:currentColor}
+.rtable{width:100%;border-collapse:collapse;font-size:12px;min-width:820px}
+.rtable th,.rtable td{padding:7px 10px;border-bottom:1px solid #eef2f7;text-align:left;vertical-align:top}
+.rtable th{color:#718096;font-weight:500;background:#f8fafc;white-space:nowrap}
+.rtable tbody tr{cursor:pointer}
+.rtable tbody tr:hover{background:#f8fafc}
+.rtable td.rdev{font-family:ui-monospace,monospace;font-weight:600;white-space:nowrap}
+.rprob-cell{max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rdonewrap{margin-top:12px}
+#repDoneToggle{margin-bottom:8px}
+.rtable td.rempty{color:#718096;text-align:center;padding:18px 10px;cursor:default}
+.rattach{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}
+.rattach a{display:flex;flex-direction:column;width:96px;border:1px solid #e5eaf1;border-radius:8px;overflow:hidden;background:#f8fafc;text-decoration:none}
+.rattach img{width:96px;height:72px;object-fit:cover;display:block}
+.rattach .rfname{font-size:11px;color:#667085;padding:4px 6px;word-break:break-all;line-height:1.4}
+.rfootbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:14px}
+.rfeishu{color:#2563eb;text-decoration:none;font-size:13px;border:1px solid #bfdbfe;background:#eff6ff;border-radius:8px;padding:8px 14px}
+.rfeishu:hover{background:#dbeafe}"""
 JS = """const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
 const ETAGS={online:'上线',offline:'掉线',version_change:'版本变更',first_seen:'新设备'};
@@ -214,6 +447,7 @@ function fmtDuration(m){if(m==null||isNaN(m))return '—';m=Math.round(m);if(m<=
 function fmtHours(m){return m==null||isNaN(m)?'—':(m/60).toFixed(1)+'h'}
 let fleet=[],sites=[],versions=[],sshHint={},q='',siteFilter='',verFilter='',targetVer='',pendingOnly=false,statusFilter='online',refreshInterval=15;
 let collectDur={enabled:false,map:{}};
+let webfix={map:{},cands:{}};
 function matches(f){
   if(siteFilter&&(f.site||'未登记')!==siteFilter)return false;
   if(verFilter&&(f.version||'未获取')!==verFilter)return false;
@@ -266,11 +500,43 @@ function renderTargetSel(){
   if(!targetVer||!opts.includes(targetVer))targetVer=opts.find(v=>v!=='未获取')||opts[0]||'';
   sel.value=targetVer;
 }
+/* ---- web 代理补配状态（KVWO-18，契约按 KVWO-19 feat/auto-webfix 定稿对齐）----
+ GET /api/webfix/tasks → {enabled,auto_enabled,port_base,port_max,verify_timeout,
+ candidates:[{hostname,web_port}],counts,tasks:[{task_id,hostname,site,trigger_type,
+ status queued|running|success|failed,error,attempts,web_port,created_at(Unix 秒),
+ finished_at,chars}]}（tasks 为每设备最新一行；candidates 为当前缺配候选）。
+ POST /api/webfix/retry {devices:[...]} → {ok,started:[{hostname,task_id,attempts}],
+ skipped:[{hostname,reason}]}（skipped 必须向用户呈现原因）；SSE 复用
+ /api/upgrade/events：type=webfix（task 同上字段）/ webfix_log（日志增量，总览不消费）。
+ 与 /api/hosts 的 web_port 组合判定：有 web_port → 正常（无标记）；在线 + 有 ssh_port + 无
+ web_port → 缺配候选，再叠加最新任务状态：queued/running → 补配中，failed → 失败（悬停看
+ error），success → 标记消失（版本随下次 /api/hosts 刷新恢复显示）。
+ 接口未上线（404）或拉取失败时优雅降级：沿用上次数据，从无数据时仅按 web_port 显示灰色
+「web 缺配」标记，不显示进行中/失败态。字段解析保留容错（数组/字典形态、ISO/Unix 时间）。 */
+function webfixTask(f){return (webfix.map||{})[String((f&&(f.hostname||f.host))||'').toLowerCase()]||null}
+function webfixState(f){
+  const t=webfixTask(f);
+  if(f&&f.web_port)return{code:'normal',task:t};
+  if(!(f&&f.online&&f.ssh_port))return{code:'',task:t};
+  const s=t?String(t.status||'').toLowerCase():'';
+  if(s==='success'||s==='done'||s==='ok')return{code:'',task:t};
+  if(s==='queued'||s==='running'||s==='pending')return{code:'running',task:t};
+  if(s==='failed'||s==='fail'||s==='error')return{code:'failed',title:(t&&t.error)||'补配失败（未返回原因）',task:t};
+  return{code:'missing',task:t};
+}
+function webfixBadge(f){
+  const st=webfixState(f);
+  if(st.code==='running')return '<span class="wfix running" title="web 代理补配进行中…"><i class="wspin"></i>补配中…</span>';
+  if(st.code==='failed')return `<span class="wfix failed" title="${esc(st.title)}">补配失败</span>`;
+  if(st.code==='missing')return '<span class="wfix" title="未检测到 web 代理（ep-编号-web），等待自动补配">web 缺配</span>';
+  return '';
+}
 function card(f){
   const tag=f.site?`<span class="stag" style="--c:${siteColor(f.site)}">${esc(f.site)}</span>`:'';
+  const wtag=webfixBadge(f);
   const cd=collectDur.enabled?collectDur.map[(f.hostname||'').toLowerCase()]:null;
   if(f.online){
-    return `<article class="card online" data-h="${esc(f.hostname)}"><div class="top"><span class="name"><i class="dot"></i>${esc(f.hostname)}</span>${tag}</div>
+    return `<article class="card online" data-h="${esc(f.hostname)}"><div class="top"><span class="name"><i class="dot"></i>${esc(f.hostname)}</span>${tag}${wtag}</div>
     <div class="row"><span>版本</span><span class="value">${esc(f.version||'未获取')}${f.version_error?` <small title="${esc(f.version_error)}">(读取失败)</small>`:''}</span></div>
     <div class="row"><span>硬件</span><span class="value">${esc(f.hardware||'—')}${f.hw_model?` · ${esc(f.hw_model)}`:''}</span></div>
     <div class="row"><span>IP</span><span class="value">${esc(f.ip||'—')}</span></div>
@@ -318,6 +584,15 @@ async function openDevice(h){
     const evRows=(d.events||[]).map(e=>`<div class="erow"><span class="etag ${esc(e.event_type)}">${ETAGS[e.event_type]||esc(e.event_type)}</span><b>${esc(e.ts||'')}</b><span class="edetail">${esc(e.new_value||e.detail||'')}${e.old_value&&e.new_value?' ← '+esc(e.old_value):''}</span></div>`).join('')||'<p class="eempty">暂无事件</p>';
     const stRows=(d.status||[]).map(s=>`<tr><td>${esc(s.ts)}</td><td>${s.online?'<span style="color:#16a34a">在线</span>':'<span style="color:#dc2626">离线</span>'}</td><td>${esc(s.release_version||'—')}</td><td>${s.connections!=null?s.connections:'—'}</td></tr>`).join('');
     const cmd=d.ssh_port?`ssh -J ${hint.jump||'ubuntu@124.222.147.63'} -p ${d.ssh_port} ${hint.user||'orangepi'}@127.0.0.1`:'';
+    const wf=webfixState(d);
+    const wfc=(webfix.cands||{})[String(d.hostname||d.host||'').toLowerCase()]||null;
+    const wfExp=(wfc&&wfc.web_port)||(wf.task&&wf.task.web_port)||null;
+    const wfRow=wf.code==='normal'?`${d.web_port||'—'} / <span style="color:#16a34a">正常</span>`
+      :wf.code==='running'?`${d.web_port||'—'} / <span style="color:#1d4ed8"><i class="wspin"></i> 补配中</span>`
+      :wf.code==='failed'?`${d.web_port||'—'} / <span style="color:#dc2626" title="${esc(wf.title)}">失败：${esc(wf.title)}</span>`
+      :wf.code==='missing'?`${d.web_port||'—'} / <span style="color:#667085" title="未检测到 web 代理（ep-编号-web），等待自动补配">${wfExp?`缺配（补配后 ${esc(String(wfExp))}）`:'缺配'}</span>`
+      :`${d.web_port||'—'} / <span style="color:#98a2b3" title="设备未在线或无 SSH 隧道时不判定缺配">—</span>`;
+    const wfBar=wf.code==='failed'&&d.online&&d.ssh_port?`<div class="wfixbar"><small>自动补配仅触发一次；重试将重新推送 frpc 配置并重启该机 frpc（隧道秒级闪断）</small><button type="button" id="webfixRetry">重试补配</button></div>`:'';
     $('#modalBody').innerHTML=`
       <header><div><span class="name"><i class="dot${d.online?'':' off'}"></i>${esc(d.hostname)}</span>${d.site?` <span class="stag" style="--c:${siteColor(d.site)}">${esc(d.site)}</span>`:''}</div><button class="x" id="mClose">✕</button></header>
       <div class="mgrid">
@@ -328,16 +603,37 @@ async function openDevice(h){
         <span>当前状态</span><b>${d.online?'在线':'未上线（最后在线 '+(d.last_seen?esc(d.last_seen):'从未')+'）'}</b>
         <span>版本</span><b>${esc(d.release_version||'未获取')}</b>
         <span>SSH / Web 端口</span><b>${d.ssh_port||'—'} / ${d.web_port||'—'}</b>
+        <span>web 代理</span><b>${wfRow}</b>
         <span>首次 / 最后在线</span><b>${esc(d.first_seen||'—')} / ${esc(d.last_seen||'从未')}</b>
         <span>在线率 24h / 7d</span><b>${pct(d.uptime_24h)} / ${pct(d.uptime_7d)}</b>
         <span>采集时长</span><b>${fmtDuration(cd?cd.today_minutes:null)}</b>
       </div>
+      ${wfBar}
       ${cmd?`<div class="cmd"><code id="sshCmd">${esc(cmd)}</code><button id="copyBtn">复制跳板命令</button></div>`:''}
       <h3>近 7 天采集时长</h3><div class="twrap"><table><tr><th>日期</th><th>时长</th></tr>${cdRows||`<tr><td colspan=2 class="eempty">${collectDur.enabled?'暂无采集记录':'采集时长统计未启用'}</td></tr>`}</table></div>
       <h3>最近快照（5 分钟一条）</h3><div class="twrap"><table><tr><th>时间</th><th>状态</th><th>版本</th><th>连接</th></tr>${stRows||'<tr><td colspan=4 class="eempty">暂无快照</td></tr>'}</table></div>
       <h3>最近事件</h3><div class="elist">${evRows}</div>`;
     $('#mClose').onclick=closeModal;
     const cb=$('#copyBtn');if(cb)cb.onclick=async()=>{if(await copyText(cmd)){cb.textContent='已复制 ✓';setTimeout(()=>cb.textContent='复制跳板命令',1500)}else alert(cmd)};
+    const rb=$('#webfixRetry');
+    if(rb)rb.onclick=async()=>{
+      if(rb.dataset.arm!=='1'){rb.dataset.arm='1';rb.classList.add('arm');rb.textContent='确认重试？';setTimeout(()=>{if(rb.isConnected&&rb.dataset.arm==='1'){rb.dataset.arm='';rb.classList.remove('arm');rb.textContent='重试补配'}},4000);return}
+      rb.dataset.arm='';rb.classList.remove('arm');
+      rb.disabled=true;rb.textContent='发起中…';
+      const wfail=msg=>{rb.disabled=false;rb.classList.remove('arm');rb.classList.add('err');rb.textContent='未发起：'+msg;setTimeout(()=>{if(rb.isConnected&&!rb.disabled){rb.classList.remove('err');rb.textContent='重试补配'}},8000)};
+      try{
+        const r=await fetch('/api/webfix/retry',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({devices:[d.hostname]})});
+        const j=await r.json().catch(()=>({}));
+        if(!r.ok||j.ok===false)throw Error(j.error||('HTTP '+r.status));
+        const wnorm=x=>String((x&&(x.hostname||x.host))||'').toLowerCase();
+        const me=String(d.hostname||'').toLowerCase();
+        const wstarted=(j.started||[]).some(x=>wnorm(x)===me);
+        const wskip=(j.skipped||[]).find(x=>wnorm(x)===me);
+        if(!wstarted)throw Error(String((wskip&&(wskip.reason||wskip.error))||'服务端未确认该设备（响应无 started 记录）'));
+        rb.classList.remove('arm');rb.textContent='已发起重试 ✓';
+        setTimeout(()=>{loadWebfix();if($('#modal').classList.contains('show'))openDevice(d.hostname)},900);
+      }catch(e){wfail(String(e.message||e))}
+    };
   }catch(e){$('#modalBody').innerHTML='<p class="eempty">'+esc(String(e))+'</p>'}
 }
 $('#refresh').onclick=()=>load(true);
@@ -384,10 +680,32 @@ async function loadCollectDuration(){
   if(fleet.length)renderGrid();
 }
 loadCollectDuration();setInterval(loadCollectDuration,300000);
+async function loadWebfix(){
+  try{
+    const r=await fetch('/api/webfix/tasks',{cache:'no-store'});
+    const d=await r.json();
+    if(!r.ok)throw Error(d.error||('HTTP '+r.status));
+    let arr=Array.isArray(d)?d:(d.tasks||d.items||d.devices||d.list||[]);
+    if(!Array.isArray(arr)&&arr&&typeof arr==='object')arr=Object.entries(arr).map(([h,t])=>Object.assign({hostname:h},(t&&typeof t==='object')?t:{status:t}));
+    const tsOf=v=>{if(typeof v==='number')return v>1e12?v:Math.round(v*1000);const p=Date.parse(String(v==null?'':v).replace(' ','T'));return isNaN(p)?0:p};
+    const map={};
+    for(const t of (arr||[])){
+      const h=String((t&&(t.hostname||t.host))||'').toLowerCase();if(!h)continue;
+      const ts=tsOf(t&&(t.created_at||t.created));
+      const old=map[h];if(old&&ts<old._ts)continue;
+      map[h]={hostname:h,status:t.status,error:t.error,attempts:t.attempts,trigger_type:t.trigger_type,web_port:t.web_port,created_at:t.created_at,finished_at:t.finished_at,_ts:ts};
+    }
+    const cands={};for(const c of (d.candidates||[]))if(c&&c.hostname)cands[String(c.hostname).toLowerCase()]=c;
+    webfix={map:map,cands:cands};
+  }catch(e){/* webfix 接口未上线/拉取失败：沿用已有数据；从无数据时退化为仅「web 缺配」灰色标记 */}
+  if(fleet.length)renderGrid();
+}
+loadWebfix();setInterval(loadWebfix,15000);
 
 /* ================= 升级管理视图（Upg.* 独立命名空间，不改动设备总览逻辑） =================
  数据契约（后端返工后联调基准）：POST /api/upgrade/jobs {kind,devices,params{version,oss_url,sha256}}、
- GET /api/upgrade/jobs(/<id>)、GET /api/upgrade/events（SSE：{type:'job'|'task'|'log',...}）、
+ GET /api/upgrade/jobs(/<id>)、GET /api/upgrade/events（SSE：{type:'job'|'task'|'log'|'webfix'|'webfix_log',...}，
+ webfix 类事件只驱动设备总览刷新、不进升级视图）、
  GET /api/upgrade/jobs/<id>/log?offset=N[&hostname=]、GET /api/upgrade/packages（包注册表）、
  POST/GET /api/upgrade/sha256（服务端一次性拉包算哈希，异步轮询）。旧 /api/packages 整套已不再依赖。
  字段解析全部做了兼容容错，后端未上线时各区城优雅空态；最终契约以胡磊涛完成评论为准。 */
@@ -418,7 +736,7 @@ archOf(f){const m=String((f&&(f.hw_model||f.hardware))||'').toLowerCase();if(/rk
 init(){
  const tabs=this.gid('viewTabs');
  tabs.addEventListener('click',e=>{const b=e.target.closest('button[data-view]');if(b)this.setView(b.dataset.view)});
- window.addEventListener('hashchange',()=>{const v=new URLSearchParams(location.hash.slice(1)).get('view')==='upgrade'?'upgrade':'overview';if(v!==this.view)this.setView(v,true)});
+ window.addEventListener('hashchange',()=>{const h=new URLSearchParams(location.hash.slice(1)).get('view');const v=h==='upgrade'?'upgrade':(h==='assets'||h==='repairs')?'assets':'overview';if(v!==this.view)this.setView(v,true)});
  const urlIn=this.gid('upgUrl'),shaIn=this.gid('upgSha');
  urlIn.addEventListener('input',()=>{clearTimeout(this.urlTimer);this.urlTimer=setTimeout(()=>this.onUrlInput(),400)});
  urlIn.addEventListener('change',()=>{clearTimeout(this.urlTimer);this.onUrlInput()});
@@ -443,15 +761,18 @@ init(){
  setInterval(()=>{if(this.view==='upgrade')this.loadFleet()},15000);
 },
 setView(v,skipHash){
- if(v!=='upgrade')v='overview';
+ const rep=v==='repairs';if(rep)v='assets';   // 全站唯一维修入口在资产区「维修看板」子页签；#view=repairs 深链兼容（KVWO-88）
+ if(v!=='upgrade'&&v!=='assets')v='overview';
  this.view=v;
  this.gid('viewOverview').hidden=v!=='overview';
  this.gid('viewUpgrade').hidden=v!=='upgrade';
+ this.gid('viewAssets').hidden=v!=='assets';
  document.querySelectorAll('#viewTabs button').forEach(b=>b.classList.toggle('on',b.dataset.view===v));
- if(!skipHash){const p=new URLSearchParams(location.hash.slice(1));if(v==='upgrade')p.set('view','upgrade');else p.delete('view');const s=p.toString();history.replaceState(null,'',location.pathname+location.search+(s?'#'+s:''))}
+ if(!skipHash){const p=new URLSearchParams(location.hash.slice(1));if(v!=='overview'){p.set('view',v);if(rep)p.set('atab','repairs')}else p.delete('view');const s=p.toString();history.replaceState(null,'',location.pathname+location.search+(s?'#'+s:''))}
  if(v==='upgrade')this.enter();
+ if(v==='assets'&&typeof Assets!=='undefined')Assets.enter();   // 资产区域（KVWO-84）懒加载，见文件尾 Assets.*（声明先于本行求值）
 },
-route(){const v=new URLSearchParams(location.hash.slice(1)).get('view')==='upgrade'?'upgrade':'overview';this.setView(v,true)},
+route(){const h=new URLSearchParams(location.hash.slice(1)).get('view');const v=h==='upgrade'?'upgrade':(h==='assets'||h==='repairs')?'assets':'overview';this.setView(v,true)},
 enter(){this.loadRegistry();this.loadFleet();this.loadJobs();this.renderParam();this.updateSelBar();this.updateActions()},
 setActHint(msg,warn){const el=this.gid('upgActHint');el.textContent=msg||'';el.className='uhint'+(warn?' warn':'')},
 parseOssUrl(u){
@@ -843,6 +1164,8 @@ onEvent(name,raw){
  if(s.trim().startsWith('{')){try{m=JSON.parse(s)}catch(e){m=null}}
  if(!m)return;
  const type=String(m.type||name||'').toLowerCase();
+ if(type==='webfix'){loadWebfix();return}   // 补配任务事件（KVWO-19 共流）：只驱动总览刷新，不进升级视图
+ if(type==='webfix_log')return;             // 补配日志增量：升级日志面板不消费
  if(type==='job'||m.job){
   const j=this.normJob(m.job||m);
   if(j.id==null)return;
@@ -870,7 +1193,775 @@ applyTask(t){
  this.renderJob();
 }
 };
-Upg.init();"""
+/* ================= 资产管理视图（Assets.*，KVWO-84：总览仪表盘/硬件台账 360°/项目/版本） =================
+ 契约对齐后端 KVWO-83（/api/assets 系列，KVWO-97 库存口径修正为上海+潍坊；第六波 KVWO-107：闲置 threshold_days 默认 15）：
+   GET /api/assets?status=&type=&unit=&q=&archived=1 → {devices:[…],last_sync_at}
+   GET /api/assets/stats → {registered_total,archived_total,inventory:{total,by_unit,units,unused_note},
+                            deployed,by_status,by_type,by_unit,repair_rate,damage_rate,last_sync_at}
+   GET /api/assets/units → {units:[{unit,total,normal,normal_rate,online,usage_rate,
+                            repairing,abnormal,last_updated}]}（KVWO-107：online=frps 在线
+                            快照数，usage_rate=online/total，在册 0 记 null）
+   GET /api/assets/versions → {detected:[{version,count}],ledger:[…],ledger_empty,matched,
+                              detected_only:[…],ledger_missing:[…],
+                              by_provider_top5:[{unit,total,versions:[{version,count,share}]}]}
+                              （KVWO-107：在册数前 5 单位，探测版本分桶，未探测归「未获取」，
+                              share=count/在册数两位小数）
+   GET /api/assets/{device_code} → {ledger:{…},repairs:[…],flows:[…],parts:[…],transfers:[…]}
+ 接口未合并（404）时按契约 mock 并以横幅明示（绝不静默冒充生产数据）；后端合入后 404 消失
+ 即自动切真实数据，前端零改动。字段解析容错（候选键），联调以真实字段为准。
+ 导航：顶栏「资产」页签 + 子页签（总览/硬件/维修/版本/项目）。「维修看板」槽位由 KVWO-80 的 Rep.*
+ 填充（KVWO-88 并入），#view=repairs 深链兼容路由到本子页签。 */
+const Assets={
+mock:false,err:'',lastGoodAt:0,loaded:false,tab:'dashboard',drillUnit:'',
+stats:null,units:null,versions:null,devices:[],archived:[],_mockCache:null,
+hw:{q:'',status:'',type:'',unit:'',archived:false,sortKey:'code',sortDir:1},
+STATUS_ORDER:['正常','异常','维修中','待维修','待标定','测试中','已拆解'],
+ST_COLOR:{'正常':'#16a34a','异常':'#dc2626','维修中':'#ea580c','待维修':'#d97706','待标定':'#2563eb','测试中':'#0891b2','已拆解':'#64748b'},
+TYPE_COLOR:{'EgoPortal-Stereo-V0':'#2563eb','EgoPortal-Stereo-V1':'#7c3aed','EgoPortal-Lite':'#0891b2'},
+init(){
+ const tabs=document.getElementById('assetTabs');
+ tabs.addEventListener('click',e=>{const b=e.target.closest('button[data-atab]');if(b)this.go(b.dataset.atab)});
+ window.addEventListener('hashchange',()=>{if(!document.getElementById('viewAssets').hidden)this.applyHash()});
+ document.getElementById('asQ').oninput=e=>{this.hw.q=e.target.value.trim().toLowerCase();this.renderLedger()};
+ document.getElementById('asStatus').onchange=e=>{this.hw.status=e.target.value;this.renderLedger()};
+ document.getElementById('asType').onchange=e=>{this.hw.type=e.target.value;this.renderLedger()};
+ document.getElementById('asUnit').onchange=e=>{this.hw.unit=e.target.value;this.renderLedger()};
+ document.getElementById('asArchived').onchange=e=>{this.hw.archived=e.target.checked;this.renderLedger()};
+ document.getElementById('asReportPush').onclick=()=>this.pushReport();
+ document.getElementById('asLedgerHead').onclick=e=>{const th=e.target.closest('th[data-sk]');if(!th)return;if(this.hw.sortKey===th.dataset.sk)this.hw.sortDir*=-1;else{this.hw.sortKey=th.dataset.sk;this.hw.sortDir=1}this.renderLedger()};
+ document.getElementById('asLedgerBody').onclick=e=>{this.rowClick(e)};
+ document.getElementById('asUnitDetail').addEventListener('click',e=>{
+  if(e.target.closest('#asUnitBack')){this.drillUnit='';document.getElementById('asUnitDetail').hidden=true;document.getElementById('asUnitBody').hidden=false;this.writeHash({atab:'units'});return}
+  this.rowClick(e)});
+ setInterval(()=>{if(!document.getElementById('viewAssets').hidden&&this.loaded&&!this.mock)this.loadAll()},60000);
+ if(!document.getElementById('viewAssets').hidden)this.enter();
+},
+rowClick(e){
+ const rb=e.target.closest('button[data-gorep]');
+ if(rb){this.go('repairs',{q:rb.dataset.gorep});return}
+ const tr=e.target.closest('tr[data-code]');if(tr)this.open360(tr.dataset.code)
+},
+enter(){this.applyHash();if(!this.loaded)this.loadAll();else this.syncBar()},
+applyHash(){
+ const p=new URLSearchParams(location.hash.slice(1));
+ const vh=p.get('view');if(vh!=='assets'&&vh!=='repairs')return;   // view=repairs → 维修看板深链兼容（KVWO-88）
+ const t=p.get('atab')||(vh==='repairs'?'repairs':'dashboard');
+ this.setTab(['dashboard','hardware','repairs','versions','units'].includes(t)?t:'dashboard');
+ if(p.get('q')!=null){this.hw.q=String(p.get('q')).toLowerCase();const el=document.getElementById('asQ');if(el)el.value=p.get('q')||''}
+ const u=p.get('unit');if(u&&this.units)this.drill(u);
+ if(this.loaded)this.render();
+},
+writeHash(extra){
+ const p=new URLSearchParams(location.hash.slice(1));p.set('view','assets');
+ for(const k of['atab','q','unit'])p.delete(k);
+ if(extra)for(const kv of Object.entries(extra))p.set(kv[0],kv[1]);
+ history.replaceState(null,'',location.pathname+location.search+'#'+p.toString())
+},
+go(tab,extra){this.setTab(tab);this.writeHash(Object.assign({atab:tab},extra||{}));if(tab==='repairs')this.renderRepairs()},
+setTab(t){
+ this.tab=t;
+ if(t!=='units')this.drillUnit='';   // 离开项目页签即退出下钻态，避免深链/切页被旧下钻拉回
+ document.querySelectorAll('#assetTabs button').forEach(b=>b.classList.toggle('on',b.dataset.atab===t));
+ for(const s of['dashboard','hardware','repairs','versions','units'])document.getElementById('atab'+s[0].toUpperCase()+s.slice(1)).hidden=s!==t;
+ if(t==='units'&&!this.drillUnit){document.getElementById('asUnitDetail').hidden=true;document.getElementById('asUnitBody').hidden=false}
+},
+/* ---------- 数据层：真实 API 优先，404 时契约 mock（横幅明示） ---------- */
+async api(path){
+ const r=await fetch(path,{cache:'no-store'});
+ if(r.status===404){this.mock=true;return this.mockFor(path)}
+ const d=await r.json().catch(()=>null);
+ if(!r.ok||d==null)throw Error((d&&d.error)||('HTTP '+r.status));
+ this.mock=false;return d
+},
+async loadAll(){
+ try{
+  const res=await Promise.all([this.api('/api/assets/stats'),this.api('/api/assets/units'),this.api('/api/assets/versions'),this.api('/api/assets'),this.api('/api/assets?archived=1')]);
+  this.stats=this.normStats(res[0]);this.units=this.normUnits(res[1]);this.versions=this.normVers(res[2]);
+  this.devices=this.normList(res[3],false);this.archived=this.normList(res[4],true);
+  this.err='';this.loaded=true;this.lastGoodAt=Date.now();
+ }catch(e){this.err=String(e.message||e)}
+ this.syncBar();this.render();
+},
+normList(d,archived){const arr=(d&&(d.devices||d.items||d.records))||(Array.isArray(d)?d:[]);return arr.map(r=>this.normDev(r,archived)).filter(x=>x.code)},
+nByKey(o,ks){for(const k of ks)if(o&&o[k]!=null)return o[k];return null},
+/* 闲置阈值天数：文案一律取后端 stats.idle.threshold_days（KVWO-107 起默认 15），无返回才兑底 15，不写死 */
+idleDays(){const d=this.stats&&this.stats.idleDays;return d!=null?d:15},
+normDev(r,archived){
+ const on=r?(r.device_online!==undefined?r.device_online:r.online):null;
+ return{code:String(this.nByKey(r,['device_code','device_id','code'])||'').trim(),
+  type:this.nByKey(r,['device_type','type']),status:this.nByKey(r,['status']),
+  unit:this.nByKey(r,['unit','organization']),parts:this.nByKey(r,['accessories','parts']),
+  remark:this.nByKey(r,['remark','note']),ledgerVer:this.nByKey(r,['ledger_version','software_version']),
+  detVer:this.nByKey(r,['detected_version']),online:on===true?true:(on===false?false:null),
+  openRepairs:Number(this.nByKey(r,['open_repairs','repair_count'])||0),
+  updatedAt:this.nByKey(r,['updated_at','last_updated']),modifier:this.nByKey(r,['modifier']),
+  lastSeen:this.nByKey(r,['last_seen','lastSeen']),idle:this.nByKey(r,['idle']),
+  archived:!!(archived||(r&&r.archived))}
+},
+normStats(s){return{
+ total:this.nByKey(s,['registered_total','total','registered']),archived:this.nByKey(s,['archived_total','archived']),
+ invTotal:this.nByKey(s&&s.inventory,['total']),invB:this.nByKey(s&&s.inventory,['unused_note']),
+ invUnits:(s&&s.inventory&&Array.isArray(s.inventory.units))?s.inventory.units:[],
+ invByUnit:Object.assign({},(s&&s.inventory&&s.inventory.by_unit)||{}),
+ idleTotal:this.nByKey(s&&s.idle,['total']),idleDays:this.nByKey(s&&s.idle,['threshold_days']),
+ idleByUnit:Object.assign({},(s&&s.idle&&s.idle.by_unit)||{}),
+ deployed:this.nByKey(s,['deployed']),
+ byStatus:Object.assign({},s&&(s.by_status||s.status)||{}),byType:Object.assign({},s&&(s.by_type||s.type)||{}),byUnit:Object.assign({},s&&(s.by_unit||s.unit)||{}),
+ repairRate:this.nByKey(s,['repair_rate']),damageRate:this.nByKey(s,['damage_rate']),
+ lastSync:this.nByKey(s,['last_sync_at','last_sync','synced_at'])}
+},
+normUnits(u){const arr=(u&&(u.units||u.items))||(Array.isArray(u)?u:[]);return arr.map(x=>({
+ unit:String(this.nByKey(x,['unit','name'])||''),total:this.nByKey(x,['total','count']),
+ normalRate:this.nByKey(x,['normal_rate']),repairing:this.nByKey(x,['repairing']),abnormal:this.nByKey(x,['abnormal']),
+ online:this.nByKey(x,['online','online_count']),usageRate:this.nByKey(x,['usage_rate']),   // 第六波 KVWO-107：在线数与使用率（在线/在册，null → 「—」）
+ lastUpdated:this.nByKey(x,['last_updated','updated_at'])}))
+},
+normVers(v){const arr=a=>Array.isArray(a)?a:[];return{
+ detected:arr(v&&v.detected),ledger:arr(v&&v.ledger),
+ ledgerEmpty:this.nByKey(v,['ledger_empty']),matched:this.nByKey(v,['matched']),
+ detectedOnly:arr(v&&v.detected_only),ledgerMissing:arr(v&&v.ledger_missing),
+ byProviderTop5:arr(v&&v.by_provider_top5).map(p=>({unit:String(this.nByKey(p,['unit','name'])||''),total:this.nByKey(p,['total','count']),
+  versions:arr(p&&p.versions).map(x=>({version:this.nByKey(x,['version']),count:this.nByKey(x,['count']),share:this.nByKey(x,['share'])}))}))}   // 第六波 KVWO-107：主要服务商版本占比（在册数前 5）
+},
+fmtTs(v){
+ if(v==null||v==='')return null;
+ const t=typeof v==='number'?(v<1e12?v*1000:v):Date.parse(String(v).replace(' ','T'));
+ return isNaN(t)?String(v):new Date(t).toLocaleString('zh-CN',{hour12:false})
+},
+tsOf(v){if(v==null||v==='')return 0;const t=typeof v==='number'?(v<1e12?v*1000:v):Date.parse(String(v).replace(' ','T'));return isNaN(t)?0:t},
+shortType(t){return String(t||'').replace('EgoPortal-','')},
+natCmp(a,b){return String(a).localeCompare(String(b),undefined,{numeric:true,sensitivity:'base'})},
+syncBar(){
+ const el=document.getElementById('asSyncBar');el.hidden=false;
+ const when=this.stats&&this.stats.lastSync?('飞书同步于 '+this.fmtTs(this.stats.lastSync)):'';
+ const good=this.lastGoodAt?('拉取于 '+new Date(this.lastGoodAt).toLocaleString('zh-CN',{hour12:false})):'';
+ if(this.mock){el.className='asyncbar warn';el.innerHTML='⚠ /api/assets 接口未就绪（后端 KVWO-83 未合并）：当前展示<b>契约 mock 演示数据</b>，仅供开发预览，不代表真实资产；后端合入后自动切换真实数据，前端无需改动'}
+ else if(this.err&&!this.loaded){el.className='asyncbar err';el.innerHTML='资产数据加载失败：'+esc(this.err)+'（每 60 秒自动重试）'}
+ else if(this.err){el.className='asyncbar err';el.innerHTML='最近一次刷新失败：'+esc(this.err)+'，展示最后成功数据'+(good?'（'+good+'）':'')+(when?' · '+when:'')}
+ else{el.className='asyncbar ok';el.innerHTML='资产数据'+(when||'')+(good?' · '+good:'')+' · 来源：飞书多维表（只读同步）'}
+},
+render(){if(!this.loaded)return;this.renderMetrics();this.renderDists();this.renderFilters();this.renderLedger();this.renderRepairs();this.renderVersions();this.renderUnits()},
+invLabel(){
+ const st=this.stats||{},bu=st.invByUnit||{};const parts=(st.invUnits&&st.invUnits.length?st.invUnits:['上海办公室','潍坊办公室']).map(u=>u+' '+((bu[u]!=null?bu[u]:0))+' 台');
+ return (parts.length?parts.join(' + '):'—')+'（公司库存，服务商持有不计）'
+},
+/* ---------- 日报手动推送（测试按钮，KVWO-97 评论区要求）：POST /api/assets/report/run，成功弹窗展示消息全文 ---------- */
+async pushReport(){
+ const btn=document.getElementById('asReportPush'),st=document.getElementById('asReportState');
+ if(!btn||btn.disabled)return;
+ btn.disabled=true;st.textContent='推送中…';
+ try{
+  const r=await fetch('/api/assets/report/run',{method:'POST',cache:'no-store'});
+  const d=await r.json().catch(()=>null);
+  if(!r.ok||!d||!d.ok){st.textContent='推送失败：'+((d&&d.error)||('HTTP '+r.status));return}
+  st.textContent='已推送（'+(d.reason||'manual')+' · '+(this.fmtTs((d.at||0)*1000)||'')+'），消息全文见弹窗';
+  const m=document.getElementById('modal');
+  document.getElementById('modalBody').innerHTML='<header><div><span class=name>资产日报 · 推送成功（飞书群应已收到）</span></div><button class=x id=mClose>✕</button></header><pre class=rptext>'+esc(d.text||'')+'</pre>';
+  m.classList.add('show');
+  document.getElementById('mClose').onclick=()=>m.classList.remove('show');
+ }catch(e){st.textContent='推送失败：'+String(e.message||e)}
+ finally{btn.disabled=false}
+},
+/* ---------- 模块 1：总览仪表盘 ---------- */
+renderMetrics(){
+ const s=this.stats,el=document.getElementById('asMetrics');if(!s){el.innerHTML='';return}
+ const n=k=>Number((s.byStatus||{})[k]||0);
+ const pctv=v=>v==null?'—':(Math.round(v*1000)/10)+'%';
+ const st='统计时间：'+(this.fmtTs(s.lastSync)||'—');
+ const cards=[
+  {v:s.total,l:'在册总数',sub:'口径：设备明细表（不含归档）'},
+  {v:s.archived,l:'归档（已拆解）',sub:'口径：设备归档数据表，不参与在册指标'},
+  {v:s.invTotal,l:'库存',sub:'口径：'+this.invLabel()+(s.invB!=null?'；参考：备注含「未使用」'+s.invB+' 台':''),c:'#0f766e'},
+  {v:s.deployed,l:'一线部署',sub:'口径：在册 − 库存（库存单位持有不计部署）'},
+  {v:pctv(s.repairRate),l:'维修率',rate:1,c:'#ea580c',sub:'计算式：(维修中 '+n('维修中')+' + 待维修 '+n('待维修')+') / 在册 '+s.total},
+  {v:pctv(s.damageRate),l:'损坏率',rate:1,c:'#dc2626',sub:'计算式：(异常 '+n('异常')+' + 维修中 '+n('维修中')+' + 待维修 '+n('待维修')+') / 在册 '+s.total},
+  {v:s.idleTotal,l:'闲置',sub:'口径：库存外·超 '+this.idleDays()+' 天未上线（含从未上线）；fleet 库未启用时不可计算',c:'#7c3aed'},
+ ];
+ el.innerHTML=cards.map(m=>'<div class="amcard'+(m.rate?' rate':'')+'" style="--c:'+(m.c||'')+'" title="'+esc(m.sub)+'\\n'+esc(st)+'"><b>'+esc(m.v==null?'—':m.v)+'</b><span class=albl>'+esc(m.l)+'</span><div class=asub2>'+esc(m.sub)+'<br>'+esc(st)+'</div></div>').join('');
+},
+renderDists(){
+ const el=document.getElementById('asDists'),s=this.stats;if(!s){el.innerHTML='';return}
+ const bars=(entries,colorFn,labelFn)=>{
+  const max=Math.max.apply(null,entries.map(e=>e[1]).concat([1]));
+  return entries.map(e=>'<div class=abar title="'+esc(e[0])+'：'+e[1]+'"><span class=albl2>'+esc(labelFn?labelFn(e[0]):e[0])+'</span><div class=atrack><i style="width:'+(e[1]/max*100).toFixed(1)+'%;--c:'+(colorFn?colorFn(e[0]):'#2563eb')+'"></i></div><span class=an>'+e[1]+'</span></div>').join('')};
+ const stE=this.STATUS_ORDER.filter(k=>s.byStatus[k]).map(k=>[k,s.byStatus[k]]).concat(Object.entries(s.byStatus).filter(e=>this.STATUS_ORDER.indexOf(e[0])<0));
+ const tyE=Object.entries(s.byType).sort((a,b)=>b[1]-a[1]);
+ const unE=Object.entries(s.byUnit).sort((a,b)=>b[1]-a[1]);
+ // 第六波 KVWO-108：主要服务商使用率（在册数前 5，口径：在线/在册（快照），null → 「—」）
+ const uTop=(this.units||[]).slice().sort((a,b)=>(b.total||0)-(a.total||0)||String(a.unit).localeCompare(String(b.unit),'zh')).slice(0,5);
+ const uHtml=uTop.length?uTop.map(u=>{
+  const use=u.usageRate==null?null:Math.round(u.usageRate*1000)/10;
+  return '<div class=abar title="'+esc(u.unit)+'：在线 '+(u.online!=null?u.online:'—')+' / 在册 '+(u.total!=null?u.total:'—')+' · 使用率 '+(use==null?'—（不可计算）':use+'%')+'（在线/在册（快照））"><span class=albl2>'+esc(u.unit)+'</span><div class=atrack><i style="width:'+(use==null?0:Math.min(use,100))+'%;--c:#0891b2"></i></div><span class=an>'+(use==null?'—':use+'%')+'</span></div>'
+ }).join(''):'<p class=eempty>暂无单位数据</p>';
+ el.innerHTML='<div class=adists>'+
+  '<div class=apanel><h3>状态分布（在册 '+(s.total!=null?s.total:'—')+' 台）</h3>'+(stE.length?bars(stE,k=>this.ST_COLOR[k]||'#64748b'):'<p class=eempty>暂无数据</p>')+'</div>'+
+  '<div class=apanel><h3>设备类型分布</h3>'+(tyE.length?bars(tyE,k=>this.TYPE_COLOR[k]||'#2563eb',k=>this.shortType(k)):'<p class=eempty>暂无数据</p>')+'</div>'+
+  '<div class=apanel><h3>所属单位 TOP 分布</h3>'+(unE.length?bars(unE,null):'<p class=eempty>暂无数据</p>')+'</div>'+
+  '<div class=apanel><h3>主要服务商使用率（在册数前 5）</h3><p class=uhint style="margin:0 0 10px">口径：在线/在册（快照） · 统计时间：'+esc(this.fmtTs(s.lastSync)||'—')+'</p>'+uHtml+'</div>'+
+ '</div>';
+},
+/* ---------- 模块 2：硬件台账（筛选/自然排序/360°） ---------- */
+renderFilters(){
+ const s=this.stats;if(!s)return;
+ const fill=(id,allLbl,map,ordered)=>{const el=document.getElementById(id);const cur=el.value;
+  let keys=Object.keys(map);if(ordered)keys=ordered.filter(k=>map[k]!=null).concat(keys.filter(k=>ordered.indexOf(k)<0));
+  el.innerHTML='<option value="">'+allLbl+'</option>'+keys.map(k=>'<option value="'+esc(k)+'">'+esc(id==='asType'?this.shortType(k):k)+'（'+map[k]+'）</option>').join('');
+  el.value=keys.indexOf(cur)>=0?cur:''};
+ fill('asStatus','全部状态',s.byStatus,this.STATUS_ORDER);fill('asType','全部类型',s.byType);
+ const um={};for(const u of this.units||[])um[u.unit]=u.total;fill('asUnit','全部单位',um);
+},
+sortDevs(list){
+ const hw=this.hw;
+ return list.slice().sort((x,y)=>{
+  if(hw.sortKey==='code')return this.natCmp(x.code,y.code)*hw.sortDir;
+  return (this.tsOf(x.updatedAt)-this.tsOf(y.updatedAt))*hw.sortDir||this.natCmp(x.code,y.code)
+ })
+},
+ledgerRows(){
+ const hw=this.hw,q=hw.q;
+ const match=d=>{
+  if(hw.status&&d.status!==hw.status)return false;
+  if(hw.type&&d.type!==hw.type)return false;
+  if(hw.unit&&d.unit!==hw.unit)return false;
+  if(q){const hay=(d.code+' '+(d.remark||'')+' '+(d.unit||'')).toLowerCase();if(hay.indexOf(q)<0)return false}
+  return true};
+ let list=this.sortDevs(this.devices.filter(match));
+ if(hw.archived)list=list.concat(this.sortDevs(this.archived.filter(match)));
+ return list
+},
+ledgerHeadHtml(interactive){
+ const cols=[['code','设备编号'],['type','类型'],['status','状态'],['unit','所属单位'],['parts','配件情况'],['remark','去向 / 备注'],['ledgerVer','台账版本'],['detVer','探测版本'],['online','在线'],['idle','闲置'],['openRepairs','维修'],['updatedAt','最后更新']];
+ const ar=k=>interactive&&this.hw.sortKey===k?(this.hw.sortDir>0?'▲':'▼'):'';
+ return '<tr>'+cols.map(c=>'<th'+(interactive?' class=sort data-sk="'+c[0]+'"':'')+'>'+c[1]+(ar(c[0])?' <span class=sarr>'+ar(c[0])+'</span>':'')+'</th>').join('')+'</tr>'
+},
+ledgerRowHtml(d){
+ const c=this.ST_COLOR[d.status]||'#64748b';
+ const on=d.online===true?'<span class=aon title=在线>●</span>':d.online===false?'<span class=aoff title=离线>○</span>':'<span class=anull title=未匹配>—</span>';
+ const rep=d.openRepairs>0?'<button class=abadge data-gorep="'+esc(d.code)+'" title="点击查看维修看板">'+d.openRepairs+'</button>':'<span class=anull>0</span>';
+ const idl=d.idle===true?'<span class=stag style="--c:#7c3aed" title="库存外·超 '+this.idleDays()+' 天未上线">闲置</span>':'<span class=anull title="不在闲置口径或不可判定">—</span>';
+ return '<tr data-code="'+esc(d.code)+'"'+(d.archived?' class=aarch':'')+'><td class=mono>'+esc(d.code.toUpperCase())+'</td><td>'+esc(this.shortType(d.type)||'—')+'</td><td><span class=stag style="--c:'+c+'">'+esc(d.status||'—')+'</span></td><td>'+esc(d.unit||'—')+'</td><td class=wrap title="'+esc(d.parts||'')+'">'+esc(d.parts||'—')+'</td><td class=wrap title="'+esc(d.remark||'')+'">'+esc(d.remark||'—')+'</td><td>'+esc(d.ledgerVer||'—')+'</td><td>'+esc(d.detVer||'—')+'</td><td>'+on+'</td><td>'+idl+'</td><td>'+rep+'</td><td class=mut>'+esc(this.fmtTs(d.updatedAt)||'—')+'</td></tr>'
+},
+renderLedger(){
+ document.getElementById('asLedgerHead').innerHTML=this.ledgerHeadHtml(true);
+ const rows=this.ledgerRows();
+ document.getElementById('asLedgerBody').innerHTML=rows.length?rows.map(d=>this.ledgerRowHtml(d)).join(''):'<tr><td colspan=12 class=eempty>没有匹配的设备（可调整筛选或关键词）</td></tr>';
+ document.getElementById('asLedgerHint').textContent='在册 '+this.devices.length+' 台 · 当前显示 '+rows.filter(d=>!d.archived).length+' 台'+(this.hw.archived?' · 归档 '+rows.filter(d=>d.archived).length+' 台（已追加在下方，淡色显示）':' · 归档 '+this.archived.length+' 台默认隐藏（勾选「显示归档设备」展开）');
+},
+async open360(code){
+ const m=document.getElementById('modal');m.classList.add('show');
+ const body=document.getElementById('modalBody');body.innerHTML='<p class=eempty>加载中…</p>';
+ let d;
+ try{d=await this.api('/api/assets/'+encodeURIComponent(code))}
+ catch(e){body.innerHTML='<p class=eempty>读取设备详情失败：'+esc(String(e.message||e))+'</p>';return}
+ const led=(d&&(d.ledger||d.device))||d||{};
+ const dev=this.normDev(led,!!(d&&d.archived));
+ const v=x=>(x==null||x==='')?'—':esc(String(x));
+ const tbl=(cols,rows,empty)=>'<div class=twrap><table class=astable><thead><tr>'+cols.map(c=>'<th>'+c+'</th>').join('')+'</tr></thead><tbody>'+(rows.length?rows.join(''):'<tr><td colspan='+cols.length+' class=eempty>'+(empty||'暂无数据')+'</td></tr>')+'</tbody></table></div>';
+ const repRows=(d&&d.repairs||[]).map(r=>'<tr><td>'+v(r.stage)+'</td><td class=wrap>'+v(r.issue_description||r.issue)+'</td><td>'+v(Array.isArray(r.repair_owners)?r.repair_owners.join('、'):(r.repair_owners||r.owner))+'</td><td>'+v(this.fmtTs(r.last_followed_at))+'</td><td class=wrap>'+v(r.last_follow_note)+'</td></tr>');
+ const flowRows=(d&&d.flows||[]).map(r=>'<tr><td>'+v(r.action)+'</td><td>'+v(r.operator)+'</td><td>'+v(this.fmtTs(r.ts||r.time||r.operated_at))+'</td><td class=wrap>'+v(r.note||r.summary)+'</td></tr>');
+ const partRows=(d&&d.parts||[]).map(r=>'<tr><td>'+v(r.part||r.accessory)+'</td><td>'+v(r.arrival||r.arrival_status)+'</td><td>'+v(r.item||r.check_item)+'</td><td class=wrap>'+v(r.note||r.status_note)+'</td><td>'+v(this.fmtTs(r.checked_at||r.time))+'</td></tr>');
+ const trRows=(d&&d.transfers||[]).map(r=>'<tr><td>'+v(this.fmtTs(r.ts||r.time))+'</td><td>'+v(r.unit)+'</td><td>'+v(r.item)+'</td><td>'+v(r.qty!=null?r.qty:null)+'</td><td class=wrap>'+v(r.note)+'</td></tr>');
+ const stc=this.ST_COLOR[dev.status]||'#64748b';
+ body.innerHTML=
+  '<header><div><span class=name>'+esc(dev.code.toUpperCase())+'</span> <span class=stag style="--c:'+stc+'">'+esc(dev.status||'—')+'</span>'+(dev.archived?' <span class=stag style="--c:#64748b">归档</span>':'')+'</div><button class=x id=mClose>✕</button></header>'+
+  '<h3>台账信息</h3><div class=mgrid>'+
+  '<span>设备编号</span><b>'+esc(dev.code.toUpperCase())+'</b>'+
+  '<span>设备类型</span><b>'+v(dev.type)+'</b>'+
+  '<span>所属单位</span><b>'+v(dev.unit)+'</b>'+
+  '<span>配件情况</span><b>'+v(dev.parts)+'</b>'+
+  '<span>去向 / 备注</span><b>'+v(dev.remark)+'</b>'+
+  '<span>台账软件版本</span><b>'+v(dev.ledgerVer)+'</b>'+
+  '<span>探测版本</span><b>'+v(dev.detVer)+'</b>'+
+  '<span>在线状态</span><b>'+(dev.online===true?'<span style="color:#16a34a">● 在线</span>':dev.online===false?'<span style="color:#dc2626">○ 离线</span>':'—（未匹配）')+'</b>'+
+  '<span>最后在线</span><b>'+(dev.lastSeen?esc(this.fmtTs(dev.lastSeen)):'—（从未上线或 fleet 未启用）')+'</b>'+
+  '<span>闲置</span><b>'+(dev.idle===true?'<span style="color:#7c3aed">是（超 '+this.idleDays()+' 天未上线）</span>':dev.idle===false?'否':'—（不可判定）')+'</b>'+
+  '<span>未完结维修</span><b>'+(dev.openRepairs||0)+' 条</b>'+
+  '<span>最后更新</span><b>'+v(this.fmtTs(dev.updatedAt))+'</b>'+
+  '<span>修改人</span><b>'+v(dev.modifier)+'</b>'+
+  '</div>'+
+  '<h3>维修记录（异常设备表）</h3>'+tbl(['阶段','问题描述','负责人','最后跟进','跟进说明'],repRows)+
+  '<h3>处理流水（异常处理流转）</h3>'+tbl(['动作','操作人','时间','说明'],flowRows)+
+  '<h3>配件核对</h3>'+tbl(['配件','到货状态','核对项','状态说明','核对时间'],partRows)+
+  (trRows.length?'<h3>流转记录</h3>'+tbl(['时间','所属单位','物品','数量','说明'],trRows):'');
+ document.getElementById('mClose').onclick=()=>m.classList.remove('show');
+},
+/* ---------- 模块 3：项目（单位）视图 ---------- */
+stagN(l,n){const c=this.ST_COLOR[l]||'#64748b';return '<span class=stag style="--c:'+c+'">'+l+' '+(n==null?'—':n)+'</span>'},
+shanghaiInv(){
+ if(!this.stats)return null;
+ const sh=this.devices.filter(d=>d.unit==='上海办公室');
+ const unused=this.stats.invB!=null?this.stats.invB:sh.filter(d=>String(d.remark||'').indexOf('未使用')>=0).length;
+ return{unused:unused,newBuild:sh.filter(d=>String(d.remark||'').indexOf('新组装')>=0).length}
+},
+renderUnits(){
+ if(this.drillUnit){this.drill(this.drillUnit);return}
+ const el=document.getElementById('asUnitBody'),us=this.units;
+ if(!us||!us.length){el.innerHTML='<p class=eempty>暂无单位数据</p>';return}
+ const inv=this.shanghaiInv();
+ el.innerHTML='<div class=aunitgrid>'+us.map(u=>{
+  const rate=u.normalRate==null?null:Math.round(u.normalRate*1000)/10;
+  const use=u.usageRate==null?null:Math.round(u.usageRate*1000)/10;
+  const st=this.stats||{},isInv=((st.invUnits)||[]).indexOf(u.unit)>=0,icnt=((st.invByUnit)||{})[u.unit];
+  return '<div class=aunit data-unit="'+esc(u.unit)+'" title="点击下钻该单位设备列表">'+
+   '<div class=auhead><b>'+esc(u.unit)+'</b><span>'+(u.total!=null?u.total:'—')+' 台</span></div>'+
+   '<div class=abarate><div class=atrack><i style="width:'+(rate==null?0:Math.min(rate,100))+'%;--c:#16a34a"></i></div><span>'+(rate==null?'—':rate+'%')+' 正常</span></div>'+
+   '<div class="abarate aurate" title="使用率 = frps 在线快照 / 在册（在线 '+(u.online!=null?u.online:'—')+' / '+(u.total!=null?u.total:'—')+'，快照口径；fleet 未启用或无法计算时为 —）"><div class=atrack><i style="width:'+(use==null?0:Math.min(use,100))+'%;--c:#0891b2"></i></div><span>'+(use==null?'—':use+'%')+' 使用率</span></div>'+
+   '<div class=aurow>'+this.stagN('维修中',u.repairing)+this.stagN('异常',u.abnormal)+'</div>'+
+   (isInv?'<div class=auinv>公司库存单位'+(icnt!=null?' '+icnt+' 台':'')+'（不计一线部署）'+(u.unit==='上海办公室'&&inv?' · 备注细分：未使用 '+inv.unused+' · 新组装 '+inv.newBuild:'')+'</div>':'')+
+   '<div class=aumut>最近更新：'+esc(this.fmtTs(u.lastUpdated)||'—')+'</div></div>'
+ }).join('')+'</div>';
+ el.querySelectorAll('.aunit').forEach(c=>c.onclick=()=>this.drill(c.dataset.unit));
+},
+drill(unit){
+ this.drillUnit=unit;this.setTab('units');
+ document.getElementById('asUnitBody').hidden=true;
+ const det=document.getElementById('asUnitDetail');det.hidden=false;
+ const devs=this.sortDevs(this.devices.filter(d=>d.unit===unit));
+ const rep=this.devices.filter(d=>d.unit===unit&&(d.status==='维修中'||d.status==='待维修'));
+ det.innerHTML='<div class=apanel>'+
+  '<div class=auhead2><button class=listbtn id=asUnitBack>← 返回单位列表</button><b>'+esc(unit)+'</b><span>'+devs.length+' 台在册'+(rep.length?' · 维修中/待维修 '+rep.length+' 台':'')+'</span></div>'+
+  (rep.length?'<h3>维修中 / 待维修设备</h3><div class=twrap><table class=astable><thead>'+this.ledgerHeadHtml(false)+'</thead><tbody>'+rep.map(d=>this.ledgerRowHtml(d)).join('')+'</tbody></table></div>':'')+
+  '<h3>该单位全部设备（点击行查看 360° 详情）</h3>'+
+  '<div class=twrap><table class=astable><thead>'+this.ledgerHeadHtml(false)+'</thead><tbody>'+(devs.length?devs.map(d=>this.ledgerRowHtml(d)).join(''):'<tr><td colspan=12 class=eempty>该单位暂无在册设备</td></tr>')+'</tbody></table></div></div>';
+ this.writeHash({atab:'units',unit:unit});
+},
+/* ---------- 模块 4：版本视图 ---------- */
+renderVersions(){
+ const el=document.getElementById('asVersionBody'),v=this.versions;
+ if(!v){el.innerHTML='<p class=eempty>暂无版本数据</p>';return}
+ const det=(v.detected||[]).slice().sort((a,b)=>(b.count||0)-(a.count||0));
+ const led=(v.ledger||[]).slice().sort((a,b)=>(b.count||0)-(a.count||0));
+ const dmax=Math.max.apply(null,det.map(x=>x.count||0).concat([1]));
+ const lmax=Math.max.apply(null,led.map(x=>x.count||0).concat([1]));
+ const codeOf=x=>typeof x==='string'?x:String((x&&(x.device_code||x.code||x.hostname))||'');
+ const chip=x=>{const s=codeOf(x);return '<span class=chip2 title="'+esc(s)+'">'+esc(s.toUpperCase())+'</span>'};
+ const only=v.detectedOnly||[],miss=v.ledgerMissing||[];
+ // 第六波 KVWO-108：主要服务商版本占比（by_provider_top5，在册数前 5；未探测归「未获取」桶如实展示）
+ const t5=v.byProviderTop5||[];
+ const provHtml=t5.length?'<div class=apanel><h3>主要服务商版本占比（在册数前 5）</h3><p class=uhint style="margin:0 0 4px">口径：探测版本（未探测计入「未获取」桶） · 占比 = 台数 / 该单位在册数 · 统计时间：'+esc(this.fmtTs(this.stats&&this.stats.lastSync)||'—')+'</p>'+
+  t5.map(p=>{
+   const vers=(p.versions||[]),vmax=Math.max.apply(null,vers.map(x=>(x&&x.count)||0).concat([1]));
+   return '<h4>'+esc(p.unit)+'（在册 '+(p.total!=null?p.total:'—')+' 台）</h4>'+(vers.length?vers.map(x=>{
+    const c=(x&&x.count)||0,share=(x&&x.share!=null)?x.share:(p.total?c/p.total:null),spct=share==null?'—':(Math.round(share*1000)/10)+'%';
+    const vn=String((x&&x.version)||'—'),isUn=vn==='未获取';
+    return '<div class="abar vbar" title="'+esc(p.unit)+' · '+esc(vn)+'：'+c+' 台（占比 '+spct+'）"><span class="albl2 mono'+(isUn?' mut':'')+'">'+esc(vn)+'</span><div class=atrack><i style="width:'+(c/vmax*100).toFixed(1)+'%;--c:'+(isUn?'#94a3b8':'#2563eb')+'"></i></div><span class=an>'+c+' 台 · '+spct+'</span></div>'
+   }).join(''):'<p class=eempty>该单位暂无版本数据</p>')
+  }).join('')+'</div>':
+  '<div class=apanel><h3>主要服务商版本占比（在册数前 5）</h3><p class=eempty>暂无服务商版本分布数据——版本来自 fleet 在线探测（未探测计入「未获取」桶）；后端 by_provider_top5 就绪后此处自动展示，前端无需改动。</p></div>';
+ el.innerHTML='<div class=adists>'+
+  '<div class=apanel><h3>探测版本分布（在线设备）</h3>'+(det.length?det.map(x=>'<div class=abar><span class="albl2 mono">'+esc(x.version||'—')+'</span><div class=atrack><i style="width:'+((x.count||0)/dmax*100).toFixed(1)+'%"></i></div><span class=an>'+(x.count||0)+'</span></div>').join(''):'<p class=eempty>暂无探测数据</p>')+'</div>'+
+  '<div class=apanel><h3>台账登记版本</h3>'+(v.ledgerEmpty?'<div class=uwarn style="margin:0 0 12px">台账「软件版本」当前全部未登记：<b>'+v.ledgerEmpty+'</b> 台为空（如实展示，待台账补录后此处显示分布）</div>':'')+(led.length?led.map(x=>'<div class=abar><span class="albl2 mono">'+esc(x.version||'—')+'</span><div class=atrack><i style="width:'+((x.count||0)/lmax*100).toFixed(1)+'%;--c:#0f766e"></i></div><span class=an>'+(x.count||0)+'</span></div>').join(''):'<p class=eempty>无已登记版本</p>')+'</div>'+
+  '<div class=apanel><h3>台账 × 探测对照</h3><div class=acards3><div><b>'+esc(v.matched!=null?v.matched:'—')+'</b>版本匹配</div><div><b>'+only.length+'</b>在线但台账未登记</div><div><b>'+miss.length+'</b>台账有但探测不到</div></div>'+
+  '<h4>detected_only · 在线但台账未登记</h4>'+(only.length?only.map(chip).join(''):'<p class=eempty>无</p>')+
+  '<h4>ledger_missing · 台账有但探测不到（离线 / 未部署）</h4>'+(miss.length?'<p class=uhint>共 '+miss.length+' 台</p><details><summary style="cursor:pointer;font-size:12px;color:#2563eb">展开设备列表</summary><div style="margin-top:8px">'+miss.map(chip).join('')+'</div></details>':'<p class=eempty>无</p>')+
+  '<p style="margin-top:14px"><button class=listbtn id=asGoUpg>▶ 前往升级视图（版本批量升级入口）</button></p></div></div>'+provHtml;
+ const b=document.getElementById('asGoUpg');if(b)b.onclick=()=>{location.hash='view=upgrade'};
+},
+/* ---------- 维修看板子页签：KVWO-80 Rep.* 看板实装（槽位填充，KVWO-88；全站唯一维修入口） ---------- */
+renderRepairs(){
+ if(this.tab!=='repairs')return;   // 仅在子页签可见时驱动，避免后台空拉数据
+ if(typeof Rep==='undefined')return;
+ const p=new URLSearchParams(location.hash.slice(1));
+ const q=(p.get('view')==='assets'&&p.get('atab')==='repairs')?p.get('q'):'';
+ if(q)Rep.enter(q);else Rep.enter();   // hash 携带 q（台账未完结徽章跳转/深链）则应用筛选，否则保持当前状态
+},
+/* ---------- 契约 mock（仅 404 时启用；确定性种子，数字对齐 KVWO-97 基线：在册 248/归档 69/库存 149（上海 94+潍坊 55）/部署 99/维修率 5.2%/损坏率 8.5%；闲置为确定性抽样） ---------- */
+mockFor(path){
+ const M=this.mockData();
+ if(path.indexOf('/api/assets/stats')===0)return M.stats;
+ if(path.indexOf('/api/assets/units')===0)return{units:M.units};
+ if(path.indexOf('/api/assets/versions')===0)return M.versions;
+ if(path.indexOf('/api/assets?')===0)return{devices:M.archived,last_sync_at:M.lastSync};
+ if(path.indexOf('/api/assets/')===0){
+  const code=decodeURIComponent(path.slice('/api/assets/'.length)).toLowerCase();
+  const dev=M.devices.concat(M.archived).filter(x=>x.device_code.toLowerCase()===code)[0];
+  if(dev)return this.mockDetail(dev);
+  throw Error('设备不存在：'+code)
+ }
+ return{devices:M.devices,last_sync_at:M.lastSync};
+},
+mockData(){
+ if(this._mockCache)return this._mockCache;
+ let seed=20261020;
+ const rnd=()=>{seed|=0;seed=seed+0x6D2B79F5|0;let t=Math.imul(seed^seed>>>15,1|seed);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296};
+ const pickR=a=>a[Math.floor(rnd()*a.length)];
+ const UNITS=[['上海办公室',94],['潍坊办公室',55],['苏州项目组',20],['杭州项目组',18],['南京项目组',15],['成都项目组',12],['武汉项目组',10],['西安项目组',8],['北京项目组',6],['广州项目组',6],['长沙项目组',4]];
+ const pool=(pairs)=>{const a=[];for(const[s,n]of pairs)for(let i=0;i<n;i++)a.push(s);for(let i=a.length-1;i>0;i--){const j=Math.floor(rnd()*(i+1));const t=a[i];a[i]=a[j];a[j]=t}return a};
+ const stPool=pool([['正常',217],['异常',8],['维修中',10],['待维修',3],['待标定',6],['测试中',4]]);
+ const tyPool=pool([['EgoPortal-Stereo-V0',160],['EgoPortal-Stereo-V1',55],['EgoPortal-Lite',33]]);
+ const PARTS=['头盔','相机','主机','数据线','腰带','充电宝'];
+ const base=Date.UTC(2026,9,20,0,0,0);
+ const devs=[];let k=0;
+ for(const[unit,count]of UNITS)for(let i=0;i<count;i++){
+  const status=stPool[k],type=tyPool[k];k++;
+  let code='EP-'+String(k).padStart(6,'0');if(k===31)code='ep-000031';   // 大小写混杂样例（匹配须不区分大小写）
+  const isInv=unit==='上海办公室'||unit==='潍坊办公室',r=rnd();
+  const remark=isInv?(r<0.38?'库存·未使用':r<0.5?'新组装备用':r<0.6?'新组装·待发放':(unit==='上海办公室'?'上海备机':'潍坊备机')):(pickR(['一线部署','现场备用','项目交付','演示用机','']));
+  const online=isInv?(r<0.1?null:false):(rnd()<0.72?true:false);
+  const detVer=online?pickR(['v0.4.6','v0.4.6','v0.5.0','v0.4.5']):null;
+  const openRep=status==='维修中'?(rnd()<0.3?2:1):status==='待维修'?1:(status==='异常'&&rnd()<0.4?1:0);
+  devs.push({device_code:code,device_type:type,status:status,unit:unit,accessories:pickR(PARTS)+(rnd()<0.5?'、'+pickR(PARTS):''),remark:remark,ledger_version:null,detected_version:detVer,device_online:online,open_repairs:openRep,updated_at:new Date(base-k*37*60000).toISOString(),modifier:pickR(['张伟','李娜','王强','刘敏','陈晨'])})
+ }
+ const arch=[];
+ for(let i=0;i<69;i++)arch.push({device_code:i===49?'ep-000298':'EP-'+String(249+i).padStart(6,'0'),device_type:pickR(['EgoPortal-Stereo-V0','EgoPortal-Stereo-V1','EgoPortal-Lite']),status:'已拆解',unit:pickR(UNITS.map(u=>u[0])),accessories:'',remark:'已拆解归档',ledger_version:null,detected_version:null,device_online:false,open_repairs:0,updated_at:new Date(base-400*3600000-i*3600000).toISOString(),modifier:'李娜'});
+ const byStatus={},byType={},byUnit={};
+ for(const s of this.STATUS_ORDER)byStatus[s]=devs.filter(d=>d.status===s).length;
+ for(const d of devs){byType[d.device_type]=(byType[d.device_type]||0)+1;byUnit[d.unit]=(byUnit[d.unit]||0)+1}
+ // 闲置口径（KVWO-97 需求 4）：库存外·从未上线/超阈值未上线（默认 15 天，KVWO-107）；mock 确定性抽样
+ const idleByUnit={};let idleTotal=0;
+ for(const d of devs){
+  const isInv=d.unit==='上海办公室'||d.unit==='潍坊办公室';
+  const idle=!isInv&&d.device_online===false&&rnd()<0.35;
+  d.idle=idle;
+  d.last_seen=d.device_online===true?String(d.updated_at).slice(0,16).replace('T',' '):(idle?null:new Date(Date.parse(d.updated_at)-5*86400000).toISOString().slice(0,16).replace('T',' '));
+  if(idle){idleTotal++;idleByUnit[d.unit]=(idleByUnit[d.unit]||0)+1}
+ }
+ const invA=(byUnit['上海办公室']||0)+(byUnit['潍坊办公室']||0);
+ const invB=devs.filter(d=>(d.unit==='上海办公室'||d.unit==='潍坊办公室')&&String(d.remark||'').indexOf('未使用')>=0).length;
+ const det={};for(const d of devs)if(d.detected_version)det[d.detected_version]=(det[d.detected_version]||0)+1;
+ // 第六波 KVWO-107 契约：units 增 online/usage_rate（在线/在册）；versions 增 by_provider_top5（在册数前 5 家，未探测归「未获取」桶，share=count/在册保留两位）
+ const units=UNITS.map(u=>{const us=devs.filter(d=>d.unit===u[0]);const mx=us.reduce((m,d)=>Math.max(m,Date.parse(d.updated_at)||0),0);const onc=us.filter(d=>d.device_online===true).length;return{unit:u[0],total:us.length,online:onc,usage_rate:us.length?onc/us.length:null,normal_rate:us.length?us.filter(d=>d.status==='正常').length/us.length:null,repairing:us.filter(d=>d.status==='维修中').length,abnormal:us.filter(d=>d.status==='异常').length,last_updated:mx?new Date(mx).toISOString():null}});
+ const provTop5=UNITS.slice().sort((a,b)=>b[1]-a[1]||String(a[0]).localeCompare(String(b[0]),'zh')).slice(0,5).map(u=>{
+  const us=devs.filter(d=>d.unit===u[0]),cnt={};
+  for(const d of us){const k=d.detected_version||'未获取';cnt[k]=(cnt[k]||0)+1}
+  return{unit:u[0],total:us.length,versions:Object.entries(cnt).sort((x,y)=>y[1]-x[1]).map(e=>({version:e[0],count:e[1],share:Math.round(e[1]/us.length*100)/100}))}});
+ const lastSync=new Date(base+5*60000).toISOString();
+ this._mockCache={devices:devs,archived:arch,lastSync:lastSync,
+  stats:{registered_total:devs.length,archived_total:arch.length,inventory:{total:invA,by_unit:{'上海办公室':byUnit['上海办公室']||0,'潍坊办公室':byUnit['潍坊办公室']||0},units:['上海办公室','潍坊办公室'],unused_note:invB},deployed:devs.length-invA,idle:{total:idleTotal,threshold_days:15,by_unit:idleByUnit},by_status:byStatus,by_type:byType,by_unit:byUnit,repair_rate:(byStatus['维修中']+byStatus['待维修'])/devs.length,damage_rate:(byStatus['异常']+byStatus['维修中']+byStatus['待维修'])/devs.length,last_sync_at:lastSync},
+  units:units,
+  versions:{detected:Object.entries(det).map(e=>({version:e[0],count:e[1]})),ledger:[],ledger_empty:devs.length,matched:devs.filter(d=>d.detected_version).length,detected_only:[{device_code:'ep-900201',version:'v0.5.0'},{device_code:'EP-900202',version:'v0.4.6'},{device_code:'EP-900203',version:'v0.5.0'}],ledger_missing:devs.filter(d=>!d.detected_version).map(d=>d.device_code),by_provider_top5:provTop5}};
+ return this._mockCache;
+},
+mockDetail(dev){
+ let s=String(dev.device_code).length*7919+42;
+ const rnd=()=>{s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296};
+ const needRep=dev.status==='维修中'||dev.status==='待维修'||dev.status==='异常'||dev.open_repairs>0;
+ const base=(Date.parse(dev.updated_at)||Date.now())-86400000;
+ const repairs=needRep?[{stage:dev.status==='待维修'?'待接收':(dev.status==='异常'?'损坏原因确认中':'维修中'),issue_description:dev.device_type+' 相机模块无画面，待进一步检测',repair_owners:['刘希源'],last_followed_at:new Date(base-86400000).toISOString(),last_follow_note:'已联系现场确认寄回地址'}]:[];
+ const flows=[{action:'设备登记',operator:'李娜',ts:new Date(base-19*86400000).toISOString(),note:'台账初始登记'},{action:'接收确认',operator:'刘希源',ts:new Date(base-5*86400000).toISOString(),note:'收到设备，外观完好'},{action:'维修跟进',operator:'刘希源',ts:new Date(base-86400000).toISOString(),note:'更换相机模组后复测'}];
+ const parts=needRep?[{part:'相机',arrival:rnd()<0.7?'完好':'缺失',item:'相机模组',note:'到货待核对',checked_at:new Date(base-2*86400000).toISOString()}]:[];
+ return{ledger:dev,repairs:repairs,flows:flows,parts:parts,transfers:[{ts:new Date(base-14*86400000).toISOString(),unit:dev.unit,item:'整机',qty:1,note:'项目发放'}]};
+}
+};
+/* ================= 维修流转视图（Rep.* 独立命名空间，KVWO-80；并入资产区「维修看板」子页签，KVWO-88） =================
+ 数据契约（后端 KVWO-79 已合入 data）：
+ GET /api/repairs?stage=&type=&unit=&owner=&q= → {repairs:[…17 字段 snake_case +
+ record_id/feishu_url/device_online(true|false|null)]}（或直接返回数组）；
+ GET /api/repairs/stats → {total,by_stage:{7 阶段:计数},active_count,last_sync_at[,sync_error]}；
+ GET /api/repairs/{record_id} → 单条详情（附件含可直接访问的 URL）。
+ 接口 404 /拉取失败/同步失败：明确提示 + 最后成功同步时间，
+ 不渲染陈旧数据冒充实时；空态有引导文案；字段缺失一律显示「—」。 */
+const Rep={
+STAGES:['待接收','损坏原因确认中','维修中','待发出确认','待发出','已发出','已完结'],
+SC:{'待接收':'#dc2626','损坏原因确认中':'#d97706','维修中':'#ea580c','待发出确认':'#7c3aed','待发出':'#4f46e5','已发出':'#0891b2','已完结':'#64748b'},
+KEYS:{
+ device_id:['device_id','device_no','device_code'],
+ device_type:['device_type','type'],
+ accessories:['accessories','parts'],
+ unit:['unit','unit_name','org'],
+ stage:['stage','phase'],
+ problem:['problem','description','issue'],
+ name:['name','contact_name'],
+ contact:['contact','phone','mobile','contact_info','contact_phone'],
+ receive_address:['receive_address','address','recv_address'],
+ return_address:['return_address','return_info','expected_return'],
+ tracking_no:['tracking_no','express_no','tracking_number','tracking_no_in'],
+ outbound_tracking_no:['outbound_tracking_no','send_tracking_no','outbound_express_no','tracking_no_out'],
+ owner:['owner','repair_owner','maintainer','assignee','owner_name'],
+ last_followup_at:['last_followup_at','last_follow_time','followup_at','last_followup'],
+ last_followup_note:['last_followup_note','last_follow_desc','followup_note','last_note'],
+ attachments:['attachments','files'],
+ created_at:['created_at','create_time','created'],
+ record_id:['record_id','id'],
+ feishu_url:['feishu_url','feishu_link','record_url'],
+ device_online:['device_online','online']
+},
+view:'kanban',loading:false,rows:[],all:[],stats:null,statsErr:'',listErr:'',
+q:'',stageF:'',typeF:'',unitF:'',ownerF:'',doneOpen:false,qT:null,
+gid(i){return document.getElementById(i)},
+pick(r,ks){for(const k of ks){const v=r?r[k]:undefined;if(v!==undefined&&v!==null&&v!=='')return v}return null},
+parseTs(v){if(v==null)return null;if(typeof v==='number')return v<1e12?v*1000:v;const t=Date.parse(String(v).replace(' ','T'));return isNaN(t)?null:t},
+fmtClock(ms){const d=new Date(ms);return isNaN(d.getTime())?'—':d.toLocaleString('zh-CN',{hour12:false})},
+fmtRel(ms){if(ms==null)return '—';let s=Math.max(0,(Date.now()-ms)/1000);if(s<60)return Math.floor(s)+' 秒前';const m=s/60;if(m<60)return Math.floor(m)+' 分钟前';const h=m/60;if(h<24)return Math.floor(h)+' 小时前';const d=h/24;if(d<30)return Math.floor(d)+' 天前';if(d<365)return Math.floor(d/30)+' 个月前';return Math.floor(d/365)+' 年前'},
+f(v){return v==null||v===''?'—':v},
+apiErr(r,d){if(r&&r.status===404)return '接口不可用（404）——请确认服务为含 /api/repairs（KVWO-79）的版本';return (d&&d.error)?d.error:('HTTP '+(r?r.status:'?'))},
+norm(r){
+ const o={stage:''};
+ for(const k in this.KEYS)o[k]=this.pick(r,this.KEYS[k]);
+ o.stage=o.stage==null?'':String(o.stage);
+ o.stageIdx=this.STAGES.indexOf(o.stage);
+ o.done=o.stage==='已完结';
+ o.accessories=Array.isArray(o.accessories)?o.accessories.map(String):(o.accessories?String(o.accessories).split(/[,、]/).map(s=>s.trim()).filter(Boolean):[]);
+ const atts=Array.isArray(o.attachments)?o.attachments.slice():(o.attachments?[o.attachments]:[]);
+ o.attachments=atts.map(a=>{
+  if(a==null)return null;
+  if(typeof a==='string')return{name:'',url:a};
+  const u=String((a.url||a.link||a.src||a.path)||'');
+  const nm=String((a.name||a.filename||a.title)||(u?u.split('?')[0].split('/').pop():'')||'附件');
+  return{name:nm,url:u};
+ }).filter(a=>a&&a.url);
+ const dv=o.device_online;
+ o.online=(dv===true||dv===1||dv==='true'||dv==='True')?true:((dv===false||dv===0||dv==='false'||dv==='False')?false:null);
+ o.followMs=this.parseTs(o.last_followup_at);
+ o.createdMs=this.parseTs(o.created_at);
+ return o;
+},
+normList(d){const l=Array.isArray(d)?d:(d&&(d.repairs||d.items||d.records||d.list));return Array.isArray(l)?l:[]},
+hasFilter(){return !!(this.q||this.stageF||this.typeF||this.unitF||this.ownerF)},
+params(){
+ const p=new URLSearchParams();
+ if(this.view==='list'&&this.stageF)p.set('stage',this.stageF);
+ if(this.typeF)p.set('type',this.typeF);
+ if(this.unitF)p.set('unit',this.unitF);
+ if(this.ownerF)p.set('owner',this.ownerF);
+ if(this.q)p.set('q',this.q);
+ const s=p.toString();return s?'?'+s:'';
+},
+async loadStats(){
+ try{
+  const r=await fetch('/api/repairs/stats',{cache:'no-store'});
+  const d=await r.json().catch(()=>({}));
+  if(!r.ok)throw Error(this.apiErr(r,d));
+  this.stats={total:d.total,active_count:d.active_count,byStage:d.by_stage||d.byStage||{},syncMs:this.parseTs(d.last_sync_at||d.lastSyncAt),syncError:d.sync_error||d.last_error||d.last_sync_error||''};
+  this.statsErr='';
+ }catch(e){
+  this.statsErr='维修统计不可用：'+((e&&e.message)?e.message:String(e))+(this.stats&&this.stats.syncMs?'（最后成功同步 '+this.fmtClock(this.stats.syncMs)+'，以下统计为当时数据）':'');
+ }
+ this.renderStats();this.renderBanner();
+},
+async loadList(){
+ this.loading=true;this.render();
+ try{
+  const r=await fetch('/api/repairs'+this.params(),{cache:'no-store'});
+  const d=await r.json().catch(()=>({}));
+  if(!r.ok)throw Error(this.apiErr(r,d));
+  this.rows=this.normList(d).map(x=>this.norm(x));
+  if(!this.params()){this.all=this.rows;this.buildOptions()}
+  this.listErr='';
+ }catch(e){this.listErr='维修数据加载失败：'+((e&&e.message)?e.message:String(e));this.rows=[]}
+ this.loading=false;this.render();
+},
+load(){this.loadStats();this.loadList()},
+enter(pend){
+ if(pend){this.q=pend;const qi=this.gid('repQ');if(qi)qi.value=pend}   // 台账未完结徽章跳转/深链携带的设备编号筛入搜索
+ this.setView(this.view);this.load()
+},
+render(){this.renderBanner();if(this.view==='kanban')this.renderKanban();else this.renderList()},
+renderStats(){
+ const s=this.stats,by=s?s.byStage:null;
+ const num=v=>(v==null||v===''||isNaN(Number(v)))?null:Number(v);
+ const act=s?num(s.active_count):null;
+ const tot=s?num(s.total):null;
+ const dn=by?num(by['已完结']):null;
+ this.gid('repActive').textContent=act!=null?act:'—';
+ this.gid('repTotal').textContent=tot!=null?tot:'—';
+ this.gid('repDoneN').textContent=dn!=null?dn:'—';
+ const se=this.gid('repSync');
+ if(s&&s.syncMs){se.textContent=this.fmtRel(s.syncMs);se.title='最后成功同步：'+this.fmtClock(s.syncMs)}
+ else if(s){se.textContent='未同步';se.title='后端尚未完成过一次成功同步'}
+ else{se.textContent='—';se.title=''}
+ let h='';
+ for(const st of this.STAGES){const n=by?num(by[st]):null;h+='<span class="chip rchip" data-stage="'+esc(st)+'" style="--c:'+(this.SC[st]||'#64748b')+'">'+esc(st)+' <b>'+(n!=null?n:'—')+'</b></span>'}
+ this.gid('repStageStats').innerHTML=h;
+ this.gid('repStageStats').querySelectorAll('.rchip').forEach(c=>c.onclick=()=>{
+  const st=c.dataset.stage;
+  if(this.view==='list'){const sel=this.gid('repStageF');sel.value=(this.stageF===st)?'all':st;this.stageF=sel.value==='all'?'':sel.value;this.loadList()}
+  else{let target=null;this.gid('repKanban').querySelectorAll('.rkcol').forEach(x=>{if(x.dataset.col===st)target=x});if(target)target.scrollIntoView({behavior:'smooth',block:'nearest',inline:'start'})}
+ });
+},
+renderBanner(){
+ const el=this.gid('repBanner');
+ const errs=[];
+ if(this.statsErr)errs.push(this.statsErr);
+ if(this.listErr)errs.push(this.listErr);
+ if(!errs.length&&this.stats&&this.stats.syncError)errs.push('后端最近一次飞书同步失败：'+this.stats.syncError+(this.stats.syncMs?'（最后成功同步 '+this.fmtClock(this.stats.syncMs)+'）':'（尚无成功同步）'));
+ if(!errs.length){el.hidden=true;el.innerHTML='';return}
+ el.hidden=false;
+ el.innerHTML=errs.map(x=>'<div>'+esc(x)+'</div>').join('')+'<div>当前未展示实时数据；后端同步与接口恢复后，点「重新加载」获取最新。</div>';
+},
+renderKanban(){
+ const el=this.gid('repKanban');
+ if(this.listErr){el.innerHTML='<p class="uempty">维修数据不可用，详见上方提示</p>';return}
+ const cols=this.STAGES.slice();
+ const seen=new Set(this.STAGES);
+ for(const r of this.rows){const st=r.stage||'未填写阶段';if(!seen.has(st)){seen.add(st);cols.push(st)}}
+ const groups=new Map();for(const st of cols)groups.set(st,[]);
+ for(const r of this.rows)groups.get(r.stage||'未填写阶段').push(r);
+ let h='';
+ if(this.loading&&!this.rows.length)h+='<p class="uempty rkanhint">加载中…</p>';
+ else if(!this.rows.length&&this.hasFilter())h+='<p class="uempty rkanhint">没有匹配的维修记录——调整筛选或搜索词，或点「重新加载」</p>';
+ else if(!this.rows.length)h+='<p class="uempty rkanhint">暂无维修记录——飞书维修表同步到数据后此处展示</p>';
+ for(const st of cols){
+  const list=groups.get(st).slice().sort((a,b)=>(b.followMs||0)-(a.followMs||0));
+  const c=this.SC[st]||'#64748b';
+  h+='<div class="rkcol" data-col="'+esc(st)+'"><h3><span class="rkt" style="--c:'+c+'">'+esc(st)+'</span><span class="rkn">'+list.length+'</span></h3>'+(list.length?list.map(r=>this.cardHtml(r)).join(''):'<div class="rkempty">暂无</div>')+'</div>';
+ }
+ el.innerHTML=h;
+},
+cardHtml(r){
+ const cls=r.device_type==='双目'?' rt2':(r.device_type==='单目'?' rt1':'');
+ const typ=r.device_type?'<span class="rtyp'+cls+'">'+esc(r.device_type)+'</span>':'';
+ return '<div class="rcard" data-rid="'+esc(r.record_id)+'">'
+  +'<div class="rd">'+esc(r.device_id||'（无编号）')+typ+'</div>'
+  +(r.problem?'<div class="rprob" title="'+esc(r.problem)+'">'+esc(r.problem)+'</div>':'')
+  +'<div class="rmeta"><span>'+esc(r.owner||'负责人 —')+'</span><span'+(r.followMs?' title="'+esc(this.fmtClock(r.followMs))+'"':'')+'>'+(r.followMs?esc(this.fmtRel(r.followMs)):'跟进 —')+'</span></div>'
+  +'<div class="ronrow">'+this.onlineBadge(r)+'</div></div>';
+},
+onlineBadge(r){
+ const did=r.device_id||'';
+ if(r.online===true)return '<span class="ron on link" data-jump="'+esc(did)+'" title="设备台账当前在线，点击跳到设备总览定位">台账在线</span>';
+ if(r.online===false)return '<span class="ron off link" data-jump="'+esc(did)+'" title="设备台账当前离线，点击跳到设备总览定位">台账离线</span>';
+ return '<span class="ron na" title="设备编号未匹配到设备台账">台账 —</span>';
+},
+renderList(){
+ const act=this.rows.filter(r=>!r.done),dn=this.rows.filter(r=>r.done);
+ act.sort((a,b)=>(a.stageIdx-b.stageIdx)||((b.followMs||0)-(a.followMs||0)));
+ dn.sort((a,b)=>(b.followMs||0)-(a.followMs||0));
+ const tb=this.gid('repTbody');
+ let msg='';
+ if(this.listErr)msg='维修数据不可用，详见上方提示';
+ else if(!this.rows.length)msg=this.hasFilter()?'没有匹配的维修记录——调整筛选或搜索词试试':'暂无维修记录——飞书维修表同步到数据后此处展示';
+ else if(!act.length)msg='匹配记录均为已完结，见下方折叠区';
+ tb.innerHTML=msg?'<tr><td colspan="8" class="rempty">'+esc(msg)+'</td></tr>':act.map(r=>this.rowHtml(r)).join('');
+ this.gid('repDoneWrap').hidden=!dn.length;
+ this.gid('repDoneTbody').innerHTML=dn.map(r=>this.rowHtml(r)).join('');
+ this.gid('repDoneTable').hidden=!this.doneOpen;
+ this.gid('repDoneToggle').textContent='已完结记录（'+dn.length+'）'+(this.doneOpen?' 收起 ▴':' 展开 ▾');
+},
+rowHtml(r){
+ return '<tr data-rid="'+esc(r.record_id)+'"><td class="rdev">'+esc(r.device_id||'—')+'</td><td>'+esc(r.device_type||'—')+'</td><td><span class="stag" style="--c:'+(this.SC[r.stage]||'#64748b')+'">'+esc(r.stage||'—')+'</span></td><td>'+esc(r.unit||'—')+'</td><td class="rprob-cell" title="'+esc(r.problem||'')+'">'+esc(r.problem||'—')+'</td><td>'+esc(r.owner||'—')+'</td><td'+(r.followMs?' title="'+esc(this.fmtClock(r.followMs))+'"':'')+'>'+(r.followMs?esc(this.fmtRel(r.followMs)):'—')+'</td><td>'+this.onlineBadge(r)+'</td></tr>';
+},
+buildOptions(){
+ const cnt=key=>{const m=new Map();for(const r of this.all){const v=r[key];if(v)m.set(v,(m.get(v)||0)+1)}return[...m.entries()].sort((a,b)=>a[0].localeCompare(b[0],'zh'))};
+ const fill=(id,entries,label,cur)=>{
+  const s=this.gid(id);
+  s.innerHTML='<option value="all">'+label+'</option>'+entries.map(x=>'<option value="'+esc(x[0])+'">'+esc(x[0])+'（'+x[1]+'）</option>').join('');
+  s.value=(cur&&entries.some(x=>x[0]===cur))?cur:'all';
+  return s.value==='all'?'':s.value;
+ };
+ this.unitF=fill('repUnitF',cnt('unit'),'全部单位',this.unitF);
+ this.ownerF=fill('repOwnerF',cnt('owner'),'全部负责人',this.ownerF);
+ const tmap=new Map([['单目',0],['双目',0],['其他',0]]);
+ for(const r of this.all){if(r.device_type)tmap.set(r.device_type,(tmap.get(r.device_type)||0)+1)}
+ this.typeF=fill('repTypeF',[...tmap.entries()],'全部类型',this.typeF);
+ const sel=this.gid('repStageF');
+ sel.innerHTML='<option value="all">全部阶段</option>'+this.STAGES.map(v=>'<option value="'+esc(v)+'">'+esc(v)+'</option>').join('');
+ sel.value=(this.stageF&&this.STAGES.includes(this.stageF))?this.stageF:'all';
+ this.stageF=sel.value==='all'?'':sel.value;
+},
+setView(v){
+ this.view=v==='list'?'list':'kanban';
+ this.gid('repKanban').hidden=this.view!=='kanban';
+ this.gid('repListWrap').hidden=this.view!=='list';
+ this.gid('repStageF').hidden=this.view!=='list';   // 看板本身按阶段分列，阶段筛选仅列表视图生效
+ this.gid('repVKanban').classList.toggle('on',this.view==='kanban');
+ this.gid('repVList').classList.toggle('on',this.view==='list');
+ this.render();
+},
+async openDetail(rid){
+ rid=rid==null?'':String(rid);
+ const cached=this.rows.find(r=>String(r.record_id)===rid)||this.all.find(r=>String(r.record_id)===rid)||null;
+ this.gid('repModal').classList.add('show');
+ const body=this.gid('repModalBody');
+ if(!cached&&!rid){body.innerHTML='<p class="eempty">记录缺少 record_id，无法加载详情</p>';return}
+ body.innerHTML='<p class="eempty">加载中…</p>';
+ if(!rid){this.renderDetail(cached,true);return}
+ try{
+  const r=await fetch('/api/repairs/'+encodeURIComponent(rid),{cache:'no-store'});
+  const d=await r.json().catch(()=>({}));
+  if(!r.ok)throw Error(this.apiErr(r,d));
+  let raw=Array.isArray(d)?d[0]:(d&&(d.record||d.repair||d.item)||d);
+  this.renderDetail(this.norm((raw&&typeof raw==='object')?raw:{}),false);
+ }catch(e){
+  if(cached)this.renderDetail(cached,true);
+  else{body.innerHTML='<p class="eempty">详情加载失败：'+esc((e&&e.message)?e.message:String(e))+'</p><button type="button" class="x" id="repClose" style="margin-top:10px">关闭</button>';this.bindClose()}
+ }
+},
+bindClose(){const b=this.gid('repClose');if(b)b.onclick=()=>this.closeDetail()},
+closeDetail(){this.gid('repModal').classList.remove('show')},
+renderDetail(o,degraded){
+ const body=this.gid('repModalBody');
+ const atts=o.attachments||[];
+ const IMG_EXT=['.jpg','.jpeg','.png','.gif','.webp','.bmp'];
+ const attHtml=atts.length?'<div class="rattach">'+atts.map(a=>{
+  const href=a.url||'';
+  const isImg=IMG_EXT.some(e=>href.toLowerCase().split('?')[0].endsWith(e));
+  return '<a href="'+esc(href)+'" target="_blank" rel="noopener" title="'+esc(a.name||href)+'">'+(isImg?'<img src="'+esc(href)+'" loading="lazy" alt="'+esc(a.name)+'" onerror="this.style.display=&quot;none&quot;">':'')+'<span class="rfname">'+esc(a.name||'附件')+'</span></a>';
+ }).join('')+'</div>':'<p class="eempty">无附件</p>';
+ const fu=o.feishu_url?'<a class="rfeishu" href="'+esc(o.feishu_url)+'" target="_blank" rel="noopener">查看飞书原记录 ↗</a>':'<span class="eempty">飞书原记录链接：—</span>';
+ const jump=(o.online!==null&&o.device_id)?'<button type="button" id="repJump">在设备总览中定位 '+esc(o.device_id)+'</button>':'';
+ body.innerHTML=`
+  <header><div><span class="name">${esc(o.device_id||'（无设备编号）')}</span> <span class="stag" style="--c:${this.SC[o.stage]||'#64748b'}">${esc(o.stage||'阶段 —')}</span></div><button class="x" id="repClose">✕</button></header>
+  ${degraded?'<p class="uhint warn">详情接口不可用，以下为列表缓存数据（附件可能缺失）</p>':''}
+  <div class="mgrid">
+   <span>设备编号</span><b>${esc(this.f(o.device_id))}</b>
+   <span>设备所属类型</span><b>${esc(this.f(o.device_type))}</b>
+   <span>所含配件</span><b>${o.accessories&&o.accessories.length?esc(o.accessories.join('、')):'—'}</b>
+   <span>所属单位</span><b>${esc(this.f(o.unit))}</b>
+   <span>当前阶段</span><b>${esc(this.f(o.stage))}</b>
+   <span>问题描述</span><b style="white-space:pre-wrap">${esc(this.f(o.problem))}</b>
+   <span>姓名</span><b>${esc(this.f(o.name))}</b>
+   <span>联系方式</span><b>${esc(this.f(o.contact))}</b>
+   <span>收件地址</span><b>${esc(this.f(o.receive_address))}</b>
+   <span>期望寄回地址和联系方式</span><b>${esc(this.f(o.return_address))}</b>
+   <span>快递单号</span><b>${esc(this.f(o.tracking_no))}</b>
+   <span>发出快递单号</span><b>${esc(this.f(o.outbound_tracking_no))}</b>
+   <span>维修负责人</span><b>${esc(this.f(o.owner))}</b>
+   <span>最后跟进时间</span><b>${o.followMs?esc(this.fmtClock(o.followMs)+'（'+this.fmtRel(o.followMs)+'）'):'—'}</b>
+   <span>最后跟进说明</span><b style="white-space:pre-wrap">${esc(this.f(o.last_followup_note))}</b>
+   <span>创建时间</span><b>${o.createdMs?esc(this.fmtClock(o.createdMs)):'—'}</b>
+   <span>台账在线状态</span><b>${this.onlineBadge(o)}</b>
+  </div>
+  <h3>附件（${atts.length}）</h3>${attHtml}
+  <div class="rfootbar">${fu}${jump}</div>`;
+ this.bindClose();
+ const jb=this.gid('repJump');if(jb)jb.onclick=()=>{this.closeDetail();this.jumpDevice(o.device_id)};
+},
+jumpDevice(did){
+ if(!did)return;
+ Upg.setView('overview');
+ const qi=document.getElementById('q');
+ if(qi)qi.value=did;
+ q=String(did).toLowerCase();          // 设备总览全局搜索（matches() 消费）
+ siteFilter='';verFilter='';pendingOnly=false;statusFilter='all';
+ const sf=document.getElementById('statusFilter');if(sf)sf.value='all';
+ renderSites();renderVers();renderGrid();
+ if(qi)qi.scrollIntoView({behavior:'smooth',block:'center'});
+},
+init(){
+ this.gid('repKanban').addEventListener('click',e=>{
+  const j=e.target.closest('.ron.link');if(j){e.stopPropagation();this.jumpDevice(j.dataset.jump);return}
+  const c=e.target.closest('.rcard');if(c)this.openDetail(c.dataset.rid);
+ });
+ const rowClick=e=>{
+  const j=e.target.closest('.ron.link');if(j){e.stopPropagation();this.jumpDevice(j.dataset.jump);return}
+  const tr=e.target.closest('tr[data-rid]');if(tr)this.openDetail(tr.dataset.rid);
+ };
+ this.gid('repTbody').addEventListener('click',rowClick);
+ this.gid('repDoneTbody').addEventListener('click',rowClick);
+ this.gid('repVKanban').onclick=()=>this.setView('kanban');
+ this.gid('repVList').onclick=()=>this.setView('list');
+ this.gid('repReload').onclick=()=>this.load();
+ this.gid('repDoneToggle').onclick=()=>{this.doneOpen=!this.doneOpen;this.renderList()};
+ const qi=this.gid('repQ');
+ qi.addEventListener('input',()=>{clearTimeout(this.qT);this.qT=setTimeout(()=>{this.q=qi.value.trim();this.loadList()},350)});
+ for(const id of['repStageF','repTypeF','repUnitF','repOwnerF']){
+  this.gid(id).addEventListener('change',()=>{
+   const g=i=>{const v=this.gid(i).value;return v==='all'?'':v};
+   this.stageF=g('repStageF');this.typeF=g('repTypeF');this.unitF=g('repUnitF');this.ownerF=g('repOwnerF');
+   this.loadList();
+  });
+ }
+ const m=this.gid('repModal');
+ m.addEventListener('click',e=>{if(e.target===m)this.closeDetail()});
+ document.addEventListener('keydown',e=>{if(e.key==='Escape')this.closeDetail()});
+ setInterval(()=>{if(!this.gid('atabRepairs').hidden)this.load()},60000);   // 资产区维修看板子页签可见时刷新
+}
+};
+Upg.init();      // 路由器先就绪（setView 引用下方 Assets/Rep，声明先于本行求值）
+Assets.init();
+Rep.init();
+"""
 
 
 def _json_request(url, *, method="GET", data=None, headers=None, timeout=4):
@@ -1277,6 +2368,27 @@ class Store:
             "first_seen DATETIME NOT NULL, "
             "UNIQUE KEY uq_ver_arch (version, arch)"
             ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4")
+        # webfix 台账（KVWO-17/19/44）：每次补配一行（auto 一次性防重靠 trigger_type='auto'
+        # 的历史行；attempts 为累计次数）；与 devices 同为永不清理的台账，
+        # run_maintenance 的 30 天保留不涉及此表。log 随子任务入库，重启后仍可回看。
+        # status 三态收口（KVWO-44，对齐父需求）：success / failed（环境性失败，
+        # 排障后重试可成功）/ blocked（阻断类：前置不满足或确定性错配，重试同样
+        # 结果，需人工介入）；error_code 为细分码（如 arch_unknown / proxy_conflict）。
+        self._execute(
+            "CREATE TABLE IF NOT EXISTS webfix_tasks ("
+            "id INT NOT NULL PRIMARY KEY, "
+            "hostname VARCHAR(64) NOT NULL, "
+            "trigger_type VARCHAR(8) NOT NULL, "         # auto / manual
+            "status VARCHAR(16) NOT NULL DEFAULT 'queued', "  # queued/running/success/failed/blocked
+            "error VARCHAR(500) NOT NULL DEFAULT '', "
+            "error_code VARCHAR(32) NOT NULL DEFAULT '', "   # 细分码（KVWO-44；空 = 未分类）
+            "attempts INT NOT NULL DEFAULT 1, "           # 该设备累计补配次数
+            "log LONGTEXT NULL, "
+            "created_at DATETIME NOT NULL, "
+            "finished_at DATETIME NULL, "
+            "KEY idx_host (hostname), "
+            "KEY idx_created (created_at)"
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4")
         rows = self._execute(
             "SELECT column_name FROM information_schema.columns "
             "WHERE table_schema=DATABASE() AND table_name='devices'", fetch="all")
@@ -1300,14 +2412,21 @@ class Store:
         tcols = {r[0] for r in rows or []}
         if tcols and "error_code" not in tcols:
             self._execute("ALTER TABLE upgrade_tasks ADD COLUMN error_code VARCHAR(32) NOT NULL DEFAULT ''")
+        # 老库补列（KVWO-44 前的 webfix_tasks 无 error_code）
+        rows = self._execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema=DATABASE() AND table_name='webfix_tasks'", fetch="all")
+        wcols = {r[0] for r in rows or []}
+        if wcols and "error_code" not in wcols:
+            self._execute("ALTER TABLE webfix_tasks ADD COLUMN error_code VARCHAR(32) NOT NULL DEFAULT ''")
 
     def _load_roster(self):
         rows = self._execute(
             "SELECT hostname, IFNULL(site,''), IFNULL(owner,''), IFNULL(hardware,''), retired, "
-            "IFNULL(hw_model,''), IFNULL(ip,''), ssh_port FROM devices",
+            "IFNULL(hw_model,''), IFNULL(ip,''), ssh_port, IFNULL(device_id,'') FROM devices",
             fetch="all")
         self.roster = {r[0]: {"site": r[1], "owner": r[2], "hardware": r[3], "retired": bool(r[4]),
-                              "hw_model": r[5], "ip": r[6], "ssh_port": r[7]}
+                              "hw_model": r[5], "ip": r[6], "ssh_port": r[7], "device_id": r[8]}
                        for r in rows or []}
 
     def _load_state(self):
@@ -1669,6 +2788,94 @@ class Store:
             self.finish_upgrade_job(job_id, now)
         return len(rows)
 
+    # --- webfix 台账（KVWO-17/19/44）----------------------------------------------
+    def create_webfix_task(self, task_id, hostname, trigger_type, attempts, created_at,
+                           status="queued", error="", error_code="", finished_at=None):
+        """落一行台账；KVWO-44 起支持直接以终态落行（auto 阻断类前置不满足：
+        不跑设备端，状态直接 blocked 收口，占一次性名额、可手动重试）。"""
+        self._execute(
+            "INSERT INTO webfix_tasks (id, hostname, trigger_type, status, error, "
+            "error_code, attempts, created_at, finished_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (task_id, hostname, trigger_type, status, (error or "")[:500],
+             (error_code or "")[:32], attempts, created_at, finished_at))
+
+    def update_webfix_task(self, task_id, status=None, error=None, error_code=None,
+                           log=None, finished_at=None):
+        sets, args = [], []
+        if status is not None:
+            sets.append("status=%s"); args.append(status)
+        if error is not None:
+            sets.append("error=%s"); args.append(error[:500])
+        if error_code is not None:
+            sets.append("error_code=%s"); args.append(error_code[:32])
+        if log is not None:
+            sets.append("log=%s"); args.append(log)
+        if finished_at is not None:
+            sets.append("finished_at=%s"); args.append(finished_at)
+        if not sets:
+            return
+        args.append(task_id)
+        self._execute(f"UPDATE webfix_tasks SET {', '.join(sets)} WHERE id=%s", args)
+
+    def webfix_has_auto(self, hostname):
+        """该设备是否已有自动触发记录（无论成败）——自动补配严格一次的判据。"""
+        row = self._execute(
+            "SELECT 1 FROM webfix_tasks WHERE hostname=%s AND trigger_type='auto' LIMIT 1",
+            (hostname,), fetch="one")
+        return bool(row)
+
+    def webfix_attempts(self, hostname):
+        row = self._execute(
+            "SELECT MAX(attempts) FROM webfix_tasks WHERE hostname=%s", (hostname,), fetch="one")
+        return int(row[0] or 0) if row else 0
+
+    def webfix_tasks_view(self):
+        """各设备补配状态：每设备取最新一行（含 error / error_code / 累计 attempts / 日志长度）。"""
+        rows = self._execute(
+            "SELECT w.id, w.hostname, w.trigger_type, w.status, w.error, w.error_code, "
+            "w.attempts, "
+            "UNIX_TIMESTAMP(w.created_at), IFNULL(UNIX_TIMESTAMP(w.finished_at), 0), "
+            "IFNULL(LENGTH(w.log), 0), IFNULL(d.site, '') "
+            "FROM webfix_tasks w "
+            "JOIN (SELECT hostname, MAX(id) AS mid FROM webfix_tasks GROUP BY hostname) t "
+            "ON w.id = t.mid "
+            "LEFT JOIN devices d ON d.hostname = w.hostname "
+            "ORDER BY w.id DESC", fetch="all")
+        return [{"task_id": r[0], "hostname": r[1], "trigger_type": r[2], "status": r[3],
+                 "error": r[4] or "", "error_code": r[5] or "", "attempts": int(r[6] or 1),
+                 "created_at": r[7],
+                 "finished_at": r[8] or None, "chars": int(r[9] or 0), "site": r[10] or ""}
+                for r in rows or []]
+
+    def webfix_task_log(self, task_id):
+        """取库内日志（进程重启后回看）；返回 (log, status, hostname) 或 None。"""
+        row = self._execute(
+            "SELECT log, status, hostname FROM webfix_tasks WHERE id=%s", (task_id,), fetch="one")
+        if not row:
+            return None
+        return row[0] or "", row[1] or "", row[2] or ""
+
+    def max_webfix_id(self):
+        row = self._execute("SELECT MAX(id) FROM webfix_tasks", fetch="one")
+        return int(row[0] or 0) if row else 0
+
+    def reconcile_webfix_tasks(self):
+        """进程重启后把遗留 queued/running 的补配任务标记为 failed（自动触发的
+        一次性语义不固中断而重置：台账里 auto 记录仍在，不再自动触发；可手动重试）。"""
+        rows = self._execute(
+            "SELECT id, hostname FROM webfix_tasks WHERE status IN ('queued', 'running')",
+            fetch="all")
+        if not rows:
+            return 0
+        now = datetime.now()
+        for tid, hostname in rows:
+            self.update_webfix_task(
+                tid, status="failed",
+                error="面板进程重启，补配任务中断（若配置已写入则保留现场；可手动重试）",
+                finished_at=now)
+        return len(rows)
+
     def events(self, hours, limit):
         rows = self._execute(
             "SELECT hostname, DATE_FORMAT(ts, '%%Y-%%m-%%d %%H:%%i:%%s'), event_type, "
@@ -1702,6 +2909,15 @@ def _refresh_loop():
             refresh_snapshot()
         except Exception:
             pass
+        else:
+            # webfix 自动检测（KVWO-17/19/44）：挂入现有刷新循环，每轮快照后推进
+            # 「上线事件 + 稳定窗口」状态机——新候选记窗口起点，掉线作废重计，
+            # 连续在线满 WEBFIX_DELAY（默认 60s）且仍缺 web 代理才触发（判据只看
+            # 代理列表；version_error 单独出现不触发，探测瞬时失败 ≠ 缺配置）。
+            try:
+                webfix_auto_detect()
+            except Exception:
+                pass
         time.sleep(REFRESH_INTERVAL)
 
 
@@ -1938,9 +3154,11 @@ exit $rc
 '''
 
 SCRIPT_VERIFY = r'''#!/usr/bin/env bash
-# [内嵌自 update/scripts/verify.sh · 2026-10-15，无改动]
+# [内嵌自 update/scripts/verify.sh · 2026-10-15]
 # 设备端升级后验证。成功标准：version=新版本 / service=active / http=200 /
-# api 含新版本 / 4 常驻容器新镜像 / frpc=active（由面板侧比对判分）
+# api 含新版本 / 常驻容器新镜像 / frpc=active（由面板侧比对判分）。
+# 容器判分按机型（面板侧，2026-10-16 KVWO-14）：V1(rk3588)=4 常驻容器全为新版镜像；
+# V0(amd64)=运行中 portal 容器全为新版且 ≥ 核心 2 个（backend+相机模块）。
 set -u
 pw=${DEPLOY_PW:-}
 s() { printf '%s\n' "$pw" | sudo -S -p '' "$@" 2>/dev/null; }
@@ -1979,6 +3197,67 @@ fi
 echo "health: portal=$(systemctl is-active ego-portal.service 2>/dev/null) frpc=$(systemctl is-active frpc 2>/dev/null) api=$(curl -s --max-time 5 http://127.0.0.1/api/setup/status | grep -oP '"release_version":"[^"]*"' | head -1)"
 echo "disk: $(df -h / | awk 'NR==2{print $4" free"}')"
 echo "### done"
+'''
+
+
+SCRIPT_WEBFIX = r'''#!/usr/bin/env bash
+# 设备端 web 代理补配（KVWO-17/19 · 2026-10-16）。经 FRP SSH stdin 推送执行，
+# 参数走远程命令行环境变量：WEBFIX_HOSTNAME（如 ep-000160）、WEBFIX_PORT
+# （如 30160）、DEPLOY_PW（sudo 凭据，经 stdin；严禁密码管道接 tee -a —— SOP #4）。
+# 流程：flock 防并发 → 备份 frpc.toml → 幂等检查（同名代理已存在：端口一致 =
+# 无事可做；不一致 = 报错人工介入，不覆盖）→ 临时文件追加 [[proxies]] 块 →
+# frpc verify → sudo cp 覆盖（保留原文件属主/权限）→ 延迟重启 frpc。重启会闪断
+# 自身 SSH 隧道（预期内），故以 setsid 后台延迟执行后立即退出，回连与版本闭环
+# 校验（/api/setup/status 比对 device_id）由面板侧完成。
+# 结果标记：WEBFIX_APPLIED / WEBFIX_ALREADY / ERROR_*（失败不回滚，保留现场）。
+set -u
+pw="${DEPLOY_PW:?need DEPLOY_PW}"
+s() { printf '%s\n' "$pw" | sudo -S -p '' "$@" 2>/dev/null; }
+HOST="${WEBFIX_HOSTNAME:?need WEBFIX_HOSTNAME, e.g. ep-000160}"
+PORT="${WEBFIX_PORT:?need WEBFIX_PORT, e.g. 30160}"
+printf '%s' "$HOST" | grep -qE '^ep-[0-9]+$' || { echo "ERROR_BAD_HOSTNAME: $HOST 不符合 ep-<编号> 约定"; exit 18; }
+case "$PORT" in ''|*[!0-9]*) echo "ERROR_BAD_PORT: $PORT"; exit 19;; esac
+CONF=/etc/frp/frpc.toml
+exec 9>/var/tmp/webfix.lock
+flock -n 9 || { echo "ERROR_BUSY: 另一个 webfix 正在此设备上运行"; exit 20; }
+echo "webfix: host=$HOST web=$PORT conf=$CONF frpc=$(systemctl is-active frpc 2>/dev/null || true)"
+s test -f "$CONF" || { echo "ERROR_NO_CONF: $CONF 不存在（frpc 配置路径与预期不符，需人工确认）"; exit 11; }
+# 1) 幂等检查：同名代理块已存在 → remotePort 一致 = 无事可做；不一致 = 不覆盖，人工介入
+line=$(s grep -nE "^[[:space:]]*name[[:space:]]*=[[:space:]]*\"${HOST}-web\"" "$CONF" | head -1 || true)
+if [ -n "$line" ]; then
+  ln=${line%%:*}
+  existing=$(s tail -n +"$((ln + 1))" "$CONF" | sed -n '/^[[:space:]]*\[\[/q; /remotePort[[:space:]]*=/p' | grep -oE '[0-9]+' | head -1)
+  if [ "$existing" = "$PORT" ]; then
+    echo "WEBFIX_ALREADY: 代理 ${HOST}-web 已存在且 remotePort=$PORT 一致，未做任何改动"
+    exit 0
+  fi
+  echo "ERROR_PROXY_CONFLICT: 已存在同名代理 ${HOST}-web（remotePort=${existing:-?} ≠ $PORT），不覆盖，需人工介入"
+  exit 12
+fi
+# 2) 备份（时间戳留档，不覆盖历史备份，供人工排查/回滚参考）
+BAK="${CONF}.bak-webfix-$(date +%Y%m%d-%H%M%S)"
+s cp -p "$CONF" "$BAK" || { echo "ERROR_BACKUP: 备份失败，未改动配置"; exit 13; }
+echo "backup: $BAK"
+# 3) 临时文件组装（用户态临时文件；sudo cat 读原配置，不依赖其权限）→
+#    frpc verify → sudo cp 覆盖（对已存在目标为截断写，保留原属主/权限）
+TMP=$(mktemp /var/tmp/frpc-webfix.XXXXXX)
+trap 'rm -f "$TMP"' EXIT
+s cat "$CONF" > "$TMP" || { echo "ERROR_READ_CONF: 读取 $CONF 失败"; exit 14; }
+[ "$(tail -c1 "$TMP" | wc -l)" -gt 0 ] || printf '\n' >> "$TMP"   # 原文件无结尾换行时补一行，防 TOML 粘连
+printf '[[proxies]]\nname = "%s-web"\ntype = "tcp"\nlocalIP = "127.0.0.1"\nlocalPort = 80\nremotePort = %s\n' "$HOST" "$PORT" >> "$TMP"
+echo "append: ${HOST}-web remotePort=$PORT -> 127.0.0.1:80"
+FRPC=$(command -v frpc 2>/dev/null || true)
+[ -n "$FRPC" ] || for c in /usr/local/bin/frpc /usr/bin/frpc /opt/frp/frpc; do [ -x "$c" ] && FRPC="$c" && break; done
+[ -n "$FRPC" ] || { echo "ERROR_NO_FRPC: 找不到 frpc 可执行文件，需人工确认安装路径"; exit 17; }
+printf '%s\n' "$pw" | sudo -S -p '' "$FRPC" verify -c "$TMP" || { echo "ERROR_VERIFY: frpc verify 未通过（见上方输出），未改动 $CONF"; exit 15; }
+echo "verify: frpc syntax check pass"
+s cp "$TMP" "$CONF" || { echo "ERROR_INSTALL: sudo cp 覆盖 $CONF 失败（备份在 $BAK）"; exit 16; }
+s ls -l "$CONF" | sed 's/^/installed: /'
+# 4) 延迟重启（setsid 脱离会话：frpc 重启会闪断本 SSH 隧道，本进程须先安全退出；
+#    9>&- 不把 flock 句柄遗传给后台进程，锁随本脚本退出即释放）
+s sh -c "nohup setsid sh -c 'sleep 2; systemctl restart frpc; sleep 3; systemctl is-active frpc' >/var/tmp/webfix-restart.log 2>&1 9>&- &"
+echo "WEBFIX_APPLIED: 已写入 ${HOST}-web（remotePort=$PORT -> 127.0.0.1:80），2s 后重启 frpc（本机隧道秒级闪断为预期）"
+exit 0
 '''
 
 
@@ -2361,13 +3640,18 @@ def _next_upgrade_ids(n):
 
 
 def device_busy(hostname):
-    """该设备是否已有 queued/running 子任务（跨任务查重，并发护栏）。"""
+    """该设备是否已有 queued/running 子任务（跨任务查重，并发护栏）。
+
+    含 webfix 补配任务（frpc 重启会闪断 SSH 隧道，与升级互斥）。"""
     with UPGRADES_LOCK:
         for job in UPGRADES.values():
             with job.lock:
                 for t in job.tasks:
                     if t.hostname == hostname and t.status in ("queued", "running"):
                         return job.id
+    webfix = webfix_active(hostname)
+    if webfix is not None:
+        return f"webfix#{webfix.id}"
     return None
 
 
@@ -2616,6 +3900,28 @@ def stage_install(task, ctx):
     return False
 
 
+# 验证容器判据按机型校准（2026-10-16 KVWO-14）：V1（rk3588）常驻栈 4 容器全为新版
+# 镜像；V0（amd64）常驻核心集 = backend + 相机模块（2 个），判据为「运行中的 portal
+# 容器全部为新版镜像，且数量 ≥ 机型核心数」——有旧容器还在跑即判真失败。
+VERIFY_CORE_CONTAINERS = {"rk3588-arm64": 4, "amd64": 2}
+VERIFY_MODEL_BY_ARCH = {"amd64": "V0", "rk3588-arm64": "V1"}
+
+
+def _verify_containers(out, want, arch):
+    """按机型校准容器判分。返回 (ok, 新版数, portal 运行数, 核心数, 机型)。"""
+    core = VERIFY_CORE_CONTAINERS.get(arch, 4)
+    model = VERIFY_MODEL_BY_ARCH.get(arch, arch or "未知机型")
+    # docker ps 输出行形如：ego_portal-backend-1 | registry/…:v0.4.6 | Up 2 minutes
+    portal = [l for l in out.splitlines()
+              if "|" in l and l.split("|", 1)[0].strip().startswith("ego_portal-")]
+    new = sum(1 for l in portal if want and want in l)
+    if arch == "amd64":
+        ok = bool(portal) and new == len(portal) and new >= core
+    else:
+        ok = new >= core
+    return ok, new, len(portal), core, model
+
+
 def stage_verify(task, ctx):
     rc, out = push_script(task, SCRIPT_VERIFY, {}, timeout=180)
     if rc != 0:
@@ -2627,15 +3933,18 @@ def stage_verify(task, ctx):
             if line.startswith(key + "="):
                 s[key] = line.split("=", 1)[1][:160]
     want = ctx.get("version") or ""
-    new_containers = sum(1 for l in out.splitlines() if want and want in l and "|" in l)
+    arch = ctx.get("arch") or "rk3588-arm64"
+    cont_ok, new_containers, portal_total, core, model = _verify_containers(out, want, arch)
     ok = (s.get("service") == "active" and s.get("http") == "200"
           and s.get("frpc") == "active"
           and (not want or s.get("version") == want)
-          and (not want or new_containers >= 4))
+          and (not want or cont_ok))
     task.log(f"[panel] 验证结果 version={s.get('version')} service={s.get('service')} "
-             f"http={s.get('http')} frpc={s.get('frpc')} 新版容器={new_containers}")
+             f"http={s.get('http')} frpc={s.get('frpc')} "
+             f"新版容器={new_containers}/{portal_total}（{model} 核心={core}）")
     if not ok:
-        task.set_status("failed", "验证未全部通过（版本/service/HTTP/frpc/4 容器镜像）")
+        task.set_status("failed", f"验证未全部通过（版本/service/HTTP/frpc/容器镜像："
+                                  f"新版容器 {new_containers}/{portal_total}（{model} 核心={core}））")
     return ok
 
 
@@ -2683,7 +3992,10 @@ def _run_upgrade_task(task):
 
 
 def _resolve_device(hostname):
-    """以面板设备记录为准解析 ssh_port 与机型；返回 (ssh_port, arch, error)。"""
+    """以面板设备记录为准解析 ssh_port 与机型；返回 (ssh_port, arch, error, error_code)。
+
+    error_code（KVWO-44 阻断类细分码）：no_ssh_port / arch_unknown，供 webfix
+    阻断落库与 API 回显；升级编排调用方忽略该值。"""
     snap = {}
     try:
         hosts, _ = get_snapshot()
@@ -2696,12 +4008,14 @@ def _resolve_device(hostname):
         ssh_port = int(ssh_port)
     hw = (roster.get("hardware") or "").strip() or _hardware_category(roster.get("hw_model") or "")
     arch = ARCH_BY_HW.get((hw or "").strip()) or ARCH_BY_HW.get(hw.casefold() if hw else "")
-    error = None
+    error, code = None, ""
     if not ssh_port:
         error = "无 SSH 端口记录（以面板设备记录为准，请等设备上线后再试）"
+        code = "no_ssh_port"
     elif not arch:
         error = "无法确定机型（V0/amd64 或 V1/rk3588），请先在设备登记表维护 hardware"
-    return ssh_port, arch, error
+        code = "arch_unknown"
+    return ssh_port, arch, error, code
 
 
 def create_upgrade_job(kind, devices, params):
@@ -2778,7 +4092,7 @@ def create_upgrade_job(kind, devices, params):
         if busy:
             skipped.append({"hostname": hostname, "reason": f"已有任务 {busy} 在进行中"})
             continue
-        ssh_port, arch, error = _resolve_device(hostname)
+        ssh_port, arch, error, _ = _resolve_device(hostname)
         if error:
             skipped.append({"hostname": hostname, "reason": error})
             continue
@@ -2898,6 +4212,2037 @@ def _prune_upgrade_memory():
 
 
 # ----------------------------------------------------------------------------
+# webfix 引擎（KVWO-17/19/44）：缺失 web 代理设备的自动检测与一次性补配。
+# 检测挂入 _refresh_loop（上线事件 + 稳定窗口，KVWO-44）；补配复用升级编排的
+# SSH 基建（run_remote/push_script，SSH 用户按机型解析，KVWO-13）与 SSE/日志
+# 体系；台账入库 webfix_tasks。
+# 只动设备侧 frpc.toml，不触碰 frps / 网关（allowPorts 30000-30999 已预放宽）。
+# ----------------------------------------------------------------------------
+# 阻断类细分码（KVWO-44，对齐父需求「成功/失败/阻断」三态与 KVWO-21 的
+# blocked / error_code 设计）：阻断 = 前置条件不满足或确定性错配，重试同样
+# 结果，需人工介入（补登记表 / 放宽网关段 / 处理配置冲突）；普通失败 =
+# 环境性/瞬时性失败（SSH 不可达、闭环校验超时等），排障后重试可成功。
+#   面板侧前置：bad_hostname / port_out_of_range / no_ssh_port / arch_unknown
+#   设备端脚本：no_conf（配置缺失）/ proxy_conflict（同名代理端口冲突）/ no_frpc
+#               / bad_hostname / bad_port
+#   闭环校验：  device_id_mismatch（端口「借住」错配，不会自愈，等人工）
+WEBFIX_BLOCKED_CODES = {"bad_hostname", "bad_port", "port_out_of_range", "no_ssh_port",
+                        "arch_unknown", "no_conf", "proxy_conflict", "no_frpc",
+                        "device_id_mismatch"}
+_SCRIPT_ERROR_CODES = {"ERROR_BAD_HOSTNAME": "bad_hostname", "ERROR_BAD_PORT": "bad_port",
+                       "ERROR_NO_CONF": "no_conf", "ERROR_PROXY_CONFLICT": "proxy_conflict",
+                       "ERROR_NO_FRPC": "no_frpc"}
+
+
+def _webfix_device_number(hostname):
+    """从设备名提取编号（ep-000160 → 160）；不符合约定返回 None。"""
+    m = re.fullmatch(r"ep-(\d+)", (hostname or "").strip().casefold())
+    return int(m.group(1)) if m else None
+
+
+def webfix_port_for(hostname):
+    """该设备应使用的 web 远端端口（WEBFIX_PORT_BASE + 编号）；超段返回 None。"""
+    number = _webfix_device_number(hostname)
+    if number is None:
+        return None
+    port = WEBFIX_PORT_BASE + number
+    return port if WEBFIX_PORT_BASE <= port <= WEBFIX_PORT_MAX else None
+
+
+def webfix_candidates(hosts):
+    """缺 web 代理候选：在线 + 有 SSH 代理端口 + 无 web 代理端口。
+
+    判据只看 frps 代理列表；web 代理已存在但探测失败（version_error）不属于
+    缺配置，不触发——那是探测瞬时失败，改设备配置解决不了。"""
+    out = []
+    for h in hosts or []:
+        if not h.get("port"):        # 无 SSH 代理：无法推送补配脚本
+            continue
+        if h.get("web_port"):        # web 代理已存在（即使 version_error 也不是候选）
+            continue
+        out.append(h["hostname"])
+    return out
+
+
+def _webfix_id_matches(got, expected):
+    """闭环校验的 device_id 比对：数字串按值比（"0160"="160"），其余按字面比。"""
+    g, e = str(got or "").strip(), str(expected or "").strip()
+    if not g or not e:
+        return False
+    if g.isdigit() and e.isdigit():
+        return int(g) == int(e)
+    return g.casefold() == e.casefold()
+
+
+class WebfixTask:
+    """一台设备一次补配的运行态（内存态权威，状态/日志增量落 webfix_tasks）。
+
+    兼容 run_remote/push_script 的任务接口（ssh_port/ssh_user/log）。status 三态
+    收口（KVWO-44）：success / failed（环境性）/ blocked（阻断类，重试同样
+    结果，需人工介入）；error_code 为细分码。"""
+
+    def __init__(self, task_id, hostname, trigger_type, attempts, ssh_port, ssh_user,
+                 port, expected_id):
+        self.id = task_id
+        self.hostname = hostname
+        self.trigger_type = trigger_type      # auto / manual
+        self.attempts = attempts              # 该设备累计补配次数
+        self.ssh_port = ssh_port
+        self.ssh_user = ssh_user
+        self.port = port                      # 目标 web 远端端口（30000+编号）
+        self.expected_id = expected_id        # 闭环校验期望 device_id
+        self.status = "queued"
+        self.error = ""
+        self.error_code = ""
+        self.created_at = time.time()
+        self.finished_at = 0.0
+        self.text = ""
+        self._flushed = 0
+        self.lock = threading.Lock()
+
+    def log(self, line):
+        chunk = _sanitize(str(line)) + "\n"
+        with self.lock:
+            self.text += chunk
+            if len(self.text) > TASK_LOG_CAP:
+                cut = self.text.find("\n", len(self.text) - int(TASK_LOG_CAP * 0.8))
+                self.text = "…（前文截断）…\n" + self.text[cut + 1:]
+            total = len(self.text)
+            flush = total - self._flushed >= 65536
+        BUS.publish({"type": "webfix_log", "task_id": self.id, "hostname": self.hostname,
+                     "chunk": chunk, "total": total, "text": chunk, "offset": total})
+        if flush:
+            self.persist(log=True)
+
+    def set_status(self, status, error=None, error_code=None):
+        with self.lock:
+            self.status = status
+            if error is not None:
+                self.error = _sanitize(str(error))[:500]
+            if error_code is not None:
+                self.error_code = _sanitize(str(error_code))[:32]
+        BUS.publish({"type": "webfix", "task": self.to_dict()})
+
+    def persist(self, status=None, error=None, error_code=None, log=False, finished=False):
+        kwargs = {}
+        if status is not None:
+            kwargs["status"] = status
+        if error is not None:
+            kwargs["error"] = error
+        if error_code is not None:
+            kwargs["error_code"] = error_code
+        if log:
+            with self.lock:
+                kwargs["log"] = self.text
+                self._flushed = len(self.text)
+        if finished:
+            kwargs["finished_at"] = datetime.now()
+        if kwargs:
+            store.update_webfix_task(self.id, **kwargs)
+
+    def to_dict(self):
+        with self.lock:
+            return {"task_id": self.id, "hostname": self.hostname,
+                    "site": (store.roster.get(self.hostname) or {}).get("site", ""),
+                    "trigger_type": self.trigger_type, "status": self.status,
+                    "error": self.error, "error_code": self.error_code,
+                    "attempts": self.attempts,
+                    "web_port": self.port,
+                    "created_at": self.created_at or None,
+                    "finished_at": self.finished_at or None,
+                    "chars": len(self.text)}
+
+
+WEBFIX = {}              # task_id -> WebfixTask（内存态；历史从 DB 回看）
+WEBFIX_LOCK = threading.RLock()  # 可重入：_start_webfix_checked 持锁时内查 webfix_active
+_WEBFIX_SEQ = store.max_webfix_id() if store.enabled else 0  # 重启后从 DB 续号，防主键冲突
+WEBFIX_POOL = ThreadPoolExecutor(max_workers=WEBFIX_MAX_PARALLEL,
+                                 thread_name_prefix="webfix")
+
+
+def webfix_active(hostname):
+    """该设备是否有 queued/running 的补配任务（返回任务或 None）。"""
+    with WEBFIX_LOCK:
+        for t in WEBFIX.values():
+            if t.hostname == hostname and t.status in ("queued", "running"):
+                return t
+    return None
+
+
+def _webfix_reject_auto(hostname, reason, error_code):
+    """auto 触发遇阻断类前置不满足：不跑设备端，直接落一条 blocked 台账行。
+
+    阻断也占一次性名额（对齐 KVWO-21 语义）：结果落库可查、面板可见，人工
+    补齐登记表 / 放宽网关段后可手动重试；避免每轮刷新对永久性缺口反复探测。"""
+    with WEBFIX_LOCK:
+        global _WEBFIX_SEQ
+        _WEBFIX_SEQ += 1
+        task_id = _WEBFIX_SEQ
+        attempts = (store.webfix_attempts(hostname) or 0) + 1
+        task = WebfixTask(task_id, hostname, "auto", attempts, None, "", None, "")
+        task.status = "blocked"
+        task.error = _sanitize(str(reason))[:500]
+        task.error_code = error_code
+        task.finished_at = time.time()
+        WEBFIX[task_id] = task
+    store.create_webfix_task(task_id, hostname, "auto", attempts, datetime.now(),
+                             status="blocked", error=task.error,
+                             error_code=error_code, finished_at=datetime.now())
+    BUS.publish({"type": "webfix", "task": task.to_dict()})
+    try:
+        store._event(datetime.now(), hostname, "webfix", "auto", "blocked", task.error)
+    except Exception:  # noqa: BLE001  # 事件失败不影响阻断收口
+        pass
+    return {"ok": False, "reason": reason, "error_code": error_code,
+            "blocked": True, "task_id": task_id}
+
+
+def _start_webfix_checked(hostname, trigger):
+    """校验后创建并异步启动一次补配；返回 {ok, task_id?, attempts?, reason?,
+    error_code?, blocked?}。
+
+    trigger: auto（检测引擎，严格一次）/ manual（面板重试，每次新建台账行、
+    attempts 累加、trigger_type=manual）。阻断类前置不满足（机型未知、端口
+    超段等）时：auto 落 blocked 台账行（KVWO-44），manual 仅跳过并回明原因。"""
+    hostname = (hostname or "").strip().casefold()
+    if not hostname:
+        return {"ok": False, "reason": "空设备名"}
+
+    def reject(reason, code=""):
+        if trigger == "auto" and code in WEBFIX_BLOCKED_CODES:
+            return _webfix_reject_auto(hostname, reason, code)
+        return {"ok": False, "reason": reason, "error_code": code}
+
+    port = webfix_port_for(hostname)
+    if port is None:
+        number = _webfix_device_number(hostname)
+        if number is None:
+            return reject(f"设备名 {hostname} 不符合 ep-<编号> 约定，无法推导 web 端口",
+                          "bad_hostname")
+        return reject(f"推导端口 {WEBFIX_PORT_BASE + number} 超出网关预放宽段 "
+                      f"{WEBFIX_PORT_BASE}-{WEBFIX_PORT_MAX}，需先放宽 allowPorts",
+                      "port_out_of_range")
+    if not store.enabled:
+        return {"ok": False, "reason": "历史库未启用（webfix 依赖台账防重，需 MySQL）"}
+    if not DEPLOY_PW:
+        return {"ok": False, "reason": "服务端未设置 DEPLOY_PW（/etc/frp-monitor.env）"}
+    try:
+        hosts, _ = get_snapshot()
+        snap = next((h for h in hosts if h["hostname"] == hostname), None)
+    except Exception:  # noqa: BLE001  # frps 不可达时仅按登记表判定
+        hosts, snap = [], None
+    roster = store.roster.get(hostname) or {}
+    if hostname not in store.roster and snap is None:
+        return {"ok": False, "reason": "未知设备（不在面板记录中）"}
+    if trigger == "auto" and roster.get("retired"):
+        return {"ok": False, "reason": "设备已标记退役，自动补配跳过（可手动重试）"}
+    if snap is not None and snap.get("web_port"):
+        return {"ok": False, "reason": f"web 代理已存在（web_port={snap['web_port']}），无需补配"}
+    busy = device_busy(hostname)
+    if busy:
+        return {"ok": False, "reason": f"已有升级任务 {busy} 在进行中，稍后再试"}
+    ssh_port, arch, error, code = _resolve_device(hostname)
+    if error:
+        return reject(error, code)
+    # 期望 device_id：登记表值优先（探测过的设备），否则按设备编号
+    # （闭环校验防端口「借住」错配的比对基准，SOP #11）
+    expected_id = str(roster.get("device_id") or "").strip() or str(_webfix_device_number(hostname))
+    with WEBFIX_LOCK:
+        active = webfix_active(hostname)
+        if active is not None:
+            return {"ok": False, "reason": f"已有补配任务 #{active.id} 在进行中"}
+        global _WEBFIX_SEQ
+        _WEBFIX_SEQ += 1
+        task_id = _WEBFIX_SEQ
+        attempts = (store.webfix_attempts(hostname) or 0) + 1
+        task = WebfixTask(task_id, hostname, trigger, attempts, ssh_port,
+                          _ssh_user_for_arch(arch), port, expected_id)
+        WEBFIX[task_id] = task
+    store.create_webfix_task(task_id, hostname, trigger, attempts, datetime.now())
+    WEBFIX_POOL.submit(_run_webfix_task, task)
+    return {"ok": True, "task_id": task_id, "attempts": attempts}
+
+
+def _webfix_error_code(out):
+    """从设备端脚本输出提取结构化错误码（末尾 ERROR_* 行优先：
+    ERROR_PROXY_CONFLICT → proxy_conflict）；无标记返回 ''（环境性/无输出失败）。"""
+    for line in reversed([l.strip() for l in (out or "").splitlines() if l.strip()]):
+        if line.startswith("ERROR_"):
+            marker = line.split(":", 1)[0].strip()
+            return _SCRIPT_ERROR_CODES.get(marker,
+                                           marker.removeprefix("ERROR_").strip().lower())
+    return ""
+
+
+def _webfix_script_error(out, rc):
+    """从设备端脚本输出提取可读错误（ERROR_* 行优先，否则末行/退出码）。"""
+    lines = [l.strip() for l in (out or "").splitlines() if l.strip()]
+    for line in reversed(lines):
+        if line.startswith("ERROR_"):
+            body = line.split(":", 1)[1].strip() if ":" in line else line
+            return f"{body}（rc={rc}）" if rc else body
+    if lines:
+        return f"rc={rc}: {lines[-1][:300]}" if rc else lines[-1][:300]
+    return f"rc={rc}（无输出；设备不可达或 SSH 凭据失效）"
+
+
+def _webfix_verify(task):
+    """闭环校验：经 127.0.0.1:<30000+编号> 探 /api/setup/status，要求
+    release_version 非空且 device_id 与设备编号一致（防端口「借住」错配）。
+    返回 (ok, error, error_code)；device_id 不一致立即失败并标阻断类
+    （错配不会自愈，等人工），超时归普通失败（环境性，排障后可重试成功）。"""
+    base = f"http://127.0.0.1:{task.port}"
+    deadline = time.time() + WEBFIX_VERIFY_TIMEOUT
+    last_err = ""
+    while True:
+        try:
+            info = _setup_status_probe(base)
+            got = str(info.get("device_id") or "").strip()
+            if not _webfix_id_matches(got, task.expected_id):
+                err = (f"端口 {task.port} 探到 device_id={got or '<空>'}，与期望 "
+                       f"{task.expected_id} 不一致（疑似端口被其他设备占用/错配，SOP #11）；"
+                       f"设备配置已保留现场，需人工排查")
+                task.log(f"[panel] 闭环校验失败：{err}")
+                return False, err, "device_id_mismatch"
+            task.log(f"[panel] 闭环校验通过：device_id={got} "
+                     f"release_version={info.get('release_version')} — 补配成功")
+            return True, "", ""
+        except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
+            last_err = str(exc)
+        if time.time() >= deadline:
+            break
+        time.sleep(5)
+    err = (f"闭环校验超时（>{int(WEBFIX_VERIFY_TIMEOUT)}s，frpc 重启后 web 代理未就绪"
+           f"或版本不可读）：{last_err}")
+    task.log(f"[panel] {err}")
+    return False, err, "verify_timeout"
+
+
+def _run_webfix_task(task):
+    """一次补配：推送设备端脚本 → 等待重启回连 → 闭环校验。
+
+    失败不回滚设备配置（保留现场供排查），错误信息可读；台账与 SSE 同步收口。"""
+    task.set_status("running")
+    task.persist(status="running")
+    try:
+        task.log(f"[panel] webfix #{task.id} 开始：{task.hostname} 追加代理 "
+                 f"{task.hostname}-web（remotePort={task.port} → 127.0.0.1:80，"
+                 f"SSH {task.ssh_user}@127.0.0.1:{task.ssh_port}）")
+        rc, out = push_script(task, SCRIPT_WEBFIX,
+                              {"WEBFIX_HOSTNAME": task.hostname,
+                               "WEBFIX_PORT": str(task.port)}, timeout=180)
+        if "ERROR_" in out:               # 设备端结构化错误：阻断类（端口冲突/配置缺失等，
+            code = _webfix_error_code(out)  # 重试同样结果需人工）与普通失败分开收口
+            task.set_status("blocked" if code in WEBFIX_BLOCKED_CODES else "failed",
+                            _webfix_script_error(out, rc), error_code=code)
+        elif "WEBFIX_APPLIED" not in out and "WEBFIX_ALREADY" not in out:
+            task.set_status("failed", _webfix_script_error(out, rc))
+        else:
+            if rc != 0:
+                task.log(f"[panel] 注意：SSH 会话在收尾时断开（rc={rc}），"
+                         f"以结果标记与闭环校验为准")
+            if "WEBFIX_ALREADY" in out:
+                task.log("[panel] 设备端代理已存在且端口一致，未改动配置；进入闭环校验")
+            else:
+                task.log("[panel] 设备端配置已写入并重启 frpc（本机隧道秒级闪断为预期），"
+                         "等待 web 代理回连…")
+            ok, err, code = _webfix_verify(task)
+            if ok:
+                task.set_status("success")
+            else:
+                task.set_status("blocked" if code in WEBFIX_BLOCKED_CODES else "failed",
+                                err, error_code=code or None)
+    except Exception as exc:  # noqa: BLE001
+        task.log(f"[panel] 任务异常: {exc!r}")
+        task.set_status("failed", f"任务异常: {exc!r}")
+    finally:
+        task.finished_at = time.time()
+        task.persist(status=task.status, error=task.error or None,
+                     error_code=task.error_code or None, log=True, finished=True)
+        BUS.publish({"type": "webfix", "task": task.to_dict()})
+        try:
+            store._event(datetime.now(), task.hostname, "webfix", task.trigger_type,
+                         task.status, task.error or f"attempts={task.attempts}")
+        except Exception:  # noqa: BLE001  # 事件失败不影响任务收口
+            pass
+
+
+_webfix_windows = {}                 # hostname → 稳定窗口起点（内存态，KVWO-44）
+_webfix_windows_lock = threading.Lock()
+
+
+def webfix_advance_windows(candidates, now=None):
+    """推进「上线事件 + 稳定窗口」状态机；返回窗口已满、应触发自动补配的设备名。
+
+    - 新进入候选集（离线转在线；或面板启动后首次观测到的存量设备）→ 记窗口
+      起点（存量设备从首次观测起算同样窗口）；
+    - 离开候选集（掉线 / web 代理已出现 / ssh 代理消失）→ 计时作废，移除跟踪，
+      重新上线后从新起点重计；
+    - 连续在候选集满 WEBFIX_DELAY 秒 → 进入返回列表。跟踪条目保留：若触发被
+      瞬时原因拒绝（如升级任务占用），下轮窗口仍满可继续尝试；触发成功或落
+      auto 台账（含 blocked）后，调用方的候选集预过滤会将其移出，条目随之清除。
+    """
+    now = time.time() if now is None else now
+    due = []
+    with _webfix_windows_lock:
+        for hostname in set(_webfix_windows) - set(candidates):
+            _webfix_windows.pop(hostname, None)      # 掉线/不再是候选：计时作废
+        for hostname in candidates:
+            since = _webfix_windows.get(hostname)
+            if since is None:
+                _webfix_windows[hostname] = now      # 上线事件：启动稳定计时
+            elif now - since >= WEBFIX_DELAY:
+                due.append(hostname)
+    return due
+
+
+def webfix_auto_detect():
+    """每轮快照后：上线事件 + 稳定窗口模型的一次性自动补配（KVWO-44）。
+
+    触发时机（需求方定稿 2026-10-16）：不再周期扫描命中即触发——设备从离线
+    转在线（且 ssh 代理在、web 代理缺、无 auto 台账记录）→ 启动稳定计时，
+    连续在线满 WEBFIX_DELAY（默认 60s，环境变量可调）且期间未掉线（掉线计时
+    作废、重新上线重计）→ 仍缺 web 代理 → 触发一次。跳过：退役设备、升级/
+    补配任务进行中、已有 auto 台账记录（无论成败；阻断类前置不满足也占名额
+    落 blocked 行，不反复探测）。"""
+    if not WEBFIX_AUTO or not store.enabled or not DEPLOY_PW:
+        return
+    try:
+        hosts, _ = get_snapshot()
+    except Exception:  # noqa: BLE001
+        return
+    candidates = []
+    for hostname in webfix_candidates(hosts):
+        if store.webfix_has_auto(hostname):
+            continue                      # 一次为限：有 auto 记录不再跟踪/触发
+        if (store.roster.get(hostname) or {}).get("retired"):
+            continue
+        candidates.append(hostname)
+    for hostname in webfix_advance_windows(candidates):
+        result = _start_webfix_checked(hostname, "auto")
+        if result.get("ok"):
+            print(f"frp-monitor: webfix auto-trigger {hostname} "
+                  f"(task #{result['task_id']}, attempts={result['attempts']}, "
+                  f"stable>={int(WEBFIX_DELAY)}s)", flush=True)
+        elif result.get("blocked"):
+            print(f"frp-monitor: webfix auto-trigger {hostname} blocked "
+                  f"(task #{result.get('task_id')}, code={result.get('error_code')}): "
+                  f"{result.get('reason', '')}", flush=True)
+
+
+def webfix_retry(devices):
+    """POST /api/webfix/retry：手动重试（面板认证）；每次新建台账行，
+    attempts 累加，trigger_type=manual。自动触发的一次性语义不受影响。"""
+    if not store.enabled:
+        return {"ok": False, "error": "历史库未启用，webfix 不可用（需要 MySQL 台账防重）"}
+    if not DEPLOY_PW:
+        return {"ok": False, "error": "服务端未设置 DEPLOY_PW 环境变量（/etc/frp-monitor.env）"}
+    names, seen = [], set()
+    for h in devices or []:
+        name = str(h).strip().casefold()
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
+    if not names:
+        return {"ok": False, "error": "未指定设备"}
+    started, skipped = [], []
+    for hostname in names:
+        result = _start_webfix_checked(hostname, "manual")
+        if result.get("ok"):
+            started.append({"hostname": hostname, "task_id": result["task_id"],
+                            "attempts": result["attempts"]})
+        else:
+            skipped.append({"hostname": hostname, "reason": result.get("reason", "未知原因")})
+    return {"ok": True, "started": started, "skipped": skipped}
+
+
+def webfix_candidates_view():
+    """当前快照中的候选（在线 + 有 SSH 代理 + 缺 web 代理），供面板标记。"""
+    try:
+        hosts, _ = get_snapshot()
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for hostname in webfix_candidates(hosts):
+        port = webfix_port_for(hostname)
+        out.append({"hostname": hostname, "web_port": port})
+    return out
+
+
+def webfix_view():
+    """GET /api/webfix/tasks：各设备补配状态（最新一行/设备，含 error）。"""
+    rows = store.webfix_tasks_view() if store.enabled else []
+    merged = {row["hostname"]: row for row in rows}
+    with WEBFIX_LOCK:
+        memory = [(t.hostname, t.to_dict()) for t in WEBFIX.values()]
+    for hostname, d in memory:  # 内存态为权威（运行中/刚结束的任务）
+        if hostname not in merged or d["task_id"] >= merged[hostname]["task_id"]:
+            merged[hostname] = d
+    tasks = sorted(merged.values(), key=lambda t: -t["task_id"])
+    return {"enabled": store.enabled,
+            "auto_enabled": WEBFIX_AUTO and store.enabled and bool(DEPLOY_PW),
+            "port_base": WEBFIX_PORT_BASE, "port_max": WEBFIX_PORT_MAX,
+            "delay": WEBFIX_DELAY,          # 上线后稳定窗口秒数（KVWO-44，增补字段）
+            "verify_timeout": int(WEBFIX_VERIFY_TIMEOUT),
+            "candidates": webfix_candidates_view(),
+            "counts": _task_counts(tasks),
+            "tasks": tasks}
+
+
+def webfix_task_log_view(task_id, offset=0):
+    """补配日志增量读取（内存态优先，重启后回落 DB）。"""
+    with WEBFIX_LOCK:
+        task = WEBFIX.get(task_id)
+    if task is not None:
+        with task.lock:
+            text, total = task.text[offset:], len(task.text)
+        return {"ok": True, "task_id": task.id, "hostname": task.hostname,
+                "status": task.status, "log": text, "text": text,
+                "next_offset": total, "offset": total}
+    if store.enabled:
+        row = store.webfix_task_log(task_id)
+        if row is not None:
+            text, status, hostname = row
+            text = text or ""
+            return {"ok": True, "task_id": task_id, "hostname": hostname, "status": status,
+                    "log": text[offset:], "text": text[offset:],
+                    "next_offset": len(text), "offset": len(text)}
+    return None
+
+
+def _prune_webfix_memory():
+    """清理 24h 前已结束的内存态补配任务（历史回看走 DB 台账）。"""
+    with WEBFIX_LOCK:
+        stale = [tid for tid, t in WEBFIX.items()
+                 if t.status not in ("queued", "running")
+                 and time.time() - (t.finished_at or t.created_at) > 86400]
+        for tid in stale:
+            WEBFIX.pop(tid, None)
+
+
+# ----------------------------------------------------------------------------
+# 维修面板（KVWO-78/79）：飞书维修表 lark-cli 同步 + 只读 API
+# ----------------------------------------------------------------------------
+# 飞书字段清单（field_id -> snake_case 键与解析方式）。lark-cli record-list 返回
+# 行矩阵 + field_id_list，列序按 field_id 排序、并非固定顺序，因此按 field_id
+# 动态对齐；飞书表加列/调序不影响解析，未登记字段自动忽略。
+REPAIR_FIELD_MAP = {
+    "fldx4c6Flq": ("device_no", "text"),             # 设备编号
+    "fldekV0gKB": ("device_type", "select"),         # 设备所属类型（单目/双目/其他）
+    "fldXSSDwxu": ("parts", "select_multi"),         # 所含配件（多选）
+    "flddlnusAD": ("unit", "text"),                  # 所属单位
+    "fld8pX79fy": ("stage", "select"),               # 当前阶段
+    "fldQUKUSwQ": ("problem", "text"),               # 问题描述
+    "fldPl56KmS": ("contact_name", "text"),          # 姓名
+    "fldPyqR6Kz": ("contact_phone", "text"),         # 联系方式
+    "fldaYxqLZP": ("recv_address", "text"),          # 收件地址
+    "fldK0Omrot": ("return_address", "text"),        # 期望寄回地址和联系方式
+    "fldNSnDuEW": ("tracking_no_in", "text"),        # 快递单号（寄入）
+    "fld5JmUvOY": ("tracking_no_out", "text"),       # 发出快递单号（寄出）
+    "fldb9pcfQp": ("owner_name", "user"),            # 维修负责人（user，取 name）
+    "fldVVgRTyK": ("last_followup_at", "datetime"),  # 最后跟进时间
+    "fldHpO5cwl": ("last_followup_note", "text"),    # 最后跟进说明
+    "fld9KwsKJB": ("attachments", "attachment"),     # 附件（file_token/name/size）
+    "fldiwa2Opq": ("created_at", "datetime"),        # 创建时间（飞书自动字段）
+}
+# 流转阶段固定顺序（排序用）；未知阶段排在已知之后（按名称）
+REPAIR_STAGE_ORDER = ["待接收", "损坏原因确认中", "维修中", "待发出确认", "待发出", "已发出", "已完结"]
+REPAIR_DONE_STAGE = "已完结"
+REPAIR_ITEM_FIELDS = ["record_id", "device_no", "device_type", "parts", "unit", "stage",
+                      "problem", "contact_name", "contact_phone", "recv_address",
+                      "return_address", "tracking_no_in", "tracking_no_out", "owner_name",
+                      "last_followup_at", "last_followup_note", "created_at"]
+REPAIR_LARK_TIMEOUT = 120     # 单次 lark-cli record-list 子进程超时（秒）
+REPAIR_ATTACH_TIMEOUT = 180   # 单个附件下载超时（秒）
+
+
+def repair_feishu_url(record_id):
+    """飞书原记录链接（面板详情页跳回飞书用）。"""
+    return (f"https://archebase.feishu.cn/base/{REPAIR_BASE_TOKEN}"
+            f"?table={REPAIR_TABLE_ID}&view={REPAIR_VIEW_ID}&record={record_id}")
+
+
+def _repair_json_lenient(text):
+    """从 lark-cli stdout 解析 JSON（容忍进度前缀，取首个 '{' 起）。"""
+    text = text or ""
+    pos = text.find("{")
+    if pos < 0:
+        raise ValueError("输出中不含 JSON")
+    return json.loads(text[pos:])
+
+
+def _repair_cell(cell, kind):
+    """按字段类型解析飞书行矩阵单元格 → snake_case 值；空值一律 None。"""
+    if cell is None or cell == "":
+        return None
+    if kind == "text":
+        return str(cell).strip() or None
+    if kind == "select":
+        if isinstance(cell, list):
+            items = [str(v).strip() for v in cell if str(v).strip()]
+            return items[0] if items else None
+        return str(cell).strip() or None
+    if kind == "select_multi":
+        if isinstance(cell, list):
+            items = [str(v).strip() for v in cell if str(v).strip()]
+            return items or None
+        value = str(cell).strip()
+        return [value] if value else None
+    if kind == "user":
+        if isinstance(cell, list):
+            names = [str((u or {}).get("name") or "").strip()
+                     for u in cell if isinstance(u, dict)]
+            return "、".join(n for n in names if n) or None
+        return str(cell).strip() or None
+    if kind == "datetime":
+        return str(cell).strip() or None
+    if kind == "attachment":
+        items = []
+        for att in (cell if isinstance(cell, list) else [cell]):
+            if not isinstance(att, dict):
+                continue
+            token = str(att.get("file_token") or "").strip()
+            if token:
+                items.append({"file_token": token,
+                              "name": str(att.get("name") or token),
+                              "size": int(att.get("size") or 0)})
+        return items or None
+    return None
+
+
+def repair_parse_row(row, field_ids):
+    """把一行行矩阵（与 field_id_list 对齐）解析为 17 字段 snake_case dict。"""
+    rec = {spec[0]: None for spec in REPAIR_FIELD_MAP.values()}
+    for fid, cell in zip(field_ids or [], row or []):
+        spec = REPAIR_FIELD_MAP.get(fid)
+        if spec is not None:
+            rec[spec[0]] = _repair_cell(cell, spec[1])
+    return rec
+
+
+class RepairStore:
+    """维修记录本地 SQLite 存储（飞书表全量镜像，record_id 为主键）。
+
+    独立于可选的 MySQL 历史库：本地文件即数据，同步失败只记错误状态，
+    已入库数据继续服务只读 API；单 RLock 串行化读写，与 Store 同样的
+    “任何库问题都不拖垮面板”哲学。
+    """
+
+    _COLS = ["record_id", "device_no", "device_type", "parts", "unit", "stage",
+             "problem", "contact_name", "contact_phone", "recv_address",
+             "return_address", "tracking_no_in", "tracking_no_out", "owner_name",
+             "last_followup_at", "last_followup_note", "attachments",
+             "created_at", "synced_at"]
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.RLock()
+        self.conn = None
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            self.conn = sqlite3.connect(path, check_same_thread=False)
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA busy_timeout=5000")
+            self._migrate()
+        except (OSError, sqlite3.Error) as exc:
+            print(f"frp-monitor: 维修表本地库不可用（{path}: {exc}），维修面板无数据",
+                  flush=True)
+            self.conn = None
+
+    def _migrate(self):
+        with self.lock:
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS repairs ("
+                "record_id TEXT PRIMARY KEY, "  # 飞书 record_id（幂等主键）
+                + ", ".join(f"{c} TEXT" for c in self._COLS[1:-1])
+                + ", synced_at REAL)")
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS repairs_sync ("
+                "id INTEGER PRIMARY KEY CHECK (id = 1), "
+                "last_sync_at REAL, "   # 最近一次同步尝试（含失败）
+                "last_ok_at REAL, "     # 最近一次成功同步（数据新鲜度）
+                "last_error TEXT, "     # 最近一次失败原因（成功则清空）
+                "record_count INTEGER)")
+            self.conn.execute("INSERT OR IGNORE INTO repairs_sync (id) VALUES (1)")
+            self.conn.commit()
+
+    @staticmethod
+    def _decode(item):
+        for col in ("parts", "attachments"):
+            item[col] = json.loads(item[col]) if item[col] else None
+        return item
+
+    def replace_all(self, records, synced_at=None):
+        """全量镜像式幂等写入：record_id upsert，飞书已删记录本地同步删除。"""
+        if self.conn is None:
+            return 0
+        synced_at = time.time() if synced_at is None else synced_at
+        json_cols = {"parts", "attachments"}
+        cols = self._COLS
+        with self.lock:
+            cur = self.conn.cursor()
+            try:
+                cur.execute("BEGIN")
+                for rid, rec in records.items():
+                    row = {"record_id": rid, "synced_at": synced_at, **rec}
+                    values = [json.dumps(row.get(c), ensure_ascii=False) if c in json_cols
+                              else row.get(c) for c in cols]
+                    cur.execute(f"INSERT OR REPLACE INTO repairs ({','.join(cols)}) "
+                                f"VALUES ({','.join('?' * len(cols))})", values)
+                if records:
+                    cur.execute(f"DELETE FROM repairs WHERE record_id NOT IN "
+                                f"({','.join('?' * len(records))})", list(records))
+                else:
+                    cur.execute("DELETE FROM repairs")
+                cur.execute("UPDATE repairs_sync SET last_sync_at = ?, last_ok_at = ?, "
+                            "last_error = NULL, record_count = ? WHERE id = 1",
+                            (synced_at, synced_at, len(records)))
+                self.conn.commit()
+            except sqlite3.Error:
+                self.conn.rollback()
+                raise
+        return len(records)
+
+    def set_error(self, error):
+        """同步失败：记错误状态，保留上次成功数据与计数不动。"""
+        if self.conn is None:
+            return
+        with self.lock:
+            self.conn.execute("UPDATE repairs_sync SET last_sync_at = ?, last_error = ? "
+                              "WHERE id = 1", (time.time(), str(error)[:500]))
+            self.conn.commit()
+
+    def all_records(self):
+        """全部记录 dict 列表，按阶段固定顺序 + 创建时间倒序排列。"""
+        if self.conn is None:
+            return []
+        cols = self._COLS
+        with self.lock:
+            rows = self.conn.execute(f"SELECT {','.join(cols)} FROM repairs").fetchall()
+        items = [self._decode(dict(zip(cols, row))) for row in rows]
+        stage_rank = {s: i for i, s in enumerate(REPAIR_STAGE_ORDER)}
+
+        def created_key(it):
+            # ISO 8601（同一 +08:00 时区）字典序即时间序；空值排最后
+            return (0, it.get("created_at") or "") if it.get("created_at") else (1, "")
+
+        items.sort(key=created_key, reverse=True)
+        items.sort(key=lambda it: stage_rank.get(it.get("stage") or "", len(stage_rank) + 1))
+        return items
+
+    def get(self, record_id):
+        if self.conn is None:
+            return None
+        cols = self._COLS
+        with self.lock:
+            row = self.conn.execute(f"SELECT {','.join(cols)} FROM repairs "
+                                    "WHERE record_id = ?", (record_id,)).fetchone()
+        return self._decode(dict(zip(cols, row))) if row else None
+
+    def sync_state(self):
+        empty = {"last_sync_at": None, "last_ok_at": None, "last_sync_error": None,
+                 "record_count": 0}
+        if self.conn is None:
+            return empty
+        with self.lock:
+            row = self.conn.execute("SELECT last_sync_at, last_ok_at, last_error, "
+                                    "record_count FROM repairs_sync WHERE id = 1").fetchone()
+        if row is None:
+            return empty
+        return {"last_sync_at": row[0], "last_ok_at": row[1],
+                "last_sync_error": row[2], "record_count": row[3] or 0}
+
+
+repair_store = RepairStore(REPAIR_DB_PATH)
+REPAIR_SYNC_LOCK = threading.Lock()
+
+
+def _repair_lark_run(args, timeout=REPAIR_LARK_TIMEOUT, cwd=None):
+    """跑一次 lark-cli 子进程，stdout 解析 JSON；非零退出 / ok=false 抛 RuntimeError。"""
+    argv = shlex.split(REPAIR_LARK_CMD) + list(args)
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, cwd=cwd)
+    except FileNotFoundError:
+        raise RuntimeError(f"lark-cli 不存在（{REPAIR_LARK_CMD}），"
+                           f"请安装或配置 FRP_MONITOR_REPAIR_LARK_CMD")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"lark-cli 超时（>{timeout}s）")
+    if proc.returncode != 0:
+        raise RuntimeError(f"lark-cli 退出码 {proc.returncode}: "
+                           f"{(proc.stderr or proc.stdout).strip()[:300]}")
+    try:
+        payload = _repair_json_lenient(proc.stdout)
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"lark-cli 输出非 JSON（{exc}）: {proc.stdout[:200]}")
+    if not payload.get("ok"):
+        raise RuntimeError("lark-cli 返回失败: "
+                           + json.dumps(payload.get("error") or {}, ensure_ascii=False)[:300])
+    return payload
+
+
+def repair_fetch_records():
+    """分页全量拉取飞书维修表 → {record_id: {17 字段 snake_case}}。"""
+    records, offset = {}, 0
+    field_ids = []
+    while True:
+        payload = _repair_lark_run(["base", "+record-list",
+                                    "--base-token", REPAIR_BASE_TOKEN,
+                                    "--table-id", REPAIR_TABLE_ID,
+                                    "--format", "json",
+                                    "--limit", "200", "--offset", str(offset)])
+        data = payload.get("data") or {}
+        field_ids = data.get("field_id_list") or field_ids
+        rows = data.get("data") or []
+        rids = data.get("record_id_list") or []
+        for rid, row in zip(rids, rows):
+            records[rid] = repair_parse_row(row, field_ids)
+        if not data.get("has_more") or not rows:
+            break
+        offset += len(rows)
+    return records
+
+
+def _repair_attach_index():
+    """扫描附件目录 → {去扩展名 token: 实际文件名}。
+
+    lark-cli 下载会按内容类型自动给输出文件补扩展名（token → token.jpg），
+    本地按裸 token 入索引，URL/服务侧统一用它解析真实文件名。
+    """
+    index = {}
+    try:
+        with os.scandir(REPAIR_ATTACH_DIR) as entries:
+            for entry in entries:
+                if entry.is_file():
+                    index[os.path.splitext(entry.name)[0]] = entry.name
+    except OSError:
+        pass
+    return index
+
+
+def _repair_attach_file(token, index=None):
+    """token → 附件目录内实际文件名（无则 None）。"""
+    if not token:
+        return None
+    index = _repair_attach_index() if index is None else index
+    return index.get(token)
+
+
+def repair_sync_attachments(records):
+    """把新出现的附件下载到本地静态目录（按 file_token 命名，存在即跳过）。
+
+    多维表附件经 Drive 直下接口 403，走 lark-cli drive +preview
+    --type source_file 通道可行（实测）；lark-cli 的 --output 只接受当前
+    目录内相对路径，因此以附件目录为 cwd、裸 token 为文件名。单个附件
+    失败只记日志，不影响整次同步（该附件 URL 置 null，下轮同步自动补下）。
+    """
+    try:
+        os.makedirs(REPAIR_ATTACH_DIR, exist_ok=True)
+    except OSError as exc:
+        print(f"frp-monitor: 维修附件目录不可用（{REPAIR_ATTACH_DIR}: {exc}）", flush=True)
+        return
+    index = _repair_attach_index()
+    for rec in records.values():
+        for att in rec.get("attachments") or []:
+            token = att.get("file_token")
+            if not token or _repair_attach_file(token, index) is not None:
+                continue
+            try:
+                _repair_lark_run(["drive", "+preview", "--file-token", token,
+                                  "--type", "source_file", "--output", token],
+                                 timeout=REPAIR_ATTACH_TIMEOUT, cwd=REPAIR_ATTACH_DIR)
+                # lark-cli 会自动补扩展名，按 token 前缀找回实际落盘文件名
+                for name in os.listdir(REPAIR_ATTACH_DIR):
+                    if name == token or name.startswith(token + "."):
+                        index[token] = name
+                        break
+            except RuntimeError as exc:
+                print(f"frp-monitor: 维修附件下载失败 {token}"
+                      f"（{att.get('name')}）: {exc}", flush=True)
+
+
+def run_repair_sync(reason="scheduled"):
+    """同步一次飞书维修表 → SQLite 全量镜像；错误也返回摘要、绝不抛出。"""
+    with REPAIR_SYNC_LOCK:
+        started = time.time()
+        try:
+            records = repair_fetch_records()
+            repair_sync_attachments(records)
+            repair_store.replace_all(records)
+            print(f"frp-monitor: 维修表同步成功（{reason}）：{len(records)} 条，"
+                  f"耗时 {time.time() - started:.1f}s", flush=True)
+            return {"ok": True, "count": len(records), "reason": reason,
+                    "elapsed": round(time.time() - started, 1)}
+        except Exception as exc:  # noqa: BLE001 —— 同步失败要有明确错误状态，不影响其他页签
+            try:
+                repair_store.set_error(f"{reason}: {exc}")
+            except Exception:
+                pass
+            print(f"frp-monitor: 维修表同步失败（{reason}）: {exc}", flush=True)
+            return {"ok": False, "count": repair_store.sync_state()["record_count"],
+                    "reason": reason, "error": str(exc),
+                    "elapsed": round(time.time() - started, 1)}
+
+
+def _repair_sync_loop():
+    if not REPAIR_SYNC_ENABLED:
+        return
+    while True:
+        run_repair_sync("scheduled")
+        time.sleep(REPAIR_SYNC_INTERVAL)
+
+
+def _repair_online_lookup():
+    """返回 device_no → 在线状态 函数：True=当前在线（frps 快照）、
+    False=台账已登记但未上线、None=台账与快照均未匹配（数据不合成，显示 —）。"""
+    try:
+        hosts, _ = get_snapshot()
+        online = {h["hostname"] for h in hosts}
+    except Exception:
+        online = set()  # 快照暂不可得（仅首次拉取失败窗口）：登记设备按离线计
+    registered = set(store.roster) if store.enabled else set()
+
+    def lookup(device_no):
+        if not device_no:
+            return None
+        key = str(device_no).strip().casefold()
+        if key in online:
+            return True
+        if key in registered:
+            return False
+        return None
+
+    return lookup
+
+
+def _repair_public(rec, lookup=None, attach_index=None):
+    """库内记录 → API 视图（17 字段 + feishu_url + 附件本地 URL + device_online）。"""
+    item = {k: rec.get(k) for k in REPAIR_ITEM_FIELDS}
+    item["feishu_url"] = repair_feishu_url(rec["record_id"])
+    attachments = []
+    for att in rec.get("attachments") or []:
+        entry = dict(att)
+        token = entry.get("file_token") or ""
+        if _repair_attach_file(token, attach_index) is not None:
+            entry["url"] = f"/repair-attachments/{token}/{quote(str(entry.get('name') or token))}"
+        else:
+            entry["url"] = None
+        attachments.append(entry)
+    item["attachments"] = attachments or None
+    if lookup is not None:
+        item["device_online"] = lookup(item.get("device_no"))
+    item["synced_at"] = rec.get("synced_at")
+    return item
+
+
+def repairs_list_view(filters=None):
+    """维修列表（stage/type 精确、unit 模糊、owner 精确、q 设备编号/问题描述模糊）。"""
+    filters = filters or {}
+    lookup = _repair_online_lookup()
+    attach_index = _repair_attach_index()
+    items = [_repair_public(rec, lookup, attach_index) for rec in repair_store.all_records()]
+    stage = (filters.get("stage") or "").strip()
+    if stage:
+        items = [i for i in items if i.get("stage") == stage]
+    dtype = (filters.get("type") or "").strip()
+    if dtype:
+        items = [i for i in items if i.get("device_type") == dtype]
+    unit = (filters.get("unit") or "").strip()
+    if unit:
+        items = [i for i in items if unit in (i.get("unit") or "")]
+    owner = (filters.get("owner") or "").strip()
+    if owner:
+        items = [i for i in items if i.get("owner_name") == owner]
+    q = (filters.get("q") or "").strip().casefold()
+    if q:
+        items = [i for i in items
+                 if q in (i.get("device_no") or "").casefold()
+                 or q in (i.get("problem") or "").casefold()]
+    return items
+
+
+def repairs_stats_view():
+    """顶部统计：总数 / 各阶段计数（7 阶段固定顺序）/ 未完结数 / 同步状态。"""
+    items = repair_store.all_records()
+    counts = {}
+    for it in items:
+        stage = it.get("stage") or ""
+        counts[stage] = counts.get(stage, 0) + 1
+    by_stage = {s: counts.get(s, 0) for s in REPAIR_STAGE_ORDER}
+    for stage, n in counts.items():  # 未知阶段原样追加（数据不合成也不丢弃）
+        if stage and stage not in by_stage:
+            by_stage[stage] = n
+    state = repair_store.sync_state()
+    return {"total": len(items), "by_stage": by_stage,
+            "active_count": sum(n for s, n in counts.items() if s != REPAIR_DONE_STAGE),
+            "last_sync_at": state["last_ok_at"],
+            "last_sync_attempt_at": state["last_sync_at"],
+            "last_sync_error": state["last_sync_error"],
+            "sync_enabled": REPAIR_SYNC_ENABLED,
+            "sync_interval": int(REPAIR_SYNC_INTERVAL),
+            "stage_order": REPAIR_STAGE_ORDER}
+
+
+# ----------------------------------------------------------------------------
+# 资产多表同步与聚合 API（KVWO-83，基于 KVWO-79 维修面板同步机制扩展）
+#
+# 同一飞书 Base 增量接入 5 张资产表，全部「全量拉取 + record_id 幂等镜像」：
+#   设备明细（在册台账）/ 设备归档数据表（仅存量展示，不计入在册指标）/
+#   异常处理流转 / 配件核对明细 / 流转记录。
+# 各表列序以 lark-cli 返回的 fields 表头动态对齐（中文字段名键控），
+# 不硬编码列序——归档表与设备明细列序不同（实测），重命名/调整列序不影响解析，
+# 仅字段名变更或删除时该字段退化为 null。
+# 同步失败按表隔离：一张表失败只记该表的错误状态，不影响其他表与维修页签。
+# ----------------------------------------------------------------------------
+ASSET_TABLES = {
+    "devices": {
+        "table_id": "tblg1YoctJNcZskM",
+        "label": "设备明细",           # 在册台账（参与在册指标）
+        "sql_table": "asset_devices",
+        "fields": {
+            "设备编号": ("device_no", "text"),
+            "设备类型": ("device_type", "select"),
+            "状态": ("status", "select"),
+            "所属单位": ("unit", "select"),
+            "配件情况": ("accessories", "text"),
+            "去向/备注": ("note", "text"),
+            "软件版本": ("software_version", "text"),
+            "修改人": ("modified_by", "user"),       # 飞书自动字段 updated_by
+            "最后更新时间": ("updated_at", "datetime"),  # 飞书自动字段 updated_at
+        },
+    },
+    "archived": {
+        "table_id": "tblAeG2cGJ8SjQzR",
+        "label": "设备归档数据表",      # 归档/已拆解，仅存量展示，不计入在册指标
+        "sql_table": "asset_archived",
+        "fields": {  # 与设备明细同构但列序不同（动态对齐不依赖列序）
+            "设备编号": ("device_no", "text"),
+            "设备类型": ("device_type", "select"),
+            "状态": ("status", "select"),
+            "所属单位": ("unit", "select"),
+            "配件情况": ("accessories", "text"),
+            "去向/备注": ("note", "text"),
+            "软件版本": ("software_version", "text"),
+            "修改人": ("modified_by", "user"),
+            "最后更新时间": ("updated_at", "datetime"),
+        },
+    },
+    "actions": {
+        "table_id": "tblri9gaBX4zVXzX",
+        "label": "异常处理流转",
+        "sql_table": "asset_actions",
+        "fields": {
+            "摘要": ("summary", "text"),
+            "说明": ("note", "text"),
+            "动作": ("action", "select"),
+            "提交人": ("created_by", "user"),        # 飞书自动字段 created_by
+            "操作人": ("operator", "user"),
+            "转交给": ("transferred_to", "user"),
+            "设备编号": ("device_no", "select"),     # 本表内是单选而非文本
+            "操作时间": ("operated_at", "datetime"),  # 飞书自动字段 created_at
+            "附件": ("attachments", "attachment"),
+            "关联异常设备": ("linked_records", "link"),  # link → 异常设备表 record_id 列表
+        },
+    },
+    "parts": {
+        "table_id": "tblOLbWKpDlcJkDi",
+        "label": "配件核对明细",
+        "sql_table": "asset_parts",
+        "fields": {
+            "核对项": ("item", "text"),
+            "配件": ("part", "select"),
+            "设备编号": ("device_no", "text"),
+            "到货状态": ("arrival_status", "select"),
+            "状态说明": ("status_note", "text"),
+            "核对人": ("checker", "user"),
+            "核对时间": ("checked_at", "datetime"),   # 飞书自动字段 created_at
+            "照片": ("photos", "attachment"),
+            "关联异常设备": ("linked_records", "link"),
+        },
+    },
+    "transfers": {
+        "table_id": "tblxmVpjAHeATuMU",
+        "label": "流转记录",
+        "sql_table": "asset_transfers",
+        "fields": {
+            "时间": ("occurred_at", "datetime"),
+            "物品": ("item", "text"),
+            "数量": ("quantity", "number"),
+            "说明": ("note", "text"),
+            "所属单位": ("unit", "text"),            # 自由文本（非单选）
+            "签收证明": ("proof", "attachment"),
+        },
+    },
+}
+
+
+def _asset_cell(cell, kind):
+    """资产表单元格解析：text/select/多选/user/datetime/attachment 复用维修表
+    解析器（KVWO-79），在此补充 link（关联记录 id 列表）与 number 两类。"""
+    if kind in ("link", "number"):
+        if cell is None or cell == "":
+            return None
+        if kind == "number":
+            try:
+                value = float(cell)
+                return int(value) if value.is_integer() else value
+            except (TypeError, ValueError):
+                return None
+        ids = []
+        for item in (cell if isinstance(cell, list) else [cell]):
+            if isinstance(item, dict) and str(item.get("id") or "").strip():
+                ids.append(str(item["id"]).strip())
+            elif isinstance(item, str) and item.strip():
+                ids.append(item.strip())
+        return ids or None
+    return _repair_cell(cell, kind)
+
+
+def asset_parse_row(row, fields, field_map):
+    """按 fields 表头（中文字段名）动态对齐解析一行行矩阵 → snake_case dict。
+
+    不依赖列序：zip(fields, row) 后按字段名查映射；未映射列忽略，
+    映射内缺失列保持 None（数据不合成）。
+    """
+    rec = {spec[0]: None for spec in field_map.values()}
+    for name, cell in zip(fields or [], row or []):
+        spec = field_map.get(name)
+        if spec is not None:
+            rec[spec[0]] = _asset_cell(cell, spec[1])
+    return rec
+
+
+def asset_feishu_url(table_id, record_id):
+    """飞书原记录链接（table + record 即可直达，无需视图）。"""
+    return (f"https://archebase.feishu.cn/base/{ASSET_BASE_TOKEN}"
+            f"?table={table_id}&record={record_id}")
+
+
+class AssetStore:
+    """资产 5 表本地 SQLite 镜像（每表 record_id 主键全量幂等 upsert）。
+
+    与 RepairStore 同一套哲学：独立于可选 MySQL 历史库，本地文件即数据；
+    同步失败按表记错误状态、保留上次成功数据；单 RLock 串行化读写。
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.RLock()
+        self.conn = None
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            self.conn = sqlite3.connect(path, check_same_thread=False)
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA busy_timeout=5000")
+            self._migrate()
+        except (OSError, sqlite3.Error) as exc:
+            print(f"frp-monitor: 资产表本地库不可用（{path}: {exc}），资产面板无数据",
+                  flush=True)
+            self.conn = None
+
+    @staticmethod
+    def _spec_cols(spec):
+        """(全部列名, JSON 列集合)：列名为 snake_case JSON 键，含 number 列标记。"""
+        cols = [v[0] for v in spec["fields"].values()]
+        json_cols = {v[0] for v in spec["fields"].values()
+                     if v[1] in ("attachment", "link", "select_multi")}
+        return cols, json_cols
+
+    def _migrate(self):
+        with self.lock:
+            for spec in ASSET_TABLES.values():
+                cols, _ = self._spec_cols(spec)
+                decls = ["record_id TEXT PRIMARY KEY"]
+                for col, (name, (_, kind)) in zip(cols, spec["fields"].items()):
+                    decls.append(f"{col} {'NUM' if kind == 'number' else 'TEXT'}")
+                decls.append("synced_at REAL")
+                self.conn.execute(
+                    f"CREATE TABLE IF NOT EXISTS {spec['sql_table']} ({', '.join(decls)})")
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS asset_sync ("
+                "tbl TEXT PRIMARY KEY, "      # ASSET_TABLES 键（按表隔离错误状态）
+                "last_sync_at REAL, "         # 最近一次同步尝试（含失败）
+                "last_ok_at REAL, "           # 最近一次成功同步（数据新鲜度）
+                "last_error TEXT, "           # 最近一次失败原因（成功则清空）
+                "record_count INTEGER)")
+            self.conn.executemany(
+                "INSERT OR IGNORE INTO asset_sync (tbl) VALUES (?)",
+                [(k,) for k in ASSET_TABLES])
+            self.conn.commit()
+
+    def replace_all(self, key, records, synced_at=None):
+        """单表全量镜像式幂等写入：record_id upsert + 删除飞书已删记录。"""
+        if self.conn is None:
+            return 0
+        spec = ASSET_TABLES[key]
+        cols, json_cols = self._spec_cols(spec)
+        all_cols = ["record_id"] + cols + ["synced_at"]
+        synced_at = time.time() if synced_at is None else synced_at
+        with self.lock:
+            cur = self.conn.cursor()
+            try:
+                cur.execute("BEGIN")
+                for rid, rec in records.items():
+                    row = {"record_id": rid, "synced_at": synced_at, **rec}
+                    values = [json.dumps(row.get(c), ensure_ascii=False) if c in json_cols
+                              else row.get(c) for c in all_cols]
+                    cur.execute(
+                        f"INSERT OR REPLACE INTO {spec['sql_table']} ({','.join(all_cols)}) "
+                        f"VALUES ({','.join('?' * len(all_cols))})", values)
+                if records:
+                    cur.execute(
+                        f"DELETE FROM {spec['sql_table']} WHERE record_id NOT IN "
+                        f"({','.join('?' * len(records))})", list(records))
+                else:
+                    cur.execute(f"DELETE FROM {spec['sql_table']}")
+                cur.execute(
+                    "UPDATE asset_sync SET last_sync_at = ?, last_ok_at = ?, "
+                    "last_error = NULL, record_count = ? WHERE tbl = ?",
+                    (synced_at, synced_at, len(records), key))
+                self.conn.commit()
+            except sqlite3.Error:
+                self.conn.rollback()
+                raise
+        return len(records)
+
+    def set_error(self, key, error):
+        """单表同步失败：只记该表错误状态，其余表与已有数据不受影响。"""
+        if self.conn is None:
+            return
+        with self.lock:
+            self.conn.execute(
+                "UPDATE asset_sync SET last_sync_at = ?, last_error = ? WHERE tbl = ?",
+                (time.time(), str(error)[:500], key))
+            self.conn.commit()
+
+    def all_records(self, key):
+        """单表全部记录（dict 列表，原始库内顺序）。"""
+        if self.conn is None:
+            return []
+        spec = ASSET_TABLES[key]
+        cols, json_cols = self._spec_cols(spec)
+        all_cols = ["record_id"] + cols + ["synced_at"]
+        with self.lock:
+            rows = self.conn.execute(
+                f"SELECT {','.join(all_cols)} FROM {spec['sql_table']}").fetchall()
+        items = []
+        for row in rows:
+            item = dict(zip(all_cols, row))
+            for col in json_cols:
+                item[col] = json.loads(item[col]) if item[col] else None
+            items.append(item)
+        return items
+
+    def sync_state(self, key):
+        empty = {"last_sync_at": None, "last_ok_at": None, "last_sync_error": None,
+                 "record_count": 0}
+        if self.conn is None:
+            return empty
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT last_sync_at, last_ok_at, last_error, record_count "
+                "FROM asset_sync WHERE tbl = ?", (key,)).fetchone()
+        if row is None:
+            return empty
+        return {"last_sync_at": row[0], "last_ok_at": row[1],
+                "last_sync_error": row[2], "record_count": row[3] or 0}
+
+    def sync_states(self):
+        """全部表同步状态（按表隔离展示：{key: {..., label, table_id}}）。"""
+        out = {}
+        for key, spec in ASSET_TABLES.items():
+            state = self.sync_state(key)
+            out[key] = {**state, "label": spec["label"], "table_id": spec["table_id"]}
+        return out
+
+
+asset_store = AssetStore(ASSET_DB_PATH)
+ASSET_SYNC_LOCK = threading.Lock()
+
+
+def _asset_lark_page(args, attempts=3):
+    """拉一页（带退避重试）：lark-cli 瞬时失败（限流等）不该让整表本轮同步失败。"""
+    last = None
+    for attempt in range(attempts):
+        if attempt:
+            time.sleep(2 * attempt)
+        try:
+            return _repair_lark_run(args)
+        except RuntimeError as exc:
+            last = exc
+    raise last
+
+
+def asset_fetch_table(key):
+    """分页全量拉取一张资产表 → {record_id: {snake_case 字段}}。
+
+    列对齐键为 fields 表头（中文字段名），与列序无关；单页瞬时失败
+    退避重试（限流），重试耗尽才让该表本轮同步失败（按表隔离）。
+    """
+    spec = ASSET_TABLES[key]
+    records, offset = {}, 0
+    fields = []
+    while True:
+        data = (_asset_lark_page(["base", "+record-list",
+                                  "--base-token", ASSET_BASE_TOKEN,
+                                  "--table-id", spec["table_id"],
+                                  "--format", "json",
+                                  "--limit", "200", "--offset", str(offset)])
+                .get("data") or {})
+        fields = data.get("fields") or fields
+        rows = data.get("data") or []
+        rids = data.get("record_id_list") or []
+        for rid, row in zip(rids, rows):
+            records[rid] = asset_parse_row(row, fields, spec["fields"])
+        if not data.get("has_more") or not rows:
+            break
+        offset += len(rows)
+    return records
+
+
+def run_asset_sync(reason="scheduled"):
+    """同步全部 5 张资产表 → SQLite 镜像；按表隔离失败，绝不抛出。
+
+    单表失败只记该表错误状态，其余表照常完成（一张表失败不影响其他表
+    与维修页签）。附件元数据入库但不自动下载（体积大且资产页签验收
+    不要求附件可访问；如已存在本地文件则解析出 URL，见 _asset_public）。
+    """
+    with ASSET_SYNC_LOCK:
+        started = time.time()
+        results = {}
+        for key, spec in ASSET_TABLES.items():
+            t0 = time.time()
+            try:
+                records = asset_fetch_table(key)
+                asset_store.replace_all(key, records)
+                results[key] = {"ok": True, "count": len(records),
+                                "elapsed": round(time.time() - t0, 1)}
+                print(f"frp-monitor: 资产表同步成功（{spec['label']}，{reason}）："
+                      f"{len(records)} 条，耗时 {time.time() - t0:.1f}s", flush=True)
+            except Exception as exc:  # noqa: BLE001 —— 单表失败隔离，不拖垮其他表
+                try:
+                    asset_store.set_error(key, f"{reason}: {exc}")
+                except Exception:
+                    pass
+                results[key] = {"ok": False, "count": asset_store.sync_state(key)["record_count"],
+                                "error": str(exc), "elapsed": round(time.time() - t0, 1)}
+                print(f"frp-monitor: 资产表同步失败（{spec['label']}，{reason}）: {exc}",
+                      flush=True)
+        return {"ok": all(r.get("ok") for r in results.values()),
+                "reason": reason, "tables": results,
+                "elapsed": round(time.time() - started, 1)}
+
+
+def _asset_sync_loop():
+    if not ASSET_SYNC_ENABLED:
+        return
+    while True:
+        run_asset_sync("scheduled")
+        time.sleep(ASSET_SYNC_INTERVAL)
+
+
+# --- 资产日报定时飞书 webhook 推送（KVWO-97） -------------------------------
+# 服务端自行定时推送，不依赖外部 agent 轮询；调度模式与采集时长
+# （_collect_duration_loop，FRP_MONITOR_COLLECT_TIMES=19:00,21:00）一致：
+# 每轮从墙上时钟重推下一次时刻，进程重启自然对齐，不依赖内存计数器。
+def _parse_report_slots(spec):
+    """解析 FRP_MONITOR_REPORT_TIMES（"09:00" 或多时刻）为排序去重时间点。"""
+    slots = set()
+    for part in (spec or "").split(","):
+        hh, sep, mm = part.strip().partition(":")
+        if not sep:
+            continue
+        try:
+            slot = (int(hh), int(mm))
+        except ValueError:
+            continue
+        if 0 <= slot[0] <= 23 and 0 <= slot[1] <= 59:
+            slots.add(slot)
+    return sorted(slots) or [(9, 0)]
+
+
+REPORT_SLOTS = _parse_report_slots(REPORT_TIMES)
+_FEISHU_REPORT_LOCK = threading.Lock()  # 定时调度与手动触发串行，避免同刻重复推送
+_feishu_report_state = {"last": None, "next_run_at": None}  # 状态可查（GET /api/assets/report）
+
+
+def _next_report_slot(now=None):
+    """下一个日报推送时刻（服务器本地时间）。"""
+    now = now or datetime.now()
+    for hh, mm in REPORT_SLOTS:
+        cand = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if cand > now:
+            return cand
+    hh, mm = REPORT_SLOTS[0]
+    return (now + timedelta(days=1)).replace(hour=hh, minute=mm, second=0, microsecond=0)
+
+
+def feishu_report_text(stats, now=None):
+    """由 /api/assets/stats·units·versions 口径拼中文日报文本（同一数据源，不另算死数）。
+
+    KVWO-107 追加（2026-10-21 提出人确认，日报必须体现）：正文含
+    「主要服务商使用率（前 5 家，按在册数）」与「主要服务商版本占比
+    （前 5 家）」两段，实时取 assets_units_view / assets_versions_view
+    同口径同排序（在册数降序、并列按单位名稳定），定时推送与手动推送
+    （POST /api/assets/report/run，含面板「立即推送日报」弹窗）共用本
+    函数，文案天然一致；不足 5 家如实全列，无在册设备时整段「—」。
+    """
+    now = now or datetime.now()
+    inv = stats.get("inventory") or {}
+    by_unit = inv.get("by_unit") or {}
+    units = inv.get("units") or list(INVENTORY_UNITS)
+    inv_parts = " + ".join(f"{u} {by_unit.get(u, 0)} 台" for u in units)
+    n = stats.get("registered_total") or 0
+    by_status = stats.get("by_status") or {}
+    repairing = by_status.get("维修中", 0) + by_status.get("待维修", 0)
+    pending = by_status.get("待维修", 0)
+    abnormal = by_status.get("异常", 0)
+
+    def pct(v):
+        return "—" if v is None else f"{v * 100:.1f}%"
+
+    lines = [
+        f"【{panel_title()} · 资产日报】{now.strftime('%Y-%m-%d %H:%M')}",
+        f"库存：{inv.get('total', 0)} 台（{inv_parts}）",
+        "口径：公司库存（" + "、".join(units) + "），服务商等其他单位持有不计库存",
+        f"在册硬件：{n} 台（一线部署 {stats.get('deployed', 0)} 台；"
+        f"另有归档 {stats.get('archived_total', 0)} 台不计在册）",
+        f"维修率：{pct(stats.get('repair_rate'))}（维修中 {repairing - pending} 台 "
+        f"+ 待维修 {pending} 台，分母在册 {n} 台）",
+        f"损坏率：{pct(stats.get('damage_rate'))}（异常 {abnormal} 台 + 维修中 "
+        f"{repairing - pending} 台 + 待维修 {pending} 台，分母在册 {n} 台）",
+    ]
+    idle = stats.get("idle") or {}
+    if idle.get("total") is None:
+        lines.append(f"闲置：—（fleet 库未启用，暂不可计算；口径：库存外超 "
+                     f"{idle.get('threshold_days', IDLE_DAYS)} 天未上线，含从未上线）")
+    else:
+        lines.append(f"闲置：{idle['total']} 台（库存外超 "
+                     f"{idle.get('threshold_days', IDLE_DAYS)} 天未上线，含从未上线）")
+    # 主要服务商使用率 / 版本占比两段（KVWO-107 追加，置于闲置与数据时间之间）：
+    # 使用率行 = 在线快照数/在册（百分比与既有 pct 同保留 1 位）；版本行紧凑分布，
+    # share 取 API 同值（两位小数）展示为整数百分比；未探测/空版本归「未获取」桶。
+    top_units = assets_units_view()[:5]
+    lines.append("主要服务商使用率（前 5 家，按在册数）：")
+    if top_units:
+        lines.extend(f"{u['unit']}：在线 {u['online']}/在册 {u['total']}（{pct(u['usage_rate'])}）"
+                     for u in top_units)
+    else:
+        lines.append("—（无在册设备）")
+    top5 = assets_versions_view()["by_provider_top5"]
+    lines.append("主要服务商版本占比（前 5 家）：")
+    if top5:
+        lines.extend(f"{t['unit']}（{t['total']} 台）："
+                     + " / ".join(f"{v['version']} {v['count']} 台 {v['share'] * 100:.0f}%"
+                                   for v in t["versions"])
+                     for t in top5)
+    else:
+        lines.append("—（无在册设备）")
+    ts = stats.get("last_sync_at")
+    if ts:
+        lines.append("数据时间：" + datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+                     + "（飞书台账最近一次成功同步）")
+    else:
+        lines.append("数据时间：—（尚未成功同步，以下指标可能为空）")
+    if stats.get("last_sync_error"):
+        lines.append("⚠ 飞书同步异常（数据可能滞后，以台账为准）："
+                     + str(stats["last_sync_error"])[:120])
+    return "\n".join(lines)
+
+
+def _feishu_webhook_sign(secret, timestamp):
+    """飞书自定义机器人签名（官方算法）：key = "timestamp\nsecret"，消息体为空。"""
+    string_to_sign = f"{timestamp}\n{secret}"
+    return base64.b64encode(
+        hmac.new(string_to_sign.encode("utf-8"), digestmod=hashlib.sha256).digest()
+    ).decode("utf-8")
+
+
+def _feishu_webhook_post(text, attempts=3):
+    """POST 飞书群机器人 text 消息；带退避重试，返回 (ok, http_status, detail)。
+
+    配置了签名密钥时按官方算法附带 timestamp+sign（机器人开启签名校验
+    必需，否则飞书拒绝 code=19021 sign match fail）。"""
+    payload = {"msg_type": "text", "content": {"text": text}}
+    if FEISHU_WEBHOOK_SECRET:
+        ts = str(int(time.time()))
+        payload.update(timestamp=ts, sign=_feishu_webhook_sign(FEISHU_WEBHOOK_SECRET, ts))
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    last_code, last_detail = None, ""
+    for attempt in range(attempts):
+        if attempt:
+            time.sleep(2 * attempt)
+        try:
+            req = Request(FEISHU_WEBHOOK, data=body, method="POST",
+                          headers={"Content-Type": "application/json"})
+            with urlopen(req, timeout=10) as resp:
+                status = resp.status
+                raw = resp.read(4096).decode("utf-8", "replace")
+        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+            last_code, last_detail = None, f"{type(exc).__name__}: {exc}"
+            continue
+        try:
+            resp_json = json.loads(raw or "{}")
+        except ValueError:
+            resp_json = {}
+        # 新版 {code:0} / 旧版 {StatusCode:0}；缺省视为成功（HTTP 200 即送达）
+        biz = resp_json.get("code", resp_json.get("StatusCode", 0))
+        if status == 200 and biz == 0:
+            return True, status, raw[:200]
+        if biz == 19021:
+            last_detail = (f"飞书拒绝 code=19021（签名校验失败）：请在群机器人设置"
+                           f"核对签名密钥（FRP_MONITOR_FEISHU_WEBHOOK_SECRET）或关闭"
+                           f"签名校验；resp={raw[:120]}")
+            last_code = status
+            break  # 签名失败是确定性错误：重试无意义
+        else:
+            last_detail = raw[:200]
+        last_code = status
+    return False, last_code, last_detail
+
+
+def run_feishu_report(reason="scheduled"):
+    """推送一次资产日报到飞书群；失败只记日志与状态，绝不抛出、
+    不影响面板服务与飞书同步（验收 4）。"""
+    with _FEISHU_REPORT_LOCK:
+        stats = assets_stats_view()
+        text = feishu_report_text(stats)
+        try:
+            ok, http_status, detail = _feishu_webhook_post(text)
+        except Exception as exc:  # noqa: BLE001 —— 推送链路异常不拖垮调度线程
+            ok, http_status, detail = False, None, f"{type(exc).__name__}: {exc}"
+        record = {"ok": ok, "reason": reason, "at": time.time(),
+                  "http_status": http_status, "detail": (detail or "")[:200],
+                  "text_preview": text[:80]}
+        _feishu_report_state["last"] = record
+        print(f"frp-monitor: 资产日报推送{'成功' if ok else '失败'}"
+              f"（{reason}，HTTP {http_status}）"
+              + ("" if ok else f": {detail}"), flush=True)
+        return {**record, "text": text}  # 手动触发回显全文，便于验收核对文案
+
+
+def _feishu_report_loop():
+    if not FEISHU_WEBHOOK:
+        return  # 未配置 webhook：不启动推送（FRP_MONITOR_FEISHU_WEBHOOK 置空=关闭）
+    while True:
+        deadline = _next_report_slot()
+        with _FEISHU_REPORT_LOCK:
+            _feishu_report_state["next_run_at"] = deadline.timestamp()
+        while True:  # 分段睡眠到点，兼顾长时间休眠与时钟漂移
+            remaining = (deadline - datetime.now()).total_seconds()
+            if remaining <= 0:
+                break
+            time.sleep(min(30.0, remaining))
+        try:
+            run_feishu_report("scheduled")
+        except Exception as exc:  # noqa: BLE001 —— 调度线程异常不退出
+            print(f"frp-monitor: 资产日报调度异常: {exc}", flush=True)
+
+
+# --- 面板标题（KVWO-97）：env 覆盖 > lark-cli 解析 Base 全称 > 兑底值 ----------
+# 浏览器标签（<title>）与页头（<h1>）一致；Base 全称启动时后台 best-effort
+# 解析（命令形态未文档化，多形态尝试，失败不阻塞），成功前先用兑底值服务。
+_panel_title_lock = threading.Lock()
+_panel_title = {"value": PANEL_TITLE_ENV or PANEL_TITLE_FALLBACK,
+                "source": "env" if PANEL_TITLE_ENV else "fallback"}
+
+
+def panel_title():
+    with _panel_title_lock:
+        return _panel_title["value"]
+
+
+def _find_base_name(node, depth=0):
+    """在 lark-cli 返回 JSON 里浅层找 Base 名称（name/base_name/app_name/title 键）。"""
+    if depth > 3 or not isinstance(node, dict):
+        return None
+    for key in ("name", "base_name", "app_name", "title"):
+        v = node.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    for v in node.values():
+        if isinstance(v, dict):
+            found = _find_base_name(v, depth + 1)
+            if found:
+                return found
+    return None
+
+
+def _lark_base_name():
+    """best-effort 用 lark-cli 查 Base 全称；多命令形态尝试，全部失败返回 None。"""
+    for args in (("base", "+base-info", "--base-token", ASSET_BASE_TOKEN),
+                 ("base", "info", "--base-token", ASSET_BASE_TOKEN)):
+        try:
+            payload = _repair_lark_run(list(args), timeout=20)
+        except Exception:  # noqa: BLE001 —— 命令不存在/失败：换下一个形态
+            continue
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        name = _find_base_name(data)
+        if name:
+            return name
+    return None
+
+
+def _resolve_panel_title():
+    if PANEL_TITLE_ENV:
+        return  # env 显式覆盖：不查 lark
+    name = _lark_base_name()
+    if name:
+        with _panel_title_lock:
+            _panel_title.update(value=name, source="lark")
+        print(f"frp-monitor: 面板标题已取 Base 全称「{name}」", flush=True)
+
+
+def _asset_fleet_lookup():
+    """返回资产 API 的探测查询组（device_online / detected_version / 全量快照）。
+
+    设备编号匹配规则（全库统一，大小写不敏感）：台账存在 `ep-000298` 小写、
+    异常表 `EP-000289` 等混杂情况，一律 str.strip().casefold() 后比对——
+    frps 主机名本身就是小写 `ep-000xxx`，casefold 即天然对齐。
+    device_online：frps 快照在线→true；MySQL 台账已登记但未上线→false；
+    均未匹配→null（数据不合成，前端显示「—」）。
+    detected_version：在线取当前探测版本；离线但 MySQL 历史有最后已知版本
+    则返回之；否则 null（探测不到 ≠ 离线，与 device_online 语义分开）。
+    """
+    try:
+        hosts, _ = get_snapshot()
+        snap = {}
+        for h in hosts:
+            snap[str(h.get("hostname") or "").strip().casefold()] = {
+                "online": True, "version": (str(h.get("version") or "").strip() or None)}
+    except Exception:
+        snap = {}  # 快照暂不可得（仅首次拉取失败窗口）：登记设备按离线计
+    registered = set(store.roster) if store.enabled else set()
+    last_known = {}
+    if store.enabled:
+        with store.lock:
+            last_known = {str(h).strip().casefold(): (v or {}).get("version") or None
+                          for h, v in (store.state or {}).items()}
+
+    def online(device_no):
+        if not device_no:
+            return None
+        key = str(device_no).strip().casefold()
+        if key in snap:
+            return True
+        if key in registered:
+            return False
+        return None
+
+    def version(device_no):
+        if not device_no:
+            return None
+        key = str(device_no).strip().casefold()
+        info = snap.get(key)
+        if info is not None:
+            return info["version"]
+        return last_known.get(key) or None
+
+    return online, version, snap
+
+
+def _dev_key(device_no):
+    """设备编号归一（跨表关联统一入口，见 _asset_fleet_lookup 注释）。"""
+    return str(device_no or "").strip().casefold()
+
+
+ASSET_DEVICE_ITEM_FIELDS = ["record_id", "device_no", "device_type", "status", "unit",
+                            "accessories", "note", "software_version", "modified_by",
+                            "updated_at"]
+
+
+def _asset_attach_urls(items):
+    """附件元数据列表 → 带 url 的视图（仅当本地已存在同名 token 文件时给出
+    /repair-attachments/ 静态路径；资产表附件默认不主动下载，url 多为 null）。"""
+    out = []
+    for att in items or []:
+        if not isinstance(att, dict):
+            continue
+        entry = dict(att)
+        token = str(entry.get("file_token") or "")
+        entry["url"] = (f"/repair-attachments/{token}/"
+                        + quote(str(entry.get("name") or token))
+                        if token and _repair_attach_file(token) is not None else None)
+        out.append(entry)
+    return out or None
+
+
+def _asset_device_public(rec, online=None, version=None, repairs_by_dev=None,
+                          table_key="devices", last_seen=None):
+    """设备明细/归档库内记录 → API 视图（全字段 + 探测联动 + 未完结维修数）。
+
+    last_seen（fleet 库映射）非 None 时附 `last_seen`（最后在线，null=从未
+    上线/无记录）与 `idle`（闲置判定；归档设备不在册，置 null）。"""
+    item = {k: rec.get(k) for k in ASSET_DEVICE_ITEM_FIELDS}
+    item["archived"] = table_key == "archived"
+    item["feishu_url"] = asset_feishu_url(ASSET_TABLES[table_key]["table_id"],
+                                          rec["record_id"])
+    item["device_online"] = online(item.get("device_no")) if online else None
+    item["detected_version"] = version(item.get("device_no")) if version else None
+    item["active_repairs"] = ((repairs_by_dev or {}).get(_dev_key(item.get("device_no"))) or 0) \
+        if repairs_by_dev is not None else None
+    item["synced_at"] = rec.get("synced_at")
+    item["last_seen"] = None
+    item["idle"] = None
+    if last_seen is not None:
+        item["last_seen"] = last_seen.get(_dev_key(item.get("device_no"))) or None
+        if not item["archived"]:
+            item["idle"] = _device_idle(item.get("device_no"), item.get("unit"), last_seen)
+    return item
+
+
+def _asset_active_repairs_index():
+    """{设备编号 casefold: 未完结维修记录数}（来源：KVWO-79 异常设备表镜像）。"""
+    index = {}
+    for rec in repair_store.all_records():
+        stage = rec.get("stage")
+        if not stage or stage == REPAIR_DONE_STAGE:
+            continue
+        key = _dev_key(rec.get("device_no"))
+        if key:
+            index[key] = index.get(key, 0) + 1
+    return index
+
+
+def _fleet_last_seen():
+    """frps fleet 库每台设备最后在线时间（MySQL devices.last_seen_at，KVWO-97 需求 4）。
+
+    返回 None = fleet 库未启用/不可查（闲置不可计算，如实置空不合成）；
+    否则 {设备编号 casefold: 'YYYY-MM-DD HH:MM'}，无记录/空串 = 从未上线。
+    """
+    if not store.enabled:
+        return None
+    try:
+        return {_dev_key(d["hostname"]): (d.get("last_seen") or "")
+                for d in store.devices_view()}
+    except Exception:  # noqa: BLE001 —— 查询失败同未启用：不合成在线历史
+        return None
+
+
+def _device_idle(device_no, unit, last_seen, now=None):
+    """单台闲置判定：库存外 + fleet 最后在线距今 > IDLE_DAYS（含从未上线）。
+
+    - 库存单位设备不算闲置（本就离线存放，即使从未上线）；
+    - last_seen 为 None（fleet 库不可用）→ 返回 None（不可判定，不合成）；
+    - 从未上线（无记录/空串/时间不可解析）→ 闲置；
+    - 归档设备不在此判定（在册口径外，调用方置 idle=null）。
+    """
+    if last_seen is None:
+        return None
+    if (unit or "") in INVENTORY_UNITS:
+        return False
+    seen = last_seen.get(_dev_key(device_no))
+    if not seen:
+        return True
+    try:
+        return ((now or datetime.now()) - datetime.strptime(seen, "%Y-%m-%d %H:%M")
+                > timedelta(days=IDLE_DAYS))
+    except ValueError:
+        return True
+
+
+def _idle_stats(devices, last_seen, now=None):
+    """闲置指标：{total, threshold_days, by_unit}（fleet 不可用时 total=None）。"""
+    if last_seen is None:
+        return {"total": None, "threshold_days": IDLE_DAYS, "by_unit": {}}
+    now = now or datetime.now()
+    by_unit, total = {}, 0
+    for d in devices:
+        if _device_idle(d.get("device_no"), d.get("unit"), last_seen, now):
+            total += 1
+            u = d.get("unit") or "(未填写)"
+            by_unit[u] = by_unit.get(u, 0) + 1
+    return {"total": total, "threshold_days": IDLE_DAYS, "by_unit": by_unit}
+
+
+def assets_list_view(filters=None):
+    """台账列表：status/type/unit 精确 + q（设备编号/备注模糊，大小写不敏感）；
+    include_archived=1 时追加归档设备（archived=true 标记）。"""
+    filters = filters or {}
+    online, version, _ = _asset_fleet_lookup()
+    last_seen = _fleet_last_seen()
+    repairs_by_dev = _asset_active_repairs_index()
+    items = [_asset_device_public(rec, online, version, repairs_by_dev,
+                                  last_seen=last_seen)
+             for rec in asset_store.all_records("devices")]
+    if str(filters.get("include_archived") or "").strip().lower() in ("1", "true", "yes"):
+        for rec in asset_store.all_records("archived"):
+            items.append(_asset_device_public(rec, online, version, repairs_by_dev,
+                                              table_key="archived", last_seen=last_seen))
+    status = (filters.get("status") or "").strip()
+    if status:
+        items = [i for i in items if i.get("status") == status]
+    dtype = (filters.get("type") or "").strip()
+    if dtype:
+        items = [i for i in items if i.get("device_type") == dtype]
+    unit = (filters.get("unit") or "").strip()
+    if unit:
+        items = [i for i in items if i.get("unit") == unit]
+    q = (filters.get("q") or "").strip().casefold()
+    if q:
+        items = [i for i in items
+                 if q in (i.get("device_no") or "").casefold()
+                 or q in (i.get("note") or "").casefold()]
+    return items
+
+
+def assets_stats_view():
+    """资产总览指标（全部由同步数据实时计算，不落死数）。
+
+    口径（提出人 2026-10-20 确认，归档不计入在册）：
+    - 在册 registered_total = 设备明细全部记录
+    - 库存 = 所属单位 ∈ INVENTORY_UNITS（默认上海办公室+潍坊办公室，均为
+      公司库存未使用；服务商等其他单位持有不计库存，清单走
+      FRP_MONITOR_INVENTORY_UNITS 可扩展，分单位明细见 inventory.by_unit）
+    - 口径 B（备注含「未使用」）仅作参考保留：unused_note
+    - 一线部署 deployed = 在册 − 库存
+    - 维修率 = (维修中 + 待维修) / 在册；损坏率 = (异常 + 维修中 + 待维修) / 在册
+    """
+    devices = asset_store.all_records("devices")
+    archived = asset_store.all_records("archived")
+    n = len(devices)
+
+    def counter(field):
+        counts = {}
+        for d in devices:
+            key = d.get(field) or ""
+            counts[key] = counts.get(key, 0) + 1
+        # 空值单独成桶（数据不合成也不静默丢弃）
+        return counts
+
+    by_status = counter("status")
+    by_type = counter("device_type")
+    by_unit = counter("unit")
+    # 库存分单位明细：配置单位全部列出（无设备时计 0，便于对账）
+    inv_by_unit = {u: by_unit.get(u, 0) for u in INVENTORY_UNITS}
+    inv_total = sum(inv_by_unit.values())
+    inv_b = sum(1 for d in devices if "未使用" in str(d.get("note") or ""))
+    repairing = by_status.get("维修中", 0) + by_status.get("待维修", 0)
+    damaged = by_status.get("异常", 0) + repairing
+    idle = _idle_stats(devices, _fleet_last_seen())
+    state = asset_store.sync_state("devices")
+    return {
+        "registered_total": n,
+        "archived_total": len(archived),
+        "inventory": {"total": inv_total, "by_unit": inv_by_unit,
+                      "units": list(INVENTORY_UNITS), "unused_note": inv_b},
+        "deployed": n - inv_total,
+        "idle": idle,
+        "by_status": by_status,
+        "by_type": by_type,
+        "by_unit": by_unit,
+        "repair_rate": round(repairing / n, 4) if n else None,
+        "damage_rate": round(damaged / n, 4) if n else None,
+        "last_sync_at": state["last_ok_at"],
+        "last_sync_attempt_at": state["last_sync_at"],
+        "last_sync_error": state["last_sync_error"],
+        "tables": asset_store.sync_states(),
+    }
+
+
+def assets_units_view():
+    """项目（所属单位）维度聚合：设备数 / 正常率 / 维修中 / 异常 / 使用率 / 最近更新时间。
+
+    维修中数 = 状态为「维修中」+「待维修」；正常率 = 正常 / 该单位设备数；
+    使用率（KVWO-107 第六波，口径：frps 在线快照数 / 该单位在册设备数，
+    在册为 0 记 null；设备编号匹配与 /api/assets 同规则，大小写不敏感）；
+    最近更新时间 = 该单位设备「最后更新时间」的最大值（ISO 字典序即时间序）。
+    单位详情由前端引用 /api/assets?unit=… 过滤，不另设接口。
+    """
+    devices = asset_store.all_records("devices")
+    _, _, snap = _asset_fleet_lookup()
+    units = {}
+    for d in devices:
+        name = d.get("unit") or "(未填写)"
+        u = units.setdefault(name, {"unit": name, "total": 0, "normal": 0,
+                                    "repairing": 0, "abnormal": 0, "online": 0,
+                                    "last_updated": None})
+        u["total"] += 1
+        if _dev_key(d.get("device_no")) in snap:
+            u["online"] += 1
+        status = d.get("status") or ""
+        if status == "正常":
+            u["normal"] += 1
+        elif status in ("维修中", "待维修"):
+            u["repairing"] += 1
+        elif status == "异常":
+            u["abnormal"] += 1
+        ts = d.get("updated_at") or ""
+        if ts and (u["last_updated"] or "") < ts:
+            u["last_updated"] = ts
+    items = []
+    for u in units.values():
+        items.append({**u,
+                      "normal_rate": round(u["normal"] / u["total"], 4) if u["total"] else None,
+                      "usage_rate": round(u["online"] / u["total"], 4) if u["total"] else None})
+    items.sort(key=lambda x: (-x["total"], x["unit"]))
+    return items
+
+
+def assets_versions_view():
+    """版本分布：探测版本计数 + 台账软件版本计数 + 按设备编号的匹配情况。
+
+    匹配规则（大小写不敏感，见 _asset_fleet_lookup）：
+    - matched：在册（设备明细）且探测到（frps 快照在线）
+    - ledger_missing：在册但探测不到（离线 / 未部署 / 未接入 frps）
+    - detected_only：探测到但在册与归档均未登记
+    归档设备不计入 ledger_missing；探测版本计数覆盖全部快照主机
+    （版本空 =「未获取」桶，与面板总览一致）；台账软件版本当前全空时
+    ledger_by_version 如实返回空对象。
+    """
+    online, version, snap = _asset_fleet_lookup()
+    devices = asset_store.all_records("devices")
+    archived = asset_store.all_records("archived")
+    ledger = {_dev_key(d.get("device_no")): d for d in devices if d.get("device_no")}
+    archived_keys = {_dev_key(d.get("device_no")) for d in archived if d.get("device_no")}
+
+    detected_by_version = {}
+    for key, info in snap.items():
+        ver = info.get("version") or "未获取"
+        detected_by_version[ver] = detected_by_version.get(ver, 0) + 1
+    ledger_by_version = {}
+    ledger_no_version = 0
+    for d in devices:
+        ver = (d.get("software_version") or "").strip()
+        if ver:
+            ledger_by_version[ver] = ledger_by_version.get(ver, 0) + 1
+        else:
+            ledger_no_version += 1
+
+    detected_keys = set(snap)
+    matched = sorted(k for k in ledger if k in detected_keys)
+    ledger_missing = sorted(k for k in ledger if k not in detected_keys)
+    detected_only = sorted(k for k in detected_keys
+                           if k not in ledger and k not in archived_keys)
+    # 主要服务商版本占比（KVWO-107 第六波）：在册数前 5 单位的探测版本分桶。
+    # 口径：版本取 frps 在线快照的探测版本，空版本/未探测（离线、未接入）
+    # 一律归「未获取」桶（与 detected_by_version 同桶名）；share = count /
+    # 该单位在册数（保留两位小数）；排序 = 在册数降序、并列按单位名稳定
+    # 排序（与 units 同规则），恰取前 5（不足 5 家如实返回全部）。
+    units_ver = {}
+    for d in devices:
+        name = d.get("unit") or "(未填写)"
+        u = units_ver.setdefault(name, {"total": 0, "by_version": {}})
+        u["total"] += 1
+        info = snap.get(_dev_key(d.get("device_no")))
+        ver = (info.get("version") if info else None) or "未获取"
+        u["by_version"][ver] = u["by_version"].get(ver, 0) + 1
+    by_provider_top5 = []
+    for name, u in sorted(units_ver.items(),
+                           key=lambda kv: (-kv[1]["total"], kv[0]))[:5]:
+        versions = [{"version": ver, "count": cnt,
+                     "share": round(cnt / u["total"], 2)}
+                    for ver, cnt in sorted(u["by_version"].items(),
+                                           key=lambda kv: (-kv[1], kv[0]))]
+        by_provider_top5.append({"unit": name, "total": u["total"],
+                                 "versions": versions})
+    return {
+        "detected_by_version": detected_by_version,
+        "detected_total": len(snap),
+        "ledger_by_version": ledger_by_version,
+        "ledger_registered": ledger_no_version + sum(ledger_by_version.values()),
+        "ledger_no_version": ledger_no_version,
+        "by_provider_top5": by_provider_top5,
+        "match": {"matched": matched, "ledger_missing": ledger_missing,
+                  "detected_only": detected_only},
+        "match_counts": {"matched": len(matched), "ledger_missing": len(ledger_missing),
+                         "detected_only": len(detected_only)},
+        "last_sync_at": asset_store.sync_state("devices")["last_ok_at"],
+    }
+
+
+def _asset_action_public(rec):
+    return {"record_id": rec["record_id"], "action": rec.get("action"),
+            "summary": rec.get("summary"), "note": rec.get("note"),
+            "operator": rec.get("operator"), "transferred_to": rec.get("transferred_to"),
+            "created_by": rec.get("created_by"), "operated_at": rec.get("operated_at"),
+            "attachments": _asset_attach_urls(rec.get("attachments")),
+            "linked_records": rec.get("linked_records"),
+            "feishu_url": asset_feishu_url(ASSET_TABLES["actions"]["table_id"],
+                                           rec["record_id"])}
+
+
+def _asset_part_public(rec):
+    return {"record_id": rec["record_id"], "item": rec.get("item"),
+            "part": rec.get("part"), "device_no": rec.get("device_no"),
+            "arrival_status": rec.get("arrival_status"),
+            "status_note": rec.get("status_note"), "checker": rec.get("checker"),
+            "checked_at": rec.get("checked_at"), "photos": _asset_attach_urls(rec.get("photos")),
+            "linked_records": rec.get("linked_records"),
+            "feishu_url": asset_feishu_url(ASSET_TABLES["parts"]["table_id"],
+                                           rec["record_id"])}
+
+
+def _asset_transfer_public(rec):
+    return {"record_id": rec["record_id"], "occurred_at": rec.get("occurred_at"),
+            "item": rec.get("item"), "quantity": rec.get("quantity"),
+            "note": rec.get("note"), "unit": rec.get("unit"),
+            "proof": _asset_attach_urls(rec.get("proof")),
+            "feishu_url": asset_feishu_url(ASSET_TABLES["transfers"]["table_id"],
+                                           rec["record_id"])}
+
+
+def asset_detail_view(device_no):
+    """单设备 360°：台账 + 维修记录（异常设备表）+ 处理流水 + 配件核对 + 流转记录。
+
+    关联规则（大小写不敏感，_dev_key 统一）：
+    - 维修记录：异常设备表 device_no 与设备编号一致（全部阶段，倒序）；
+    - 处理流水：异常处理流转.device_no 一致，或 linked_records 命中该设备
+      任一维修记录的 record_id（双路关联）；
+    - 配件核对：配件核对明细.device_no 一致；
+    - 流转记录：无设备编号列，按单位关联——设备所属单位与记录单位去空格后
+      相等或互为包含（该列为自由文本，存在「构元服务商」vs「潍坊构元服务商」）。
+    未匹配到的源返回空数组；台账缺失字段一律 null，不合成。
+    """
+    key = _dev_key(device_no)
+    if not key:
+        return None
+    rec = next((r for r in asset_store.all_records("devices")
+                if _dev_key(r.get("device_no")) == key), None)
+    archived = False
+    if rec is None:
+        rec = next((r for r in asset_store.all_records("archived")
+                    if _dev_key(r.get("device_no")) == key), None)
+        archived = rec is not None
+    if rec is None:
+        return None
+    online, version, _ = _asset_fleet_lookup()
+    item = _asset_device_public(rec, online, version, _asset_active_repairs_index(),
+                                table_key="archived" if archived else "devices",
+                                last_seen=_fleet_last_seen())
+
+    repairs = [r for r in repair_store.all_records() if _dev_key(r.get("device_no")) == key]
+    repairs.sort(key=lambda r: r.get("created_at") or "", reverse=True)
+    repair_ids = {r["record_id"] for r in repairs}
+    actions = [r for r in asset_store.all_records("actions")
+               if _dev_key(r.get("device_no")) == key
+               or any(rid in repair_ids for rid in (r.get("linked_records") or []))]
+    actions.sort(key=lambda r: r.get("operated_at") or "", reverse=True)
+    parts = [r for r in asset_store.all_records("parts")
+             if _dev_key(r.get("device_no")) == key]
+    parts.sort(key=lambda r: r.get("checked_at") or "", reverse=True)
+    unit = (rec.get("unit") or "").strip()
+    transfers = []
+    if unit:
+        for r in asset_store.all_records("transfers"):
+            tu = (r.get("unit") or "").strip()
+            if tu and (tu == unit or tu in unit or unit in tu):
+                transfers.append(r)
+        transfers.sort(key=lambda r: r.get("occurred_at") or "", reverse=True)
+
+    item["repairs"] = [{"record_id": r["record_id"], "stage": r.get("stage"),
+                        "device_type": r.get("device_type"),
+                        "problem": r.get("problem"), "owner_name": r.get("owner_name"),
+                        "last_followed_at": r.get("last_followed_at"),
+                        "last_followup_note": r.get("last_followup_note"),
+                        "created_at": r.get("created_at"),
+                        "feishu_url": repair_feishu_url(r["record_id"])} for r in repairs]
+    item["actions"] = [_asset_action_public(r) for r in actions]
+    item["parts_checks"] = [_asset_part_public(r) for r in parts]
+    item["transfers"] = [_asset_transfer_public(r) for r in transfers]
+    return item
+
+
+# ----------------------------------------------------------------------------
 # 数据保留与每日备份（随服务运行的后台线程）
 # ----------------------------------------------------------------------------
 def run_maintenance(retention=True, backup=True, reason="daily"):
@@ -2916,6 +6261,7 @@ def run_maintenance(retention=True, backup=True, reason="daily"):
     if store.enabled and backup:
         result["backup"] = _run_db_backup()
     _prune_upgrade_memory()
+    _prune_webfix_memory()
     return result
 
 
@@ -2941,16 +6287,21 @@ def _run_db_backup():
             fh.write(f"port={DB_PORT}\n")
         os.chmod(defaults, 0o600)
         with open(dest, "wb") as out:
-            proc = subprocess.run(
+            dumper = subprocess.Popen(
                 ["mysqldump", f"--defaults-extra-file={defaults}", "--single-transaction",
                  "--routines", "--triggers", DB_NAME],
-                stdout=out, stderr=subprocess.PIPE, timeout=1800)
-        if proc.returncode != 0:
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            zipper = subprocess.Popen(["gzip", "-6"], stdin=dumper.stdout, stdout=out)
+            dumper.stdout.close()  # gzip 先退出时让 mysqldump 收到 SIGPIPE
+            dump_rc = dumper.wait(timeout=1800)
+            zip_rc = zipper.wait(timeout=600)
+            dump_err = dumper.stderr.read().decode("utf-8", "replace")[:300]
+        if dump_rc != 0 or zip_rc != 0:
             try:
                 os.remove(dest)
             except OSError:
                 pass
-            return {"ok": False, "error": _sanitize(proc.stderr.decode("utf-8", "replace")[:300])}
+            return {"ok": False, "error": _sanitize(dump_err or f"mysqldump rc={dump_rc}, gzip rc={zip_rc}")}
     except OSError as exc:
         return {"ok": False, "error": str(exc)}
     finally:
@@ -3049,6 +6400,41 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         return json.loads(self.rfile.read(n) or b"{}")
 
+    def _api_refresh(self):
+        """强刷快照缓存（SOP/旧 fleet-panel 的 GET/POST /api/refresh 兼容入口，
+        等价于面板「立即刷新」的 /api/hosts?refresh=1；此前 404 是端点路径不同）。"""
+        try:
+            refresh_snapshot()
+        except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
+            self.send_json(502, {"ok": False, "error": str(exc)})
+            return
+        hosts, ts = get_snapshot()
+        self.send_json(200, {"ok": True, "timestamp": ts,
+                             "total": len(hosts), "online": len(hosts)})
+
+    def _repair_attachment(self, token, name=None):
+        """提供本地已下载的维修附件（token 定位文件，URL 已限制字符集，防目录穿越）。"""
+        if not token or "/" in token or "\\" in token or token != os.path.basename(token):
+            return self.send_error(404)
+        filename = _repair_attach_file(token)
+        if filename is None or os.path.splitext(filename)[0] != token:
+            return self.send_error(404)
+        fp = os.path.join(REPAIR_ATTACH_DIR, filename)
+        # Content-Type 从 URL 里的原始文件名推断（本地文件名是裸 token[.ext]）
+        ctype = mimetypes.guess_type(name or "")[0] if name else None
+        ctype = ctype or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        try:
+            with open(fp, "rb") as f:
+                body = f.read()
+        except OSError:
+            return self.send_error(404)
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "public, max-age=86400")  # token 内容寻址，可缓存
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         if not self._authorized():
             self.send_unauthorized()
@@ -3100,6 +6486,85 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/upgrade/events":
             return self._sse()
+        if path == "/api/webfix/tasks":
+            # 各设备补配状态（最新一行/设备，含 error）+ 当前候选列表（KVWO-17/19）
+            return self.send_json(200, webfix_view())
+        m = re.match(r"^/api/webfix/tasks/(\d+)/log$", path)
+        if m:
+            qs = parse_qs(urlsplit(self.path).query)
+            try:
+                offset = max(0, int(qs.get("offset", ["0"])[0]))
+            except (TypeError, ValueError):
+                offset = 0
+            view = webfix_task_log_view(int(m.group(1)), offset=offset)
+            if view is None:
+                return self.send_json(404, {"error": "unknown webfix task",
+                                            "task_id": int(m.group(1))})
+            return self.send_json(200, view)
+        if path == "/api/refresh":
+            return self._api_refresh()
+        # --- 维修面板只读 API（KVWO-78/79，数据源飞书维修表 lark-cli 同步） ---
+        if path == "/api/repairs":
+            qs = parse_qs(urlsplit(self.path).query)
+            filters = {k: (qs.get(k, [""])[0] or "") for k in ("stage", "type", "unit", "owner", "q")}
+            items = repairs_list_view(filters)
+            state = repair_store.sync_state()
+            return self.send_json(200, {
+                "enabled": REPAIR_SYNC_ENABLED, "total": len(items), "items": items,
+                "last_sync_at": state["last_ok_at"],
+                "last_sync_attempt_at": state["last_sync_at"],
+                "last_sync_error": state["last_sync_error"],
+                "sync_interval": int(REPAIR_SYNC_INTERVAL),
+                "stage_order": REPAIR_STAGE_ORDER})
+        if path == "/api/repairs/stats":
+            return self.send_json(200, repairs_stats_view())
+        m = re.match(r"^/api/repairs/([A-Za-z0-9]+)$", path)
+        if m:
+            rec = repair_store.get(m.group(1))
+            if rec is None:
+                return self.send_json(404, {"error": "unknown record", "record_id": m.group(1)})
+            return self.send_json(200, _repair_public(rec, _repair_online_lookup(),
+                                                      _repair_attach_index()))
+        m = re.match(r"^/repair-attachments/([A-Za-z0-9_-]+)(?:/(.*))?$", path)
+        if m:
+            return self._repair_attachment(m.group(1), m.group(2))
+        # --- 资产多表与聚合 API（KVWO-83，只读，数据源飞书资产表 lark-cli 同步） ---
+        if path == "/api/assets":
+            qs = parse_qs(urlsplit(self.path).query)
+            filters = {k: (qs.get(k, [""])[0] or "")
+                       for k in ("status", "type", "unit", "q", "include_archived")}
+            items = assets_list_view(filters)
+            state = asset_store.sync_state("devices")
+            return self.send_json(200, {
+                "enabled": ASSET_SYNC_ENABLED, "total": len(items), "items": items,
+                "last_sync_at": state["last_ok_at"],
+                "last_sync_attempt_at": state["last_sync_at"],
+                "last_sync_error": state["last_sync_error"],
+                "sync_interval": int(ASSET_SYNC_INTERVAL),
+                "tables": asset_store.sync_states()})
+        if path == "/api/assets/stats":
+            return self.send_json(200, assets_stats_view())
+        if path == "/api/assets/units":
+            return self.send_json(200, {"units": assets_units_view(),
+                                       "last_sync_at": asset_store.sync_state("devices")["last_ok_at"]})
+        if path == "/api/assets/versions":
+            return self.send_json(200, assets_versions_view())
+        if path == "/api/assets/report":
+            # 资产日报推送状态（KVWO-97）；webhook 地址属敏感凭据，不回显
+            with _FEISHU_REPORT_LOCK:
+                out = {"enabled": bool(FEISHU_WEBHOOK),
+                       "times": [f"{hh:02d}:{mm:02d}" for hh, mm in REPORT_SLOTS],
+                       "next_run_at": _feishu_report_state["next_run_at"],
+                       "last": _feishu_report_state["last"],
+                       "inventory_units": list(INVENTORY_UNITS),
+                       "panel_title": panel_title()}
+            return self.send_json(200, out)
+        m = re.match(r"^/api/assets/([A-Za-z0-9_-]+)$", path)
+        if m:
+            detail = asset_detail_view(m.group(1))
+            if detail is None:
+                return self.send_json(404, {"error": "unknown device", "device_id": m.group(1)})
+            return self.send_json(200, detail)
         if path == "/api/hosts":
             force = "refresh" in parse_qs(urlsplit(self.path).query)
             if force:
@@ -3269,7 +6734,8 @@ class Handler(BaseHTTPRequestHandler):
                                  "hosts": store.uptime(hours)})
             return
         if path in ("/", "/index.html"):
-            body = INDEX.format(css=CSS, js=JS).encode()
+            body = INDEX.format(css=CSS, js=JS,
+                                title=html.escape(panel_title(), quote=False)).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
@@ -3327,6 +6793,22 @@ class Handler(BaseHTTPRequestHandler):
             out = create_upgrade_job(str(req.get("kind") or ""),
                                      req.get("devices") or [], params)
             return self.send_json(200 if out.get("ok") else 400, out)
+        if path == "/api/webfix/retry":
+            # 手动重试补配（面板认证）；每次新建台账行，attempts 累加，
+            # trigger_type=manual；自动触发的一次性语义不受影响（KVWO-17/19）
+            try:
+                req = self._json_body()
+            except json.JSONDecodeError:
+                return self.send_json(400, {"ok": False, "error": "bad json"})
+            devices = req.get("devices")
+            if not isinstance(devices, list):
+                return self.send_json(400, {"ok": False,
+                                            "error": "devices 必须是设备名数组"})
+            out = webfix_retry(devices)
+            return self.send_json(200 if out.get("ok") else 400, out)
+        if path == "/api/refresh":
+            # 与 GET /api/refresh 等价（SOP 工具既有 GET 也有 POST 调法）
+            return self._api_refresh()
         if path == "/api/maintenance/run-cleanup":
             result = run_maintenance(retention=True, backup=False, reason="manual")
             return self.send_json(200, result)
@@ -3339,6 +6821,23 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_json(200, result)
             return
+        if path == "/api/repairs/sync":
+            # 手动触发一次维修表同步（自测/验证用；与定时同步互斥串行）
+            result = run_repair_sync("manual")
+            return self.send_json(200, result)
+        if path == "/api/assets/sync":
+            # 手动触发一次资产 5 表同步（自测/验证用；与定时同步互斥串行，
+            # 按表隔离失败）
+            result = run_asset_sync("manual")
+            return self.send_json(200, result)
+        if path == "/api/assets/report/run":
+            # 手动触发一次资产日报推送（测试验收用；与定时调度互斥串行）。
+            # 未配置 webhook 时如实拒绝（置空=关闭推送）
+            if not FEISHU_WEBHOOK:
+                return self.send_json(400, {"ok": False,
+                                            "error": "FRP_MONITOR_FEISHU_WEBHOOK 未配置（置空=关闭推送）"})
+            result = run_feishu_report("manual")
+            return self.send_json(200, result)
         self.send_error(404)
 
 
@@ -3357,15 +6856,38 @@ if __name__ == "__main__":
                       f"left by a previous process", flush=True)
         except Exception as exc:  # noqa: BLE001
             print(f"frp-monitor: upgrade job reconcile failed: {exc}", flush=True)
+        try:
+            _interrupted = store.reconcile_webfix_tasks()
+            if _interrupted:
+                print(f"frp-monitor: reconciled {_interrupted} interrupted webfix task(s) "
+                      f"left by a previous process", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"frp-monitor: webfix reconcile failed: {exc}", flush=True)
     if not DEPLOY_PW:
         print("frp-monitor: DEPLOY_PW not set —— 升级编排不可用（浏览可用），"
               "请在 /etc/frp-monitor.env 配置后重启", flush=True)
+    if not (WEBFIX_AUTO and store.enabled and DEPLOY_PW):
+        why = "FRP_MONITOR_WEBFIX_AUTO=0" if not WEBFIX_AUTO else (
+            "历史库未启用" if not store.enabled else "DEPLOY_PW 未设置")
+        print(f"frp-monitor: webfix 自动补配未启用（{why}；POST /api/webfix/retry 亦不可用）",
+              flush=True)
     threading.Thread(target=_refresh_loop, name="snapshot-refresher", daemon=True).start()
     threading.Thread(target=_collect_duration_loop, name="collect-duration-puller", daemon=True).start()
     threading.Thread(target=_maintenance_loop, name="daily-maintenance", daemon=True).start()
+    threading.Thread(target=_repair_sync_loop, name="repair-syncer", daemon=True).start()
+    threading.Thread(target=_asset_sync_loop, name="asset-syncer", daemon=True).start()
+    threading.Thread(target=_feishu_report_loop, name="feishu-report", daemon=True).start()
+    threading.Thread(target=_resolve_panel_title, name="panel-title-resolver", daemon=True).start()
     print(f"frp-monitor: serving on :{HTTP_PORT} (oss-signed-url distribution, "
           f"upgrade_parallel={UPGRADE_MAX_PARALLEL}, retention={RETENTION_DAYS}d, "
-          f"backup={BACKUP_DIR} keep {BACKUP_KEEP})",
+          f"backup={BACKUP_DIR} keep {BACKUP_KEEP}, "
+          f"webfix={'auto' if (WEBFIX_AUTO and store.enabled and DEPLOY_PW) else 'off'} "
+          f"ports {WEBFIX_PORT_BASE}-{WEBFIX_PORT_MAX}, stable-window {WEBFIX_DELAY:g}s, "
+          f"repairs={'on' if REPAIR_SYNC_ENABLED else 'off'}"
+          f"{'/' + str(int(REPAIR_SYNC_INTERVAL)) + 's' if REPAIR_SYNC_ENABLED else ''}, "
+          f"report={'on@' + '/'.join(f'{hh:02d}:{mm:02d}' for hh, mm in REPORT_SLOTS) if FEISHU_WEBHOOK else 'off'}, "
+          f"inventory_units={'+'.join(INVENTORY_UNITS)}, "
+          f"title={panel_title()!r})",
           flush=True)
     httpd = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), Handler)
     httpd.daemon_threads = True  # SSE 长连接随主进程退出，不阻塞重启
