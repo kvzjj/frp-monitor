@@ -1,1 +1,7 @@
 __pycache__/
+
+# 本地试跑产物
+assets.sqlite*
+repairs.sqlite*
+repair-attachments/
+__pycache__/

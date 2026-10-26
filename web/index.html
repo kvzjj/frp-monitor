@@ -1,0 +1,57 @@
+<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>{{TITLE}}</title><style><link rel="stylesheet" href="/app.css"></style></head><body><main>
+<header><div><h1>{{TITLE}}</h1><p id=sub>正在加载…</p></div><div class=hdrbtns><button id=refresh>立即刷新</button><a class=logout href=/logout title="退出登录并清除会话">退出</a></div></header>
+<nav id=viewTabs class=vtabs><button type=button data-view=overview class=on>设备总览</button><button type=button data-view=assets>资产</button><button type=button data-view=upgrade>升级</button></nav>
+<section id=viewOverview>
+<section class=summary><div><b id=online>0</b><span>在线设备</span></div><div><b id=registered>0</b><span>登记设备</span></div><div><b id=pendingN>0</b><span id=targetLbl>待升级</span></div><div><b id=sitesN>0</b><span>站点</span></div><div><b id=missingN>0</b><span>未上线</span></div></section>
+<div class=toolbar><input id=q placeholder="搜索 hostname / device_id / 设备名 / IP"><select id=statusFilter><option value=all>全部状态</option><option value=online selected>仅在线</option><option value=offline>仅未上线</option></select><select id=targetSel title="升级目标版本"></select><button id=copyPending class=listbtn title="按当前筛选（站点/状态/版本/搜索）复制：设备号 站点 IP SSH端口 device_id 当前版本">复制待升级清单</button><button id=copyCmds class=listbtn title="按当前筛选复制 SSH 跳板登录命令">复制跳板命令</button><button id=copyList class=listbtn title="按当前筛选复制设备编号">复制编号</button></div>
+<nav id=sites class=sitesbar></nav>
+<nav id=vers class=sitesbar></nav>
+<div id=grid class=grid></div>
+<section id=events><h2>最近事件（24 小时）</h2><div id=eventsBody class=elist><p class=eempty>加载中…</p></div></section>
+</section>
+<section id=viewAssets hidden>
+<nav id=assetTabs class="vtabs asub"><button type=button data-atab=dashboard class=on>资产总览</button><button type=button data-atab=hardware>硬件台账</button><button type=button data-atab=repairs>维修看板</button><button type=button data-atab=versions>版本视图</button><button type=button data-atab=units>项目视图</button></nav>
+<div id=asSyncBar class="asyncbar ok" hidden></div>
+<section id=atabDashboard>
+<div class=toolbar><button type=button id=asReportPush class=listbtn title="立即向飞书群推送一次资产日报（测试用；需服务器已配置 FRP_MONITOR_FEISHU_WEBHOOK，未配置会如实报错）">📨 立即推送日报（测试）</button><span id=asReportState class=uhint></span></div>
+<section class=amcards id=asMetrics></section>
+<div class=adists id=asDists></div>
+</section>
+<section id=atabHardware hidden>
+<div class=toolbar><input id=asQ placeholder="搜索设备编号 / 去向备注 / 单位"><select id=asStatus></select><select id=asType></select><select id=asUnit></select><label class=aswitch title="归档（已拆解）设备默认隐藏，勾选后追加在表格底部"><input type=checkbox id=asArchived>显示归档设备</label></div>
+<div class=twrap><table class=astable><thead id=asLedgerHead></thead><tbody id=asLedgerBody></tbody></table></div>
+<p class=uhint id=asLedgerHint></p>
+</section>
+<section id=atabRepairs hidden>
+<section class=summary><div><b id=repActive>—</b><span>未完结维修</span></div><div><b id=repTotal>—</b><span>维修记录</span></div><div><b id=repDoneN>—</b><span>已完结</span></div><div><b id=repSync>—</b><span>最后同步</span></div></section>
+<div id=repBanner class=rbanner hidden></div>
+<nav id=repStageStats class=sitesbar></nav>
+<div class=toolbar><input id=repQ placeholder="搜索设备编号 / 问题描述" spellcheck=false autocomplete=off><select id=repStageF title="按流转阶段筛选（仅列表视图）"><option value=all>全部阶段</option></select><select id=repTypeF><option value=all>全部类型</option></select><select id=repUnitF><option value=all>全部单位</option></select><select id=repOwnerF><option value=all>全部负责人</option></select><button id=repReload class=listbtn title="重新拉取维修列表与统计（后端默认每 5 分钟从飞书表同步一次）">重新加载</button><span class=rvswitch><button type=button id=repVKanban class=on>看板</button><button type=button id=repVList>列表</button></span></div>
+<div id=repKanban class=rkan><p class="uempty rkanhint">加载中…</p></div>
+<div id=repListWrap hidden>
+<div class=twrap><table class=rtable><thead><tr><th>设备编号</th><th>类型</th><th>阶段</th><th>所属单位</th><th>问题描述</th><th>负责人</th><th>最后跟进</th><th>台账</th></tr></thead><tbody id=repTbody></tbody></table></div>
+<div id=repDoneWrap class=rdonewrap hidden><button type=button id=repDoneToggle class=listbtn>已完结记录</button><div class=twrap id=repDoneTable hidden><table class=rtable><thead><tr><th>设备编号</th><th>类型</th><th>阶段</th><th>所属单位</th><th>问题描述</th><th>负责人</th><th>最后跟进</th><th>台账</th></tr></thead><tbody id=repDoneTbody></tbody></table></div></div>
+</div>
+</section>
+<section id=atabVersions hidden><div id=asVersionBody><p class=eempty>加载中…</p></div></section>
+<section id=atabUnits hidden><div id=asUnitBody><p class=eempty>加载中…</p></div><div id=asUnitDetail hidden></div></section>
+</section>
+<section id=viewUpgrade hidden>
+<section class=upanel id=upgParamPanel><div class=uhead><h2>① 升级参数</h2><span class=uhint id=upgRegState></span></div>
+<div class=uparam>
+<div class=prow><label for=upgUrl>OSS 签名 URL</label><input id=upgUrl type=text spellcheck=false autocomplete=off placeholder="https://<bucket>.oss-cn-hangzhou.aliyuncs.com/.../ego-portal-v0.4.6-rk3588-arm64.tar.gz?Expires=…&OSSAccessKeyId=…&Signature=…"></div>
+<div class=pmeta id=upgUrlMeta>粘贴后自动识别文件名、版本与机型；签名 URL 属敏感凭据，请勿外传</div>
+<div class=prow><label for=upgSha>sha256 基准</label><input id=upgSha type=text spellcheck=false autocomplete=off placeholder="留空自动匹配包注册表，未命中可手填或点「服务端计算」"><button type=button id=upgShaCompute class=stagebtn title="服务端从 OSS 直连拉取整包计算（约 1G 下载，耗时视服务器出口带宽），结果入注册表缓存">服务端计算</button><span id=upgShaSrc class=shaorigin></span></div>
+<div class=pmeta id=upgShaMeta></div>
+<div class=pmeta id=upgExpiry></div>
+<div id=upgParamSummary class=psummary></div>
+</div></section>
+<section class=upanel><div class=uhead><h2>② 选择目标设备</h2><div class=uselbar id=upgSelBar>已选 0 台</div></div><div id=upgDevGroups><p class=uempty>加载中…</p></div></section>
+<section class=upanel id=upgActPanel><div class=uhead><h2>③ 发起升级</h2></div><div class=ubtns><button type=button id=upgRunAll>▶ 全流程升级所选</button><button type=button class=stagebtn data-kind=precheck>仅预检</button><button type=button class=stagebtn data-kind=download>仅下载</button><button type=button class=stagebtn data-kind=install>仅安装</button><button type=button class=stagebtn data-kind=verify>仅验证</button><button type=button class=stagebtn data-kind=cleanup>仅清理</button></div><p class=uhint id=upgActHint></p></section>
+<section class=upanel><div class=uhead><h2>④ 任务与进度</h2><span id=upgConn class=connchip>未连接</span></div><div id=upgJobSummary><p class=uempty>暂无升级任务</p></div><div id=upgTaskGrid></div></section>
+</section>
+</main>
+<div id=modal class=modal><div id=modalBody class=mbody></div></div>
+<div id=upgModal class=modal><div id=upgModalBody class=mbody></div></div>
+<div id=repModal class=modal><div id=repModalBody class=mbody></div></div>
+<script src="/app.js" defer></script></body></html>
