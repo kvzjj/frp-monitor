@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>登录 · {{TITLE}}</title>
+<link rel="stylesheet" href="/login.css">
+</head>
+<body>
+<main class="wrap">
+  <form class="card" method="post" action="/login" autocomplete="on">
+    <div class="logo" aria-hidden="true">
+      <svg viewBox="0 0 48 48" width="44" height="44" focusable="false">
+        <rect x="4" y="10" width="40" height="26" rx="6" class="lg-body"/>
+        <path d="M4 26h40" class="lg-line"/>
+        <circle cx="15" cy="36" r="5" class="lg-wheel"/>
+        <circle cx="33" cy="36" r="5" class="lg-wheel"/>
+        <path d="M14 10l4-6h10l4 6" class="lg-line lg-top"/>
+        <circle cx="24" cy="21" r="4" class="lg-sig"/>
+      </svg>
+    </div>
+    <h1>{{TITLE}}</h1>
+    <p class="sub">车队设备面板 · 请登录后继续</p>
+
+    <p class="err{{ERR_HIDDEN}}" id="err" role="alert">用户名或密码不正确，请重试</p>
+
+    <label class="field">
+      <span>用户名</span>
+      <input name="username" type="text" required autofocus
+             autocapitalize="none" autocomplete="username" spellcheck="false">
+    </label>
+    <label class="field">
+      <span>密码</span>
+      <input name="password" type="password" required autocomplete="current-password">
+    </label>
+
+    <button type="submit">登 录</button>
+
+    <p class="foot">API / curl 访问仍支持 HTTP Basic（<code>curl -u user:pass</code>）</p>
+  </form>
+</main>
+</body>
+</html>

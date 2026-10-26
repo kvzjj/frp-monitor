@@ -127,6 +127,17 @@ REPAIR_TABLE_ID = os.getenv("FRP_MONITOR_REPAIR_TABLE_ID", "tblf1nlwkHhMX1V9")
 REPAIR_VIEW_ID = os.getenv("FRP_MONITOR_REPAIR_VIEW", "vewVBaWePF")  # 仅用于拼飞书原记录链接
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPAIR_DB_PATH = os.getenv("FRP_MONITOR_REPAIR_DB", os.path.join(_SCRIPT_DIR, "repairs.sqlite"))
+
+# --- 登录页（2026-10-26）：前端独立文件 + Cookie 会话，Basic Auth 保留 ----------
+# 登录页等前端文件放 web/ 目录（不再内嵌 server.py）；会话为 HMAC 签名自包含
+# Cookie（exp.签名），密钥未配置时由面板口令派生——重启不失效，改口令即全员下线。
+# HTTP Basic（curl -u / 运维脚本）继续可用，与 Cookie 会话并行。
+WEB_DIR = os.path.join(_SCRIPT_DIR, "web")
+SESSION_COOKIE = "frpmonitor_session"
+SESSION_TTL = float(os.getenv("FRP_MONITOR_PANEL_SESSION_TTL", str(7 * 86400)))
+SESSION_SECRET = (os.getenv("FRP_MONITOR_PANEL_SESSION_SECRET", "").strip() or
+                  hashlib.sha256(b"frp-monitor-session-v1:" + PANEL_PASSWORD.encode("utf-8")
+                                 ).hexdigest())
 REPAIR_ATTACH_DIR = os.getenv("FRP_MONITOR_REPAIR_ATTACH_DIR", os.path.join(_SCRIPT_DIR, "repair-attachments"))
 
 # 资产多表同步（KVWO-83）：复用维修面板（KVWO-79）的 lark-cli 同步机制与调度模式，
@@ -220,7 +231,7 @@ def ssh_user_for_device(hardware="", hw_model=""):
     return _ssh_user_for_arch(arch)
 
 INDEX = """<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>{title}</title><style>{css}</style></head><body><main>
-<header><div><h1>{title}</h1><p id=sub>正在加载…</p></div><button id=refresh>立即刷新</button></header>
+<header><div><h1>{title}</h1><p id=sub>正在加载…</p></div><div class=hdrbtns><button id=refresh>立即刷新</button><a class=logout href=/logout title="退出登录并清除会话">退出</a></div></header>
 <nav id=viewTabs class=vtabs><button type=button data-view=overview class=on>设备总览</button><button type=button data-view=assets>资产</button><button type=button data-view=upgrade>升级</button></nav>
 <section id=viewOverview>
 <section class=summary><div><b id=online>0</b><span>在线设备</span></div><div><b id=registered>0</b><span>登记设备</span></div><div><b id=pendingN>0</b><span id=targetLbl>待升级</span></div><div><b id=sitesN>0</b><span>站点</span></div><div><b id=missingN>0</b><span>未上线</span></div></section>
@@ -431,7 +442,10 @@ CSS = """*{box-sizing:border-box}body{margin:0;background:#f4f7fb;color:#172033;
 .rattach .rfname{font-size:11px;color:#667085;padding:4px 6px;word-break:break-all;line-height:1.4}
 .rfootbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:14px}
 .rfeishu{color:#2563eb;text-decoration:none;font-size:13px;border:1px solid #bfdbfe;background:#eff6ff;border-radius:8px;padding:8px 14px}
-.rfeishu:hover{background:#dbeafe}"""
+.rfeishu:hover{background:#dbeafe}
+.hdrbtns{display:flex;gap:8px;align-items:center}
+.logout{display:inline-flex;align-items:center;border:1px solid #cbd5e1;background:#f1f5f9;color:#334155;border-radius:8px;padding:10px 16px;font-size:14px;text-decoration:none;cursor:pointer;white-space:nowrap}
+.logout:hover{background:#fee2e2;border-color:#fecaca;color:#b91c1c}"""
 JS = """const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
 const ETAGS={online:'上线',offline:'掉线',version_change:'版本变更',first_seen:'新设备'};
@@ -1961,6 +1975,8 @@ init(){
 Upg.init();      // 路由器先就绪（setView 引用下方 Assets/Rep，声明先于本行求值）
 Assets.init();
 Rep.init();
+/* 会话过期兜底（2026-10-26 登录页）：SPA 任意 fetch 命中 401 → 整页跳登录页 */
+(function(){var f=window.fetch;if(!f)return;window.fetch=function(){return f.apply(this,arguments).then(function(r){if(r.status===401&&location.pathname.indexOf('/login')!==0)location.href='/login';return r})}})();
 """
 
 
@@ -6363,6 +6379,43 @@ def _maintenance_loop():
 
 
 
+def _read_web(name):
+    """读取 web/ 下前端文件（bytes）；仅允许扁平文件名（防目录穿越），缺失/非法返回 None。"""
+    if name != os.path.basename(name) or "/" in name or "\\" in name:
+        return None
+    try:
+        with open(os.path.join(WEB_DIR, name), "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _session_sign(exp):
+    """会话签名 = HMAC(secret, user|exp)；与用户名绑定，改用户名即失效。"""
+    return hmac.new(SESSION_SECRET.encode("utf-8"),
+                    f"{PANEL_USER}|{exp}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _session_token():
+    exp = int(time.time() + SESSION_TTL)
+    return f"{exp}.{_session_sign(exp)}"
+
+
+def _session_valid(cookie_header):
+    """从 Cookie 头解析会话票据并校验签名与有效期（常量时间比较）。"""
+    for part in (cookie_header or "").split(";"):
+        name, _, value = part.strip().partition("=")
+        if name != SESSION_COOKIE or "." not in value:
+            continue
+        exp_s, _, sig = value.partition(".")
+        if not exp_s.isdigit() or not sig:
+            continue
+        exp = int(exp_s)
+        if exp >= time.time() and hmac.compare_digest(sig, _session_sign(exp)):
+            return True
+    return False
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
@@ -6378,6 +6431,10 @@ class Handler(BaseHTTPRequestHandler):
     def _authorized(self):
         if not PANEL_USER or not PANEL_PASSWORD:
             return True
+        # 1) 登录页颁发的会话 Cookie（HttpOnly；exp 与签名一体，防篡改/防伪造）
+        if _session_valid(self.headers.get("Cookie") or ""):
+            return True
+        # 2) HTTP Basic 保留（curl -u / 既有运维脚本零改动）
         header = self.headers.get("Authorization") or ""
         if not header.startswith("Basic "):
             return False
@@ -6388,13 +6445,79 @@ class Handler(BaseHTTPRequestHandler):
         expected = f"{PANEL_USER}:{PANEL_PASSWORD}"
         return hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
 
-    def send_unauthorized(self):
-        self.send_response(401)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("WWW-Authenticate", 'Basic realm="frp-monitor"')
-        self.send_header("Cache-Control", "no-store")
+    def _auth_failed(self, path):
+        """未认证：页面 302 跳登录页；接口 401 JSON（不带 WWW-Authenticate，
+        防浏览器对 SPA 的 fetch 弹原生 Basic 框；curl -u 不受影响）。"""
+        if path.startswith("/api/") or path.startswith("/attach/"):
+            return self.send_json(401, {"error": "unauthorized"})
+        self._redirect("/login")
+
+    def _redirect(self, loc):
+        self.send_response(302)
+        self.send_header("Location", loc)
+        self.send_header("Content-Length", "0")
         self.end_headers()
-        self.wfile.write(b'{"error": "unauthorized"}')
+
+    def _serve_login(self):
+        if not (PANEL_USER and PANEL_PASSWORD):
+            return self._redirect("/")  # 未启用认证：无登录页概念
+        page = _read_web("login.html")
+        if page is None:
+            return self.send_error(500, "web/login.html missing")
+        err_hidden = "" if "err" in parse_qs(urlsplit(self.path).query) else " hidden"
+        body = (page.decode("utf-8")
+                .replace("{{TITLE}}", html.escape(panel_title(), quote=False))
+                .replace("{{ERR_HIDDEN}}", err_hidden)
+                .encode("utf-8"))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_web_file(self, name):
+        # 只允许 web/ 下的扁平文件名（登录页静态资源）
+        if name != os.path.basename(name) or "/" in name or "\\" in name:
+            return self.send_error(404)
+        data = _read_web(name)
+        if data is None:
+            return self.send_error(404)
+        self.send_response(200)
+        self.send_header("Content-Type",
+                         mimetypes.guess_type(name)[0] or "application/octet-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _login_submit(self):
+        if not (PANEL_USER and PANEL_PASSWORD):
+            return self._redirect("/")
+        n = int(self.headers.get("Content-Length") or 0)
+        form = parse_qs(self.rfile.read(n).decode("utf-8", "replace") if n else "")
+        user = (form.get("username") or [""])[0].strip()
+        password = (form.get("password") or [""])[0]
+        ok = (hmac.compare_digest(user.encode("utf-8"), PANEL_USER.encode("utf-8"))
+              and hmac.compare_digest(password.encode("utf-8"), PANEL_PASSWORD.encode("utf-8")))
+        if not ok:
+            time.sleep(0.4)  # 轻微限速，挫败在线爆破
+            return self._redirect("/login?err=1")
+        self.send_response(303)
+        self.send_header("Set-Cookie",
+                         f"{SESSION_COOKIE}={_session_token()}; Path=/; HttpOnly; "
+                         f"SameSite=Lax; Max-Age={int(SESSION_TTL)}")
+        self.send_header("Location", "/")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _logout(self):
+        self.send_response(303)
+        self.send_header("Set-Cookie",
+                         f"{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+        self.send_header("Location", "/login")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def _json_body(self):
         n = int(self.headers.get("Content-Length") or 0)
@@ -6436,10 +6559,16 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if not self._authorized():
-            self.send_unauthorized()
-            return
         path = urlsplit(self.path).path
+        # 公共路由（无需认证）：登录页与其样式、登出
+        if path == "/login":
+            return self._serve_login()
+        if path == "/login.css":
+            return self._serve_web_file("login.css")
+        if path == "/logout":
+            return self._logout()
+        if not self._authorized():
+            return self._auth_failed(path)
         if path == "/api/upgrade/packages":
             # 包注册表（sha256 基准缓存）+ 计算中项（含进度）；不含签名 URL
             self.send_json(200, {"packages": packages_registry_view()})
@@ -6770,9 +6899,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlsplit(self.path).path
+        if path == "/login":
+            return self._login_submit()
+        if path == "/logout":
+            return self._logout()
         if not self._authorized():
-            self.send_unauthorized()
-            return
+            return self._auth_failed(path)
         if path == "/api/upgrade/packages/hash":
             # 触发服务端从 OSS 直连拉包计算 sha256（异步，拉完即删临时文件）
             try:
