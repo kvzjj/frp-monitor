@@ -4729,21 +4729,41 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
-
-    def _serve_web_file(self, name):
-        # 只允许 web/ 下的扁平文件名（登录页静态资源）
-        if name != os.path.basename(name) or "/" in name or "\\" in name:
+    def _serve_web_file(self, name, immutable=False):
+        # web/ 内静态文件（支持 assets/ 一级子目录，Vite 构建产物）；realpath 防目录穿越。
+        # immutable=True 用于带哈希文件名的构建产物，长缓存。
+        base = os.path.realpath(WEB_DIR)
+        fp = os.path.realpath(os.path.join(WEB_DIR, name))
+        if fp != base and not fp.startswith(base + os.sep):
             return self.send_error(404)
-        data = _read_web(name)
-        if data is None:
+        try:
+            with open(fp, "rb") as f:
+                data = f.read()
+        except OSError:
             return self.send_error(404)
         self.send_response(200)
         self.send_header("Content-Type",
                          mimetypes.guess_type(name)[0] or "application/octet-stream")
-        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Cache-Control",
+                         "public, max-age=31536000, immutable" if immutable else "no-cache")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def _serve_page(self, name):
+        """下发 web/ 下页面文件并注入运行时标题（Vue 入口 / classic 兜底 / 登录页）。"""
+        page = _read_web(name)
+        if page is None:
+            return self.send_error(500, f"web/{name} missing")
+        body = (page.decode("utf-8")
+                .replace("{{TITLE}}", html.escape(panel_title(), quote=False))
+                .encode("utf-8"))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _login_submit(self):
         if not (PANEL_USER and PANEL_PASSWORD):
@@ -4823,6 +4843,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._serve_web_file("app.css")
         if path == "/app.js":
             return self._serve_web_file("app.js")
+        if path.startswith("/assets/"):
+            # Vite 构建产物（web/assets/ 下带内容哈希，长缓存）
+            return self._serve_web_file(path.lstrip("/"), immutable=True)
         if path == "/logout":
             return self._logout()
         if not self._authorized():
@@ -5089,6 +5112,12 @@ class Handler(BaseHTTPRequestHandler):
             except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
                 self.send_json(502, {"error": str(exc), "hostname": hostname})
             return
+        if path == "/classic":
+            # 原 vanilla 版面板（迁移兑底，稳定后可下线）
+            return self._serve_page("classic.html")
+        if path == "/api/panel-title":
+            return self.send_json(200, {"title": panel_title(),
+                                        "source": _panel_title.get("source", "")})
         if path == "/api/collect-duration":
             qs = parse_qs(urlsplit(self.path).query)
             try:
@@ -5121,20 +5150,8 @@ class Handler(BaseHTTPRequestHandler):
                                  "hosts": store.uptime(hours)})
             return
         if path in ("/", "/index.html"):
-            # 前端已拆分至 web/index.html（静态下发，仅标题运行时注入）
-            page = _read_web("index.html")
-            if page is None:
-                return self.send_error(500, "web/index.html missing")
-            body = (page.decode("utf-8")
-                    .replace("{{TITLE}}", html.escape(panel_title(), quote=False))
-                    .encode("utf-8"))
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
+            # Vue 3 构建入口（frontend/ 工程产物，部署于 web/index.html + web/assets/）
+            return self._serve_page("index.html")
         self.send_error(404)
 
     def _sse(self):

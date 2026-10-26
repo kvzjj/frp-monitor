@@ -5,3 +5,7 @@ assets.sqlite*
 repairs.sqlite*
 repair-attachments/
 __pycache__/
+web/index.html
+web/assets/
+frontend/dist/
+frontend/node_modules/
