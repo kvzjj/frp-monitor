@@ -1,7 +1,7 @@
 <script setup>
 // 资产管理视图：总览仪表盘 / 硬件台账（360°）/ 维修看板（RepairsBoard）/ 版本视图 / 项目视图
 // 数据契约同后端 KVWO-83；接口 404 时按契约 mock（横幅明示）。逻辑自原 Assets.* 忠实平移。
-import { ref, reactive, computed, onActivated, onDeactivated, watch } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted, onActivated, onDeactivated, watch } from 'vue'
 import { api } from '../api'
 import { fmtClockOf, parseTs, natCmp } from '../format'
 import RepairsBoard from '../components/RepairsBoard.vue'
@@ -68,14 +68,16 @@ async function apiAssets(path) {
 function normDev(r, archived) {
   const on = r ? (r.device_online !== undefined ? r.device_online : r.online) : null
   return {
-    code: String(nByKey(r, ['device_code', 'device_id', 'code']) || '').trim(),
+    // 真实契约（KVWO-107 后）：device_no / note / modified_by / active_repairs；
+    // 候选键保留旧契约与 mock 形态兼容
+    code: String(nByKey(r, ['device_no', 'device_code', 'device_id', 'code']) || '').trim(),
     type: nByKey(r, ['device_type', 'type']), status: nByKey(r, ['status']),
     unit: nByKey(r, ['unit', 'organization']), parts: nByKey(r, ['accessories', 'parts']),
-    remark: nByKey(r, ['remark', 'note']), ledgerVer: nByKey(r, ['ledger_version', 'software_version']),
+    remark: nByKey(r, ['note', 'remark']), ledgerVer: nByKey(r, ['software_version', 'ledger_version']),
     detVer: nByKey(r, ['detected_version']),
     online: on === true ? true : (on === false ? false : null),
-    openRepairs: Number(nByKey(r, ['open_repairs', 'repair_count']) || 0),
-    updatedAt: nByKey(r, ['updated_at', 'last_updated']), modifier: nByKey(r, ['modifier']),
+    openRepairs: Number(nByKey(r, ['active_repairs', 'open_repairs', 'repair_count']) || 0),
+    updatedAt: nByKey(r, ['updated_at', 'last_updated']), modifier: nByKey(r, ['modified_by', 'modifier']),
     lastSeen: nByKey(r, ['last_seen', 'lastSeen']), idle: nByKey(r, ['idle']),
     archived: !!(archived || (r && r.archived))
   }
@@ -109,10 +111,21 @@ function normUnits(u) {
 
 function normVers(v) {
   const arr = a => Array.isArray(a) ? a : []
+  // 真实契约（KVWO-107 后）：detected_by_version/ledger_by_version 字典、
+  // ledger_no_version、match_counts.{matched,…}、match.{detected_only,ledger_missing}；
+  // 旧契约（detected/ledger 数组、顶层 matched 等）保留兼容
+  const dictBars = d => (d && typeof d === 'object' && !Array.isArray(d))
+    ? Object.entries(d).map(([version, count]) => ({ version, count })) : []
+  const detected = arr(v && v.detected).length ? arr(v && v.detected) : dictBars(v && v.detected_by_version)
+  const ledger = arr(v && v.ledger).length ? arr(v && v.ledger) : dictBars(v && v.ledger_by_version)
+  const mc = (v && v.match_counts) || {}
+  const mm = (v && v.match) || {}
   return {
-    detected: arr(v && v.detected), ledger: arr(v && v.ledger),
-    ledgerEmpty: nByKey(v, ['ledger_empty']), matched: nByKey(v, ['matched']),
-    detectedOnly: arr(v && v.detected_only), ledgerMissing: arr(v && v.ledger_missing),
+    detected, ledger,
+    ledgerEmpty: nByKey(v, ['ledger_no_version', 'ledger_empty']),
+    matched: mc.matched != null ? mc.matched : nByKey(v, ['matched']),
+    detectedOnly: Array.isArray(mm.detected_only) ? mm.detected_only : arr(v && v.detected_only),
+    ledgerMissing: Array.isArray(mm.ledger_missing) ? mm.ledger_missing : arr(v && v.ledger_missing),
     byProviderTop5: arr(v && v.by_provider_top5).map(p => ({
       unit: String(nByKey(p, ['unit', 'name']) || ''), total: nByKey(p, ['total', 'count']),
       versions: arr(p && p.versions).map(x => ({ version: nByKey(x, ['version']), count: nByKey(x, ['count']), share: nByKey(x, ['share']) }))
@@ -122,13 +135,16 @@ function normVers(v) {
 
 async function loadAll() {
   try {
+    // 归档：后端参数为 include_archived=1（原前端误发 archived=1，导致归档列表与在册重复）；
+    // 单次拉全量后按 archived 标志拆分（旧后端忽略该参数时退化为无归档，可接受）
     const res = await Promise.all([
       apiAssets('/api/assets/stats'), apiAssets('/api/assets/units'), apiAssets('/api/assets/versions'),
-      apiAssets('/api/assets'), apiAssets('/api/assets?archived=1')
+      apiAssets('/api/assets?include_archived=1')
     ])
     st.stats = normStats(res[0]); st.units = normUnits(res[1]); st.versions = normVers(res[2])
-    st.devices = (res[3] && (res[3].devices || res[3].items) || []).map(r => normDev(r, false)).filter(x => x.code)
-    st.archived = (res[4] && (res[4].devices || res[4].items) || []).map(r => normDev(r, true)).filter(x => x.code)
+    const all = (res[3] && (res[3].items || res[3].devices) || [])
+    st.devices = all.filter(r => !r.archived).map(r => normDev(r, false)).filter(x => x.code)
+    st.archived = all.filter(r => !!r.archived).map(r => normDev(r, true)).filter(x => x.code)
     st.err = ''; st.loaded = true; st.lastGoodAt = Date.now()
   } catch (e) { st.err = String(e.message || e) }
 }
@@ -154,7 +170,7 @@ const metricCards = computed(() => {
   return [
     { v: s.total, l: '在册总数', sub: '口径：设备明细表（不含归档）' },
     { v: s.archived, l: '归档（已拆解）', sub: '口径：设备归档数据表，不参与在册指标' },
-    { v: s.invTotal, l: '库存', sub: '口径：' + invLabel(), c: '#0f766e' },
+    { v: s.invTotal, l: '库存', sub: '口径：' + invLabel() + (s.invB != null ? '；参考：备注含「未使用」' + s.invB + ' 台' : ''), c: '#0f766e' },
     { v: s.deployed, l: '一线部署', sub: '口径：在册 − 库存（库存单位持有不计部署）' },
     { v: pctv(s.repairRate), l: '维修率', rate: 1, c: '#ea580c', sub: '计算式：(维修中 ' + n('维修中') + ' + 待维修 ' + n('待维修') + ') / 在册 ' + s.total },
     { v: pctv(s.damageRate), l: '损坏率', rate: 1, c: '#dc2626', sub: '计算式：(异常 ' + n('异常') + ' + 维修中 ' + n('维修中') + ' + 待维修 ' + n('待维修') + ') / 在册 ' + s.total },
@@ -210,7 +226,7 @@ const filterOptions = computed(() => {
   for (const u of st.units || []) um[u.unit] = u.total
   return {
     status: barEntries(s.byStatus, STATUS_ORDER),
-    type: barEntries(s.byType).map(e => [shortType(e[0]), e[1]]),
+    type: barEntries(s.byType),
     unit: Object.entries(um)
   }
 })
@@ -224,7 +240,7 @@ function sortDevs(list) {
 }
 
 const ledgerRows = computed(() => {
-  const hw = st.hw, q = hw.q
+  const hw = st.hw, q = hw.q.trim().toLowerCase()
   const match = d => {
     if (hw.status && d.status !== hw.status) return false
     if (hw.type && d.type !== hw.type) return false
@@ -307,7 +323,7 @@ function mockFor(path) {
   if (path.indexOf('/api/assets/stats') === 0) return M.stats
   if (path.indexOf('/api/assets/units') === 0) return { units: M.units }
   if (path.indexOf('/api/assets/versions') === 0) return M.versions
-  if (path.indexOf('/api/assets?') === 0) return { devices: M.archived, last_sync_at: M.lastSync }
+  if (path.indexOf('/api/assets?') === 0) return { devices: M.devices.concat(M.archived), last_sync_at: M.lastSync }
   if (path.indexOf('/api/assets/') === 0) {
     const code = decodeURIComponent(path.slice('/api/assets/'.length)).toLowerCase()
     const dev = M.devices.concat(M.archived).filter(x => x.device_code.toLowerCase() === code)[0]
@@ -339,7 +355,7 @@ function mockData() {
     devs.push({ device_code: code, device_type: type, status, unit, accessories: pickR(PARTS) + (rnd() < 0.5 ? '、' + pickR(PARTS) : ''), remark, ledger_version: null, detected_version: detVer, device_online: online, open_repairs: openRep, updated_at: new Date(base - k * 37 * 60000).toISOString(), modifier: pickR(['张伟', '李娜', '王强', '刘敏', '陈晨']) })
   }
   const arch = []
-  for (let i = 0; i < 69; i++) arch.push({ device_code: i === 49 ? 'ep-000298' : 'EP-' + String(249 + i).padStart(6, '0'), device_type: pickR(['EgoPortal-Stereo-V0', 'EgoPortal-Stereo-V1', 'EgoPortal-Lite']), status: '已拆解', unit: pickR(UNITS.map(u => u[0])), accessories: '', remark: '已拆解归档', ledger_version: null, detected_version: null, device_online: false, open_repairs: 0, updated_at: new Date(base - 400 * 3600000 - i * 3600000).toISOString(), modifier: '李娜' })
+  for (let i = 0; i < 69; i++) arch.push({ device_code: i === 49 ? 'ep-000298' : 'EP-' + String(249 + i).padStart(6, '0'), device_type: pickR(['EgoPortal-Stereo-V0', 'EgoPortal-Stereo-V1', 'EgoPortal-Lite']), status: '已拆解', unit: pickR(UNITS.map(u => u[0])), accessories: '', remark: '已拆解归档', ledger_version: null, detected_version: null, device_online: false, open_repairs: 0, updated_at: new Date(base - 400 * 3600000 - i * 3600000).toISOString(), modifier: '李娜', archived: true })
   const byStatus = {}, byType = {}, byUnit = {}
   for (const s of STATUS_ORDER) byStatus[s] = devs.filter(d => d.status === s).length
   for (const d of devs) { byType[d.device_type] = (byType[d.device_type] || 0) + 1; byUnit[d.unit] = (byUnit[d.unit] || 0) + 1 }
@@ -392,6 +408,20 @@ onActivated(() => {
   if (!refreshTimer) refreshTimer = setInterval(() => { if (st.loaded && !st.mock) loadAll() }, 60000)
 })
 onDeactivated(() => { if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null } })
+
+// hash 变化时同步子页签/筛选/下钻（App.vue 只切顶级视图；此处处理 #atab=/q=/unit= 深链）
+function onHashChange() {
+  const p = new URLSearchParams(location.hash.slice(1))
+  if (p.get('view') !== 'assets' && p.get('view') !== 'repairs') return
+  applyHash()
+}
+if (typeof window !== 'undefined') {
+  onMounted(() => window.addEventListener('hashchange', onHashChange))
+  onUnmounted(() => {
+    window.removeEventListener('hashchange', onHashChange)
+    if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null }
+  })
+}
 
 // 维修看板子页签携带 q（台账徽章跳转/深链）
 const repQuery = ref('')
@@ -462,7 +492,7 @@ watch(() => st.tab, t => {
         </select>
         <select id="asType" v-model="st.hw.type">
           <option value="">全部类型</option>
-          <option v-for="[k, n] in filterOptions.type" :key="k" :value="k">{{ k }}（{{ n }}）</option>
+          <option v-for="[k, n] in filterOptions.type" :key="k" :value="k">{{ shortType(k) }}（{{ n }}）</option>
         </select>
         <select id="asUnit" v-model="st.hw.unit">
           <option value="">全部单位</option>
@@ -704,10 +734,10 @@ watch(() => st.tab, t => {
               <tbody>
                 <tr v-for="(r, i) in (norm360().raw.repairs || [])" :key="i">
                   <td>{{ r.stage || '—' }}</td>
-                  <td class="wrap">{{ r.issue_description || r.issue || '—' }}</td>
-                  <td>{{ Array.isArray(r.repair_owners) ? r.repair_owners.join('、') : (r.repair_owners || r.owner || '—') }}</td>
+                  <td class="wrap">{{ r.issue_description || r.issue || r.problem || '—' }}</td>
+                  <td>{{ Array.isArray(r.repair_owners) ? r.repair_owners.join('、') : (r.repair_owners || r.owner || r.owner_name || '—') }}</td>
                   <td>{{ fmtClockOf(r.last_followed_at) || '—' }}</td>
-                  <td class="wrap">{{ r.last_follow_note || '—' }}</td>
+                  <td class="wrap">{{ r.last_follow_note || r.last_followup_note || '—' }}</td>
                 </tr>
                 <tr v-if="!(norm360().raw.repairs || []).length"><td colspan="5" class="eempty">暂无数据</td></tr>
               </tbody>
@@ -718,13 +748,13 @@ watch(() => st.tab, t => {
             <table class="astable">
               <thead><tr><th>动作</th><th>操作人</th><th>时间</th><th>说明</th></tr></thead>
               <tbody>
-                <tr v-for="(r, i) in (norm360().raw.flows || [])" :key="i">
+                <tr v-for="(r, i) in (norm360().raw.actions || norm360().raw.flows || [])" :key="i">
                   <td>{{ r.action || '—' }}</td>
-                  <td>{{ r.operator || '—' }}</td>
+                  <td>{{ r.operator || r.created_by || '—' }}</td>
                   <td>{{ fmtClockOf(r.ts || r.time || r.operated_at) || '—' }}</td>
                   <td class="wrap">{{ r.note || r.summary || '—' }}</td>
                 </tr>
-                <tr v-if="!(norm360().raw.flows || []).length"><td colspan="4" class="eempty">暂无数据</td></tr>
+                <tr v-if="!((norm360().raw.actions || norm360().raw.flows || [])).length"><td colspan="4" class="eempty">暂无数据</td></tr>
               </tbody>
             </table>
           </div>
@@ -733,14 +763,14 @@ watch(() => st.tab, t => {
             <table class="astable">
               <thead><tr><th>配件</th><th>到货状态</th><th>核对项</th><th>状态说明</th><th>核对时间</th></tr></thead>
               <tbody>
-                <tr v-for="(r, i) in (norm360().raw.parts || [])" :key="i">
+                <tr v-for="(r, i) in (norm360().raw.parts_checks || norm360().raw.parts || [])" :key="i">
                   <td>{{ r.part || r.accessory || '—' }}</td>
                   <td>{{ r.arrival || r.arrival_status || '—' }}</td>
                   <td>{{ r.item || r.check_item || '—' }}</td>
                   <td class="wrap">{{ r.note || r.status_note || '—' }}</td>
                   <td>{{ fmtClockOf(r.checked_at || r.time) || '—' }}</td>
                 </tr>
-                <tr v-if="!(norm360().raw.parts || []).length"><td colspan="5" class="eempty">暂无数据</td></tr>
+                <tr v-if="!((norm360().raw.parts_checks || norm360().raw.parts || [])).length"><td colspan="5" class="eempty">暂无数据</td></tr>
               </tbody>
             </table>
           </div>
@@ -751,10 +781,10 @@ watch(() => st.tab, t => {
                 <thead><tr><th>时间</th><th>所属单位</th><th>物品</th><th>数量</th><th>说明</th></tr></thead>
                 <tbody>
                   <tr v-for="(r, i) in norm360().raw.transfers" :key="i">
-                    <td>{{ fmtClockOf(r.ts || r.time) || '—' }}</td>
+                    <td>{{ fmtClockOf(r.ts || r.time || r.occurred_at) || '—' }}</td>
                     <td>{{ r.unit || '—' }}</td>
                     <td>{{ r.item || '—' }}</td>
-                    <td>{{ r.qty != null ? r.qty : '—' }}</td>
+                    <td>{{ r.qty != null ? r.qty : (r.quantity != null ? r.quantity : '—') }}</td>
                     <td class="wrap">{{ r.note || '—' }}</td>
                   </tr>
                 </tbody>
