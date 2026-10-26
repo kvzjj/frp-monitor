@@ -130,9 +130,9 @@ console.log('== 版本视图（真实契约 detected_by_version/match_counts）'
 location.hash = '#view=assets&atab=versions'
 win.dispatchEvent(new win.Event('hashchange'))
 await sleep(600)
-ok('探测分布 v0.4.6=4', $$('#asVersionBody .abar').some(el => el.textContent.includes('v0.4.6')))
-const vb = $('#asVersionBody')?.textContent || ''; console.log('  [debug] 版本视图前200字:', vb.slice(0, 200).replace(/\s+/g, ' ')); ok('匹配=4 / 台账未登记=248 / 探测不到=244', /4\s*版本匹配/.test(vb) && vb.includes('248') && vb.includes('244'))
-ok('ledger_missing 可展开', text().includes('展开设备列表'))
+ok('分布含 v0.4.6=121 与 v0.4.5=23（最后记录口径）', $$('#asVersionBody .abar').some(el => el.textContent.replace(/\s+/g,'').includes('v0.4.6121')) && $$('#asVersionBody .abar').some(el => el.textContent.replace(/\s+/g,'').includes('v0.4.523')))
+const vb = $('#asVersionBody')?.textContent || ''; ok('匹配=191 / 台账未登记248 / 从未接入=57', /191\s*版本匹配/.test(vb) && vb.includes('248') && vb.includes('57'))
+ok('ledger_missing 可展开 + 新口径文案', text().includes('展开设备列表') && text().includes('从未接入'))
 ok('服务商版本占比 5 家', $$('#asVersionBody .apanel').some(el => el.textContent.includes('主要服务商版本占比')))
 
 console.log('== 项目视图（9 个单位）')

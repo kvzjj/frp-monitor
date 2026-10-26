@@ -552,7 +552,7 @@ watch(() => st.tab, t => {
         <template v-else>
           <div class="adists">
             <div class="apanel">
-              <h3>探测版本分布（在线设备）</h3>
+              <h3>版本分布（按最后记录版本，含离线）</h3>
               <div v-for="(x, i) in versData.det" :key="i" class="abar">
                 <span class="albl2 mono">{{ x.version || '—' }}</span>
                 <div class="atrack"><i :style="{ width: ((x.count || 0) / versData.dmax * 100).toFixed(1) + '%' }"></i></div>
@@ -574,13 +574,13 @@ watch(() => st.tab, t => {
               <h3>台账 × 探测对照</h3>
               <div class="acards3">
                 <div><b>{{ versData.matched != null ? versData.matched : '—' }}</b>版本匹配</div>
-                <div><b>{{ versData.only.length }}</b>在线但台账未登记</div>
-                <div><b>{{ versData.miss.length }}</b>台账有但探测不到</div>
+                <div><b>{{ versData.only.length }}</b>有记录·台账未登记</div>
+                <div><b>{{ versData.miss.length }}</b>台账有·从未接入</div>
               </div>
-              <h4>detected_only · 在线但台账未登记</h4>
+              <h4>detected_only · 有版本记录但台账未登记</h4>
               <span v-for="(x, i) in versData.only" :key="i" class="chip2" :title="typeof x === 'string' ? x : (x.device_code || '')">{{ (typeof x === 'string' ? x : String(x.device_code || '')).toUpperCase() }}</span>
               <p v-if="!versData.only.length" class="eempty">无</p>
-              <h4>ledger_missing · 台账有但探测不到（离线 / 未部署）</h4>
+              <h4>ledger_missing · 台账有但从未接入（无任何 fleet 记录）</h4>
               <template v-if="versData.miss.length">
                 <p class="uhint">共 {{ versData.miss.length }} 台</p>
                 <details>
@@ -595,7 +595,7 @@ watch(() => st.tab, t => {
             </div>
             <div v-if="versData.t5.length" class="apanel">
               <h3>主要服务商版本占比（在册数前 5）</h3>
-              <p class="uhint" style="margin: 0 0 4px">口径：探测版本（未探测计入「未获取」桶） · 占比 = 台数 / 该单位在册数 · 统计时间：{{ fmtClockOf(st.stats && st.stats.lastSync) || '—' }}</p>
+              <p class="uhint" style="margin: 0 0 4px">口径：设备最后一次记录版本（含离线历史；无记录计入「未获取」桶） · 占比 = 台数 / 该单位在册数 · 统计时间：{{ fmtClockOf(st.stats && st.stats.lastSync) || '—' }}</p>
               <template v-for="p in versData.t5" :key="p.unit">
                 <h4>{{ p.unit }}（在册 {{ p.total != null ? p.total : '—' }} 台）</h4>
                 <div v-for="x in p.versions" :key="x.version" class="abar vbar" :title="p.unit + ' · ' + x.version + '：' + x.count + ' 台'">

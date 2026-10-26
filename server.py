@@ -4348,27 +4348,48 @@ def assets_units_view():
     return items
 
 
-def assets_versions_view():
-    """版本分布：探测版本计数 + 台账软件版本计数 + 按设备编号的匹配情况。
+def _asset_last_versions(snap):
+    """全量设备最后记录版本（版本视图统计基准，2026-10-26 需求变更）：
+    universe = 当前在线快照 ∪ MySQL 设备台账（含离线设备）；
+    每台取最后一次记录的版本（在线取当前探测，离线取历史最后已知），
+    从未上报过版本的记录为 None（前端归「未获取」桶）。"""
+    last_known = {}
+    if store.enabled:
+        with store.lock:
+            last_known = {str(h).strip().casefold(): (v or {}).get("version") or None
+                          for h, v in (store.state or {}).items()}
+    merged = {}
+    for key, info in (snap or {}).items():
+        merged[str(key)] = (info or {}).get("version") or None
+    for key, ver in last_known.items():
+        merged.setdefault(str(key), ver or None)
+    return merged
 
+
+def assets_versions_view():
+    """版本分布（统计基准 2026-10-26 变更：设备最后一次记录的版本，含离线）。
+
+    版本归属：当前在线取探测版本，离线取 MySQL 历史最后已知版本，
+    从未上报记「未获取」桶；不再只统计当前在线快照。
     匹配规则（大小写不敏感，见 _asset_fleet_lookup）：
-    - matched：在册（设备明细）且探测到（frps 快照在线）
-    - ledger_missing：在册但探测不到（离线 / 未部署 / 未接入 frps）
-    - detected_only：探测到但在册与归档均未登记
-    归档设备不计入 ledger_missing；探测版本计数覆盖全部快照主机
-    （版本空 =「未获取」桶，与面板总览一致）；台账软件版本当前全空时
-    ledger_by_version 如实返回空对象。
-    """
+    - matched：在册（设备明细）且 fleet 有过任何记录（在线或历史）
+    - ledger_missing：在册但从未被 fleet 记录过（真未接入；离线但有历史
+      版本的设备不再误归此类）
+    - detected_only：fleet 有记录但在册与归档均未登记
+    归档设备不计入 ledger_missing；by_provider_top5 同基准（每台按最后
+    记录版本分桶，无记录归「未获取」，share = count / 在册数）。"""
     online, version, snap = _asset_fleet_lookup()
     devices = asset_store.all_records("devices")
     archived = asset_store.all_records("archived")
     ledger = {_dev_key(d.get("device_no")): d for d in devices if d.get("device_no")}
     archived_keys = {_dev_key(d.get("device_no")) for d in archived if d.get("device_no")}
 
+    # 每台设备最后一次记录的版本（含离线；universe = 在线快照 ∪ 历史台账）
+    last_versions = _asset_last_versions(snap)
     detected_by_version = {}
-    for key, info in snap.items():
-        ver = info.get("version") or "未获取"
-        detected_by_version[ver] = detected_by_version.get(ver, 0) + 1
+    for ver in last_versions.values():
+        bucket = (ver or "").strip() or "未获取"
+        detected_by_version[bucket] = detected_by_version.get(bucket, 0) + 1
     ledger_by_version = {}
     ledger_no_version = 0
     for d in devices:
@@ -4378,23 +4399,22 @@ def assets_versions_view():
         else:
             ledger_no_version += 1
 
-    detected_keys = set(snap)
+    detected_keys = set(last_versions)
     matched = sorted(k for k in ledger if k in detected_keys)
     ledger_missing = sorted(k for k in ledger if k not in detected_keys)
     detected_only = sorted(k for k in detected_keys
                            if k not in ledger and k not in archived_keys)
-    # 主要服务商版本占比（KVWO-107 第六波）：在册数前 5 单位的探测版本分桶。
-    # 口径：版本取 frps 在线快照的探测版本，空版本/未探测（离线、未接入）
-    # 一律归「未获取」桶（与 detected_by_version 同桶名）；share = count /
-    # 该单位在册数（保留两位小数）；排序 = 在册数降序、并列按单位名稳定
-    # 排序（与 units 同规则），恰取前 5（不足 5 家如实返回全部）。
+    # 主要服务商版本占比（在册数前 5）：每台按最后记录版本分桶（含离线
+    # 历史版本；无任何记录归「未获取」桶）；share = count / 该单位在册数
+    # （保留两位小数）；排序 = 在册数降序、并列按单位名稳定排序（与 units
+    # 同规则），恰取前 5（不足 5 家如实返回全部）。
     units_ver = {}
     for d in devices:
         name = d.get("unit") or "(未填写)"
         u = units_ver.setdefault(name, {"total": 0, "by_version": {}})
         u["total"] += 1
-        info = snap.get(_dev_key(d.get("device_no")))
-        ver = (info.get("version") if info else None) or "未获取"
+        ver = ((last_versions.get(_dev_key(d.get("device_no"))) or "").strip()
+               or "未获取")
         u["by_version"][ver] = u["by_version"].get(ver, 0) + 1
     by_provider_top5 = []
     for name, u in sorted(units_ver.items(),
@@ -4407,7 +4427,8 @@ def assets_versions_view():
                                  "versions": versions})
     return {
         "detected_by_version": detected_by_version,
-        "detected_total": len(snap),
+        "detected_total": len(last_versions),
+        "version_basis": "last_recorded",
         "ledger_by_version": ledger_by_version,
         "ledger_registered": ledger_no_version + sum(ledger_by_version.values()),
         "ledger_no_version": ledger_no_version,
