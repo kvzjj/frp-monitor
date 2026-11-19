@@ -205,6 +205,21 @@ const ok = (name, cond) => { if (!cond) { console.error('FAIL: ' + name); proces
   // 复位到台账干净态（前面的深链把 q 带进来了）
   A.setTab('hardware'); A.fs.q = ''; FSx2.clear(A.fs); A.hw.page = 1;
   await A.applyLedger();
+  const lastFetch = () => fetchLog[fetchLog.length - 1];
+  // P1（返修）：多选 OR 不能先被后端单值参数截断 —— 走真实 applyLedger() 路径断言
+  FSx2.set(A.fs, 'status', ['维修中', '待维修']);
+  await A.applyLedger();
+  ok('P1 台账：多选状态不下发 status 参数（否则后端先按第一个值裁掉）', !lastFetch().includes('status='));
+  ok('P1 台账：多选状态 OR = 13 台（维修中 10 + 待维修 3）', A.ledgerRows().length === 13 && ['维修中', '待维修'].every(st => A.ledgerRows().some(d => d.status === st)));
+  FSx2.set(A.fs, 'status', ['维修中']);
+  await A.applyLedger();
+  ok('P1 台账：单选状态仍下发 status 做后端收窄', lastFetch().includes('status=' + encodeURIComponent('维修中')) && A.ledgerRows().length === A.devices.filter(d => d.status === '维修中').length);
+  // 单值字段下发 + 多值字段不下发（unit 收窄、status 由前端 OR）
+  FSx2.set(A.fs, 'status', ['维修中', '待维修']); FSx2.set(A.fs, 'unit', ['上海办公室']);
+  await A.applyLedger();
+  const expMix = A.devices.filter(d => d.unit === '上海办公室' && ['维修中', '待维修'].indexOf(d.status) >= 0).length;
+  ok('P1 台账：单值 unit 下发、多值 status 省略，结果=unit 子集内 status 的并集', lastFetch().includes('unit=') && !lastFetch().includes('status=') && A.ledgerRows().length === expMix && A.ledgerRows().every(d => d.unit === '上海办公室'));
+  FSx2.clear(A.fs); await A.applyLedger();
   // S2：同一字段多选 = 或，不同字段之间 = 且（硬件台账，248 台真实 mock 数据）
   FSx2.set(A.fs, 'status', ['维修中', '待维修']);
   const bothStatus = A.ledgerRows();

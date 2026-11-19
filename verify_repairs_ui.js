@@ -104,7 +104,16 @@ const fetchMock = async (p) => {
     if (mode === 'list404') return jresp(404, { error: 'not found' });
     if (mode === 'net') throw new TypeError('fetch failed');
     if (mode === 'empty') return jresp(200, { repairs: [] });
-    return jresp(200, { repairs: RECORDS });
+    // 与后端 repairs_list_view 同语义：stage/type/owner 精确、unit 包含（KVWO-115 返修 P1 要求 mock 遵守参数）
+    const qs = new URLSearchParams(String(p).split('?')[1] || '');
+    let rows = RECORDS.slice();
+    const st = qs.get('stage'), ty = qs.get('type'), un = qs.get('unit'), ow = qs.get('owner'), qq = qs.get('q');
+    if (st) rows = rows.filter(r => r.stage === st);
+    if (ty) rows = rows.filter(r => (r.device_type || '') === ty);
+    if (un) rows = rows.filter(r => String(r.unit || '').indexOf(un) >= 0);
+    if (ow) rows = rows.filter(r => (r.owner || '') === ow);
+    if (qq) { const ql = qq.toLowerCase(); rows = rows.filter(r => String(r.device_id || '').toLowerCase().indexOf(ql) >= 0 || String(r.problem || '').toLowerCase().indexOf(ql) >= 0); }
+    return jresp(200, { repairs: rows });
   }
   if (p.startsWith('/api/assets')) return jresp(404, null);
   if (p.startsWith('/api/hosts')) return jresp(502, { error: 'frps 不可用' });
@@ -247,6 +256,19 @@ const lastFetch = () => fetchLog[fetchLog.length - 1];
   FSx.set(R.fs, 'owner', ['刘希源']);
   const onlyLiu = R.filteredRows();
   ok('S2 维修：收窄到单人后结果变少', onlyLiu.length <= owners.length && onlyLiu.every(r => r.owner === '刘希源'));
+  // P1（返修）：多选 OR 不能先被后端单值参数截断 —— mock 现在遵守查询参数，能真正复现
+  FSx.clear(R.fs); FSx.set(R.fs, 'owner', ['刘希源', '张伟']);
+  R.setView('list'); await R.loadList();
+  const unionOwners = RECORDS.filter(r => ['刘希源', '张伟'].indexOf(r.owner) >= 0).length;
+  ok('P1 维修：多选负责人不下发 owner 参数（否则后端先按单值裁掉）', !lastFetch().includes('owner='));
+  ok('P1 维修：多选负责人 OR = 两人并集', R.filteredRows().length === unionOwners && unionOwners > 0 && R.filteredRows().every(r => ['刘希源', '张伟'].indexOf(r.owner) >= 0));
+  FSx.set(R.fs, 'owner', ['刘希源']); await R.loadList();
+  ok('P1 维修：单选负责人仍下发 owner 收窄（mock 已遵守参数）', lastFetch().includes('owner=' + encodeURIComponent('刘希源')) && R.rows.length === RECORDS.filter(r => r.owner === '刘希源').length);
+  FSx.clear(R.fs); FSx.set(R.fs, 'stage', ['待接收', '维修中']); await R.loadList();
+  ok('P1 维修：多选阶段（URL 手改场景）不下发 stage 且本地 OR', !lastFetch().includes('stage=') && R.filteredRows().length === RECORDS.filter(r => ['待接收', '维修中'].indexOf(r.stage) >= 0).length);
+  FSx.set(R.fs, 'stage', ['待接收']); FSx.set(R.fs, 'owner', ['刘希源', '张伟']); await R.loadList();
+  ok('P1 维修：单值阶段下发 + 多值负责人省略，结果=阶段子集内负责人并集', lastFetch().includes('stage=') && !lastFetch().includes('owner=') && R.filteredRows().length === RECORDS.filter(r => r.stage === '待接收' && ['刘希源', '张伟'].indexOf(r.owner) >= 0).length);
+  FSx.clear(R.fs); await R.loadList();
   // S6：内置快捷视图（超 7 天未跟进）
   FSx.clear(R.fs); FSx.set(R.fs, 'overdue', ['1']);
   const od = R.filteredRows();

@@ -473,7 +473,7 @@ input:focus,select:focus {
   display:flex;
   justify-content:space-between;
   color:var(--c-text-2);
-  padding-top:7px;
+  padding-top:var(--sp-2);
   font-size:13px;
   gap:8px;
 }
@@ -3759,16 +3759,26 @@ async loadAll(){
 /* F5：台账筛选走 /api/assets（单一真值），不再前端内存过滤整表。
  多选时后端只收单值（契约不变），先取单值子集，再由 ledgerRows() 按同一套 OR/AND 语义收口。 */
 async applyLedger(){
- const server=this.fs.q||FS.get(this.fs,'status').length||FS.get(this.fs,'type').length||FS.get(this.fs,'unit').length;
+ /* P1（KVWO-115 返修）：只有「单值」字段才下发给后端收窄。
+    后端 status/type/unit 是等值过滤，若把多选里的第一个值下发，其余值会先被后端裁掉，
+    前端再 OR 也补不回来。因此选中 ≥2 时该字段不下发，取回该字段完整集合后由
+    ledgerRows()/FS.match 在前端做 OR。 */
+ const seq=(this._ledgerSeq=(this._ledgerSeq||0)+1);   // 过期响应丢弃：连续改筛选时旧请求晚到不能覆盖新结果
+ const one=k=>{const v=FS.get(this.fs,k);return v.length===1?v[0]:''};
+ const server=this.fs.q||['status','type','unit'].some(k=>!!one(k));
  if(!server){this.ledgerData=null;this.hw.loading=false;this.renderLedger();return}
  this.hw.loading=true;this.renderLedger();
  const p=new URLSearchParams();p.set('include_archived','1');
  if(this.fs.q)p.set('q',this.fs.q);
- for(const k of ['status','type','unit']){const v=FS.get(this.fs,k);if(v.length)p.set(k,v[0])}
+ for(const k of ['status','type','unit']){const v=one(k);if(v)p.set(k,v)}
  try{
   const d=await this.api('/api/assets?'+p.toString());
+  if(seq!==this._ledgerSeq)return;
   this.ledgerData=this.normList(d,false);this.ledgerErr='';
- }catch(e){this.ledgerErr=String(e.message||e);this.ledgerData=[]}
+ }catch(e){
+  if(seq!==this._ledgerSeq)return;
+  this.ledgerErr=String(e.message||e);this.ledgerData=[];
+ }
  this.hw.loading=false;this.renderLedger();
 },
 mountFilter(){
@@ -4329,11 +4339,13 @@ hasFilter(){return !FS.isEmpty(this.fs)},
  多选的完整 OR 语义由 filteredRows() 本地收口。q 不下发：后端 q 只认编号/问题描述，
  本次要求扩到负责人且「后端零改动」，故 q 在前端按 设备编号/问题描述/负责人 三字段匹配。 */
 params(){
+ /* P1（KVWO-115 返修）：单值才下发后端收窄；字段选中 ≥2 时不下发，由 filteredRows() 做 OR。
+    阶段额外一条：看板视图不下发 stage（要看全部列，靠淡化表达），列表视图单值才下发。 */
  const p=new URLSearchParams();
- const first=k=>{const v=FS.get(this.fs,k);return v.length?v[0]:''};
- if(this.view==='list'&&this.stageF)p.set('stage',this.stageF);
- const t=first('type'),u=first('unit'),o=first('owner');
- if(t)p.set('type',t);if(u)p.set('unit',u);if(o)p.set('owner',o);
+ const one=k=>{const v=FS.get(this.fs,k);return v.length===1?v[0]:''};
+ const st=FS.get(this.fs,'stage');
+ if(this.view==='list'&&st.length===1)p.set('stage',st[0]);
+ for(const k of ['type','unit','owner']){const v=one(k);if(v)p.set(k,v)}
  const s=p.toString();return s?'?'+s:'';
 },
 isOverdue(r){return !r.done&&r.followMs&&(Date.now()-r.followMs)>7*864e5},
@@ -4395,15 +4407,20 @@ async loadStats(){
  this.renderStats();this.renderBanner();
 },
 async loadList(){
+ const seq=(this._listSeq=(this._listSeq||0)+1);   // 过期响应丢弃（连续改筛选/切视图）
  this.loading=true;this.render();
  try{
   const r=await fetch('/api/repairs'+this.params(),{cache:'no-store'});
   const d=await r.json().catch(()=>({}));
+  if(seq!==this._listSeq)return;
   if(!r.ok)throw Error(this.apiErr(r,d));
   this.rows=this.normList(d).map(x=>this.norm(x));
   if(!this.params()){this.all=this.rows}
   this.listErr='';
- }catch(e){this.listErr='维修数据加载失败：'+((e&&e.message)?e.message:String(e));this.rows=[]}
+ }catch(e){
+  if(seq!==this._listSeq)return;
+  this.listErr='维修数据加载失败：'+((e&&e.message)?e.message:String(e));this.rows=[];
+ }
  this.loading=false;this.render();
 },
 load(){this.loadStats();this.loadList()},
@@ -4436,7 +4453,7 @@ renderStats(){
  for(const st of this.STAGES){const n=by?num(by[st]):null;h+='<span class="chip rchip" data-stage="'+esc(st)+'" style="--c:'+(this.SC[st]||'var(--c-muted-2)')+'">'+esc(st)+' <b>'+(n!=null?n:'—')+'</b></span>'}
  this.gid('repStageStats').innerHTML=h;
  this.gid('repStageStats').querySelectorAll('.rchip').forEach(c=>{
-  c.classList.toggle('on',this.stageF===c.dataset.stage);
+  c.classList.toggle('on',FS.has(this.fs,'stage',c.dataset.stage));
   c.onclick=()=>{   // 与看板列头、列表下拉写同一个 stage 条件（F6：阶段单入口）
    this.stageF=(this.stageF===c.dataset.stage)?'':c.dataset.stage;
    this.writeFilterUrl();this.loadList();
@@ -4462,7 +4479,7 @@ renderKanban(){
  for(const r of rows){const st=r.stage||'未填写阶段';if(!seen.has(st)){seen.add(st);cols.push(st)}}
  const groups=new Map();for(const st of cols)groups.set(st,[]);
  for(const r of rows)groups.get(r.stage||'未填写阶段').push(r);
- const picked=this.stageF;   // F6：阶段条件在看板下的表达 = 其余列淡化（保留上下文），不隐藏
+ const picked=FS.get(this.fs,'stage');   // F6：阶段条件在看板下的表达 = 其余列淡化（保留上下文），不隐藏；支持多值
  let h='';
  if(this.loading&&!this.rows.length)h+='<p class="uempty rkanhint">加载中…</p>';
  else if(!rows.length&&this.hasFilter())h+='<p class="uempty rkanhint">没有匹配的维修记录——调整筛选或搜索词，或点「重新加载」</p>';
@@ -4470,8 +4487,8 @@ renderKanban(){
  for(const st of cols){
   const list=groups.get(st).slice().sort((a,b)=>(b.followMs||0)-(a.followMs||0));
   const c=this.SC[st]||'var(--c-muted-2)';
-  const dim=(picked&&picked!==st)?' rdim':'';
-  const on=(picked===st)?' on':'';
+  const dim=(picked.length&&picked.indexOf(st)<0)?' rdim':'';
+  const on=(picked.indexOf(st)>=0)?' on':'';
   h+='<div class="rkcol'+dim+'" data-col="'+esc(st)+'"><h3 class="rkhead'+on+'" data-stage="'+esc(st)+'" title="点击按该阶段筛选（再点取消）"><span class="rkt" style="--c:'+c+'">'+esc(st)+'</span><span class="rkn">'+list.length+'</span></h3>'+(list.length?list.map(r=>this.cardHtml(r)).join(''):'<div class="rkempty">'+(dim?'已按阶段筛选':'暂无')+'</div>')+'</div>';
  }
  el.innerHTML=h;

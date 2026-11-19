@@ -166,8 +166,9 @@ active_repairs 与既有 API 交叉一致；日报状态端点/手动推送文�
   共用同一个筛选条组件与同一套条件语义。
 - **状态入 URL**：`#view=…&atab=…&q=…&f=字段:值,值;字段:值&sort=key:dir&density=dense`。
   值走 `encodeURIComponent`，可直接手改与转发；用 `history.replaceState` 写入（不塞历史）。
-- **台账筛选走接口**：`status`/`type`/`unit` 每次取*第一个*选中值下发给 `/api/assets`
-  （后端契约单值），多选的完整 OR 语义在前端按同一套规则收口；
+- **台账筛选走接口**：`status`/`type`/`unit` **只有单选（1 个值）时**才下发给 `/api/assets`
+  做后端收窄；某字段选中 **≥2 个值时不传该参数**（后端是等值过滤，传第一个值会把其余值裁掉，
+  前端再 OR 也补不回来），取回该字段的完整集合后由前端按同一套 OR 语义收口；
   `GET /api/assets?include_archived=1` 一次取回在册 + 归档，前端按 `archived` 标记拆分。
   原实现额外请求 `?archived=1`，但该参数后端不识别（只认 `include_archived`），
   会拿回全部在册设备 —— 本次一并修正。
