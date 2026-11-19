@@ -115,7 +115,7 @@ const ctx = { document, window, location, history, fetch: fetchMock, setInterval
   alert: () => {}, navigator: { clipboard: { writeText: async () => true } } };
 ctx.globalThis = ctx;
 vm.createContext(ctx);
-vm.runInContext(js + "\n;globalThis.__T={Assets:Assets,Upg:Upg,Rep:Rep};", ctx);
+vm.runInContext(js + "\n;globalThis.__T={Assets:Assets,Upg:Upg,Rep:Rep,FS:FS,ovFs:()=>ovFs,FilterBar:FilterBar,UpgT:Upg};", ctx);
 
 const A = ctx.__T.Assets, UpgT = ctx.__T.Upg, R = ctx.__T.Rep;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -152,7 +152,7 @@ const lastFetch = () => fetchLog[fetchLog.length - 1];
   R.doneOpen = true; R.renderList();
   ok('列表：展开已完结（文案带计数）', !el('repDoneTable').hidden && el('repDoneToggle').textContent.includes('已完结记录（16）'));
   R.doneOpen = false; R.renderList();
-  ok('列表：行内阶段标签配色 + 编号等宽样式', tb.includes('style="--c:#dc2626"') && tb.includes('class="rdev"'));
+  ok('列表：行内阶段标签配色（走 --c-danger token）+ 编号等宽样式', tb.includes('style="--c:var(--c-danger)"') && tb.includes('class="rdev"'));
   // ---- 筛选与搜索传参（查询参数走 API，与后端筛选一致） ----
   R.q = 'EP-000101'; await R.loadList();
   ok('搜索：?q= 精确传参', lastFetch() === '/api/repairs?q=EP-000101');
@@ -207,7 +207,8 @@ const lastFetch = () => fetchLog[fetchLog.length - 1];
   // 台账在线/离线徽章点击 → 跳设备总览定位（重置状态筛选为全部）
   el('statusFilter').value = 'online';
   R.jumpDevice('EP-000101');
-  ok('在线徽章跳设备总览：搜索词代入 + 状态筛选重置 + 视图切换', UpgT.view === 'overview' && !el('viewOverview').hidden && el('q').value === 'EP-000101' && el('statusFilter').value === 'all');
+  // F4：总览筛选改为统一模型（ovFs），跳转=清空条件+关键词；不再有 statusFilter 下拉
+  ok('在线徽章跳设备总览：搜索词代入 + 筛选条件清空 + 视图切换', UpgT.view === 'overview' && !el('viewOverview').hidden && el('q').value === 'EP-000101' && ctx.__T.ovFs().q === 'ep-000101' && Object.keys(ctx.__T.ovFs().conds).length === 0);
   const cnt0 = fetchLog.filter(p => p.startsWith('/api/repairs/stats')).length;
   A.setTab('hardware'); for (const fn of intervals) fn(); await sleep(80);
   const cnt1 = fetchLog.filter(p => p.startsWith('/api/repairs/stats')).length;

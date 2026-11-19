@@ -224,9 +224,10 @@ INDEX = """<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=
 <nav id=viewTabs class=vtabs><button type=button data-view=overview class=on>设备总览</button><button type=button data-view=assets>资产</button><button type=button data-view=upgrade>升级</button></nav>
 <section id=viewOverview>
 <section class=summary><div><b id=online>0</b><span>在线设备</span></div><div><b id=registered>0</b><span>登记设备</span></div><div><b id=pendingN>0</b><span id=targetLbl>待升级</span></div><div><b id=sitesN>0</b><span>站点</span></div><div><b id=missingN>0</b><span>未上线</span></div></section>
-<div class=toolbar><input id=q placeholder="搜索 hostname / device_id / 设备名 / IP"><select id=statusFilter><option value=all>全部状态</option><option value=online selected>仅在线</option><option value=offline>仅未上线</option></select><select id=targetSel title="升级目标版本"></select><button id=copyPending class=listbtn title="按当前筛选（站点/状态/版本/搜索）复制：设备号 站点 IP SSH端口 device_id 当前版本">复制待升级清单</button><button id=copyCmds class=listbtn title="按当前筛选复制 SSH 跳板登录命令">复制跳板命令</button><button id=copyList class=listbtn title="按当前筛选复制设备编号">复制编号</button></div>
-<nav id=sites class=sitesbar></nav>
-<nav id=vers class=sitesbar></nav>
+<section id=ovFilter></section>
+<nav id=sites class="sitesbar fchips" aria-label="站点筛选（可多选）"></nav>
+<nav id=vers class="sitesbar fchips" aria-label="版本筛选（可多选）"></nav>
+<div class=parambar><span class=plbl>升级目标版本</span><select id=targetSel title="口径参数：判定「待升级」的目标版本，不是筛选条件"></select><span class=uhint>口径参数，不是筛选条件</span><span class=pbtns><button id=copyPending class=listbtn title="按当前筛选（站点/状态/版本/搜索）复制：设备号 站点 IP SSH端口 device_id 当前版本">复制待升级清单</button><button id=copyCmds class=listbtn title="按当前筛选复制 SSH 跳板登录命令">复制跳板命令</button><button id=copyList class=listbtn title="按当前筛选复制设备编号">复制编号</button></span></div>
 <div id=grid class=grid></div>
 <section id=events><h2>最近事件（24 小时）</h2><div id=eventsBody class=elist><p class=eempty>加载中…</p></div></section>
 </section>
@@ -1957,6 +1958,386 @@ small {
 }
 .twrap table th:first-child,.twrap table td:first-child {
   padding-left:var(--sp-3);
+}
+/* ---- F3 筛选条（FilterBar）：搜索 + 多选下拉 + 清空 + 结果计数 + 条件标签行 + 快捷视图 ---- */
+.fbar {
+  position:sticky;
+  top:0;
+  z-index:20;
+  background:var(--c-bg);
+  padding:var(--sp-2) 0 var(--sp-1);
+  margin:0 0 var(--sp-3);
+}
+.frow {
+  display:flex;
+  gap:var(--sp-2);
+  align-items:center;
+  flex-wrap:wrap;
+}
+.fsearch {
+  display:flex;
+  align-items:center;
+  gap:var(--sp-2);
+  flex:1;
+  min-width:220px;
+  background:var(--c-surface);
+  border:1px solid var(--c-border-strong);
+  border-radius:var(--sp-2);
+  padding:0 var(--sp-2);
+  height:36px;
+}
+.fsearch i {
+  font-style:normal;
+  opacity:.55;
+}
+.fsearch input {
+  border:0;
+  outline:none;
+  flex:1;
+  min-width:0;
+  height:34px;
+  padding:0;
+  font-size:var(--fs-body);
+  background:transparent;
+}
+.fbtn {
+  display:inline-flex;
+  align-items:center;
+  gap:var(--sp-1);
+  height:36px;
+  padding:0 var(--sp-3);
+  background:var(--c-surface);
+  border:1px solid var(--c-border-strong);
+  color:var(--c-text-2);
+  border-radius:var(--sp-2);
+  font-size:var(--fs-body);
+  white-space:nowrap;
+}
+.fbtn:hover {
+  border-color:var(--c-brand);
+  color:var(--c-brand);
+}
+.fbtn.on {
+  border-color:var(--c-brand);
+  color:var(--c-brand);
+  background:var(--c-info-bg);
+}
+.fbtn b {
+  background:var(--c-brand);
+  color:var(--c-surface);
+  border-radius:var(--radius-pill);
+  font-size:var(--fs-mini);
+  padding:0 var(--sp-1);
+  min-width:18px;
+  text-align:center;
+}
+.fcav {
+  font-style:normal;
+  font-size:10px;
+  opacity:.6;
+}
+.fmore {
+  position:relative;
+  display:inline-flex;
+}
+.fpop {
+  position:absolute;
+  z-index:40;
+  top:calc(100% + var(--sp-1));
+  left:0;
+  min-width:220px;
+  max-height:320px;
+  overflow:auto;
+  background:var(--c-surface);
+  border:1px solid var(--c-border);
+  border-radius:var(--radius);
+  box-shadow:0 12px 32px var(--c-shadow-strong);
+  padding:var(--sp-2);
+}
+.fbar>.fpop {
+  position:relative;
+  top:0;
+  box-shadow:none;
+  border-radius:var(--radius);
+  margin-top:var(--sp-2);
+  max-height:none;
+}
+.fpophead {
+  display:flex;
+  align-items:baseline;
+  gap:var(--sp-2);
+  padding:0 var(--sp-1) var(--sp-2);
+  border-bottom:1px solid var(--c-line);
+  margin-bottom:var(--sp-1);
+}
+.fpophead small {
+  color:var(--c-text-3);
+  font-size:var(--fs-mini);
+}
+.fpopx {
+  margin-left:auto;
+  background:var(--c-surface-3);
+  color:var(--c-text-2);
+  padding:2px var(--sp-2);
+  font-size:var(--fs-mini);
+}
+.fopt {
+  display:flex;
+  align-items:center;
+  gap:var(--sp-2);
+  padding:var(--sp-1) var(--sp-2);
+  border-radius:var(--sp-1);
+  font-size:var(--fs-body);
+  cursor:pointer;
+  white-space:nowrap;
+}
+.fopt:hover {
+  background:var(--c-surface-3);
+}
+.fopt input {
+  accent-color:var(--c-brand);
+  width:15px;
+  height:15px;
+  flex:none;
+}
+.fopt span {
+  flex:1;
+  overflow:hidden;
+  text-overflow:ellipsis;
+}
+.fopt b {
+  color:var(--c-text-3);
+  font-weight:400;
+  font-variant-numeric:tabular-nums;
+}
+.foptwrap {
+  display:flex;
+  flex-wrap:wrap;
+  gap:var(--sp-1);
+}
+.fempty {
+  margin:0;
+  padding:var(--sp-2);
+  color:var(--c-text-3);
+  font-size:var(--fs-mini);
+}
+.fclear {
+  height:36px;
+  padding:0 var(--sp-3);
+  background:var(--c-surface);
+  border:1px solid var(--c-border-strong);
+  color:var(--c-text-2);
+  font-size:var(--fs-body);
+}
+.fclear:disabled {
+  opacity:.45;
+  cursor:not-allowed;
+}
+.fres {
+  margin-left:auto;
+  color:var(--c-text-3);
+  font-size:var(--fs-mini);
+  white-space:nowrap;
+  font-variant-numeric:tabular-nums;
+}
+.fsc {
+  display:flex;
+  gap:var(--sp-2);
+  align-items:center;
+  flex-wrap:wrap;
+  margin-top:var(--sp-2);
+}
+.fsc>span {
+  color:var(--c-text-3);
+  font-size:var(--fs-mini);
+}
+.fscbtn {
+  background:var(--c-surface);
+  border:1px dashed var(--c-border-strong);
+  color:var(--c-text-2);
+  border-radius:var(--radius-pill);
+  padding:var(--sp-1) var(--sp-3);
+  font-size:var(--fs-mini);
+}
+.fscbtn:hover {
+  border-style:solid;
+  border-color:var(--c-brand);
+  color:var(--c-brand);
+}
+.ftags {
+  display:flex;
+  align-items:center;
+  gap:var(--sp-2);
+  flex-wrap:wrap;
+  margin-top:var(--sp-2);
+  min-height:22px;
+}
+.ftagsl {
+  color:var(--c-text-3);
+  font-size:var(--fs-mini);
+}
+.ftag {
+  display:inline-flex;
+  align-items:center;
+  gap:var(--sp-1);
+  background:var(--c-info-bg);
+  border:1px solid var(--c-info-border);
+  color:var(--c-brand-hover);
+  border-radius:var(--radius-pill);
+  padding:1px var(--sp-2);
+  font-size:var(--fs-mini);
+}
+.ftag button {
+  background:transparent;
+  color:inherit;
+  padding:0 2px;
+  font-size:var(--fs-mini);
+  line-height:1;
+  border-radius:var(--radius-pill);
+}
+.ftag button:hover {
+  background:var(--c-info-border);
+}
+.fsheetbtn {
+  display:none;
+}
+.fsheet {
+  display:none;
+}
+.fsheet.show {
+  display:block;
+  position:fixed;
+  inset:0;
+  z-index:60;
+  background:var(--c-overlay);
+  padding:var(--sp-4);
+  overflow:auto;
+}
+.fsheetbox {
+  background:var(--c-surface);
+  border-radius:var(--radius-lg);
+  padding:var(--sp-4);
+  max-height:calc(100vh - 64px);
+  overflow:auto;
+}
+.fsheethead {
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  margin-bottom:var(--sp-3);
+}
+.fsheethead b {
+  font-size:var(--fs-section);
+}
+.fsheetfield {
+  border-top:1px solid var(--c-line);
+  padding:var(--sp-2) 0;
+}
+.fsheetfield h4 {
+  margin:0 0 var(--sp-1);
+  font-size:var(--fs-body);
+  color:var(--c-text-2);
+  display:flex;
+  gap:var(--sp-1);
+  align-items:baseline;
+}
+.fsheetfield h4 small {
+  color:var(--c-text-3);
+  font-weight:400;
+  font-size:var(--fs-mini);
+}
+.fsheetfield .foptwrap {
+  margin-top:var(--sp-1);
+}
+.fsheetfoot {
+  display:flex;
+  gap:var(--sp-2);
+  justify-content:flex-end;
+  padding-top:var(--sp-3);
+  border-top:1px solid var(--c-line);
+}
+.fsheetok {
+  background:var(--c-brand);
+}
+/* ---- 分页条 / 表格工具条 / 骨架屏 ---- */
+.pager {
+  display:flex;
+  align-items:center;
+  gap:var(--sp-2);
+  margin-top:var(--sp-3);
+  flex-wrap:wrap;
+  font-size:var(--fs-mini);
+  color:var(--c-text-3);
+}
+.pager button {
+  background:var(--c-surface);
+  border:1px solid var(--c-border-strong);
+  color:var(--c-text-2);
+  padding:var(--sp-1) var(--sp-3);
+  font-size:var(--fs-mini);
+}
+.pager button.on {
+  background:var(--c-brand);
+  border-color:var(--c-brand);
+  color:var(--c-surface);
+}
+.pager button:disabled {
+  opacity:.45;
+  cursor:not-allowed;
+}
+.tbarbtns {
+  display:flex;
+  gap:var(--sp-2);
+  align-items:center;
+  flex-wrap:wrap;
+}
+.skeleton {
+  background:linear-gradient(90deg,var(--c-surface-3) 25%,var(--c-surface-2) 37%,var(--c-surface-3) 63%);
+  background-size:400% 100%;
+  animation:skshine 1.2s ease-in-out infinite;
+  border-radius:var(--sp-1);
+  height:12px;
+}
+/* ---- F4 总览：站点/版本 chips 行 + 口径参数条 ---- */
+.fchips {
+  margin:0 0 var(--sp-2);
+}
+.fchips .chip {
+  font-size:var(--fs-body);
+}
+.parambar {
+  display:flex;
+  align-items:center;
+  gap:var(--sp-2);
+  flex-wrap:wrap;
+  margin:0 0 var(--sp-4);
+  padding-top:var(--sp-2);
+  border-top:1px dashed var(--c-line);
+}
+.parambar .plbl {
+  font-weight:600;
+  color:var(--c-text-2);
+  font-size:var(--fs-body);
+}
+.parambar select {
+  min-width:160px;
+}
+.parambar .uhint {
+  margin:0;
+}
+.parambar .pbtns {
+  margin-left:auto;
+  display:flex;
+  gap:var(--sp-2);
+  flex-wrap:wrap;
+}
+@keyframes skshine {
+  0% {
+    background-position:100% 0;
+  }
+  100% {
+    background-position:0 0;
+  }
 }"""
 JS = """const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
@@ -1971,53 +2352,231 @@ async function copyText(text){
 function pct(v){return v==null?'—':(Math.round(v*1000)/10)+'%'}
 function fmtDuration(m){if(m==null||isNaN(m))return '—';m=Math.round(m);if(m<=0)return '0分钟';const h=Math.floor(m/60),r=m%60;if(h&&r)return h+'小时'+r+'分';if(h)return h+'小时';return r+'分钟'}
 function fmtHours(m){return m==null||isNaN(m)?'—':(m/60).toFixed(1)+'h'}
-let fleet=[],sites=[],versions=[],sshHint={},q='',siteFilter='',verFilter='',targetVer='',pendingOnly=false,statusFilter='online',refreshInterval=15;
+/* ================= F3：统一筛选模型 FilterState + 筛选条组件 FilterBar + URL 序列化 =================
+ 心智模型（全站唯一）：同一字段多选 = 或（OR），不同字段之间 = 且（AND）。
+ 字段注册表由各视图在 mount 时声明；筛选条只负责收集条件、显示计数与条件标签，不碰数据渲染。
+ 状态入 URL：q=关键词 & f=字段:值,值;字段:值 & sort=key:dir & density=cozy|dense（值走 encodeURIComponent，可手改）。
+ 说明：方案 3.4 写的是 replaceState 节流 300ms；实测 replaceState 成本极低，且节流会让 URL
+ 与界面短暂不一致，这里改为「每次变更立即 replaceState」，语义与退行为都不变。 */
+const FS={
+ empty(){return{q:'',conds:{}}},
+ clone(fs){const c={};for(const k in ((fs&&fs.conds)||{}))c[k]=(fs.conds[k]||[]).slice();return{q:(fs&&fs.q)||'',conds:c}},
+ get(fs,f){return (((fs&&fs.conds)||{})[f]||[]).slice()},
+ set(fs,f,vals){vals=(vals||[]).filter(v=>v!=null&&v!=='');fs.conds=fs.conds||{};if(vals.length)fs.conds[f]=vals;else delete fs.conds[f];return fs},
+ toggle(fs,f,v){const cur=this.get(fs,f),i=cur.indexOf(v);if(i>=0)cur.splice(i,1);else cur.push(v);return this.set(fs,f,cur)},
+ has(fs,f,v){return this.get(fs,f).indexOf(v)>=0},
+ clear(fs){fs.q='';fs.conds={};return fs},
+ activeCount(fs){let n=(fs&&fs.q)?1:0;for(const k in ((fs&&fs.conds)||{}))n+=((fs.conds[k]||[]).length?1:0);return n},
+ isEmpty(fs){return !(fs&&fs.q)&&!Object.keys((fs&&fs.conds)||{}).length},
+ /* row(field) 返回该行在该字段上的取值：字符串 / 布尔 / 数组；数组表示「一行命中多个值」，任一命中即算 */
+ match(fs,row){
+  for(const f in ((fs&&fs.conds)||{})){
+   const want=fs.conds[f];if(!want||!want.length)continue;
+   const has=row(f);const arr=Array.isArray(has)?has.map(String):[String(has)];
+   if(!want.some(v=>arr.indexOf(String(v))>=0))return false
+  }
+  return true
+ },
+ encode(fs){const out=[];for(const f in ((fs&&fs.conds)||{})){const vs=(fs.conds[f]||[]).filter(Boolean);if(vs.length)out.push(f+':'+vs.map(encodeURIComponent).join(','))}return out.join(';')},
+ decode(s){const fs=this.empty();String(s||'').split(';').forEach(seg=>{const i=seg.indexOf(':');if(i<=0)return;const f=seg.slice(0,i);let vs=[];try{vs=seg.slice(i+1).split(',').filter(Boolean).map(decodeURIComponent)}catch(e){}this.set(fs,f,vs)});return fs}
+};
+const URLState={
+ params(){return new URLSearchParams(location.hash.slice(1))},
+ write(patch){const p=this.params();for(const k in patch){const v=patch[k];if(v==null||v==='')p.delete(k);else p.set(k,v)}const s=p.toString();history.replaceState(null,'',location.pathname+location.search+(s?'#'+s:''));return s},
+ readFs(){const p=this.params();const fs=FS.decode(p.get('f'));fs.q=p.get('q')||'';return fs},
+ readSort(){const s=this.params().get('sort')||'';const i=s.indexOf(':');return i<=0?{key:'',dir:1}:{key:s.slice(0,i),dir:s.slice(i+1)==='desc'?-1:1}},
+ sortStr(s){return s&&s.key?s.key+':'+(s.dir>0?'asc':'desc'):''}
+};
+/* 筛选条组件：搜索 + 多选下拉（带计数）+ 清空 + 结果计数 + 条件标签行 + 内置快捷视图
+ spec={fs, placeholder, fields:[{key,label,values:[{v,label,count}],more}], shortcuts:[{label,conds,q}],
+       resultText(fs), onChange(fs), emptyHint} */
+const FilterBar={
+ mount(hostId,spec){
+  const host=document.getElementById(hostId);if(!host)return null;
+  const fb={id:hostId,spec,fs:spec.fs||FS.empty(),open:null,qT:null};
+  host.classList.add('fbar');
+  host.addEventListener('click',e=>this.onClick(fb,e));
+  host.addEventListener('change',e=>this.onChange(fb,e));
+  host.addEventListener('input',e=>this.onInput(fb,e));
+  this.render(fb);return fb;
+ },
+ fields(fb){const f=fb.spec.fields;return typeof f==='function'?f():f},
+ fbtn(fb,f){
+  const n=FS.get(fb.fs,f.key).length;
+  return `<button type=button class="fbtn${n?' on':''}" data-f="${esc(f.key)}" title="${esc(f.label)}：多选，同字段内为「或」">${esc(f.label)}${n?` <b>${n}</b>`:''} <i class=fcav>▾</i></button>`
+ },
+ pop(fb,f){
+  const vals=f.values||[];
+  return `<div class=fpop data-pop="${esc(f.key)}">`
+   +`<div class=fpophead><b>${esc(f.label)}</b><small>同字段多选 = 或（OR）</small><button type=button class=fpopx data-popclose=1 title="关闭">✕</button></div>`
+   +(vals.length?vals.map(o=>`<label class=fopt><input type=checkbox data-f="${esc(f.key)}" data-v="${esc(o.v)}" ${FS.has(fb.fs,f.key,o.v)?'checked':''}><span>${esc(o.label!=null?o.label:o.v)}</span><b>${o.count!=null?o.count:''}</b></label>`).join(''):'<p class=fempty>无可选项</p>')
+   +`</div>`
+ },
+ markup(fb){
+  const fields=this.fields(fb),main=fields.filter(f=>!f.more),more=fields.filter(f=>f.more);
+  const n=FS.activeCount(fb.fs),res=fb.spec.resultText?fb.spec.resultText(fb.fs):'';
+  let tags=[];
+  if(fb.fs.q)tags.push(`<span class=ftag>关键词「${esc(fb.fs.q)}」<button type=button data-tag="__q" title="移除该条件">✕</button></span>`);
+  for(const f of fields)for(const v of FS.get(fb.fs,f.key)){
+   const o=(f.values||[]).filter(x=>String(x.v)===String(v))[0];
+   const lbl=o?(o.label!=null?o.label:o.v):v;
+   tags.push(`<span class=ftag>${esc(f.label)} ${esc(lbl)}<button type=button data-tag="${esc(f.key)}" data-val="${esc(v)}" title="移除该条件">✕</button></span>`);
+  }
+  const moreOpen=fb.open&&more.some(f=>f.key===fb.open);
+  return '<div class=frow>'
+   +`<label class=fsearch><i>🔍</i><input id="${esc(fb.spec.inputId||('fq-'+fb.id))}" class=fq type=search value="${esc(fb.fs.q||'')}" placeholder="${esc(fb.spec.placeholder||'搜索')}" autocomplete=off spellcheck=false></label>`
+   +main.map(f=>this.fbtn(fb,f)).join('')
+   +(more.length?`<span class=fmore>${this.fbtn(fb,{key:'__more',label:'更多'})}${moreOpen?more.map(f=>this.pop(fb,f)).join(''):''}</span>`:'')
+   +`<button type=button class=fclear data-clear ${n?'':'disabled'}>清空</button>`
+   +`<span class=fres>${res}</span>`
+   +`<button type=button class=fsheetbtn data-fsheet=1>筛选${n?` (${n})`:''}</button>`
+   +'</div>'
+   +(fb.spec.shortcuts&&fb.spec.shortcuts.length?('<div class=fsc><span>快捷视图</span>'+fb.spec.shortcuts.map((s,i)=>`<button type=button class=fscbtn data-sc="${i}" title="${esc(this.shortcutHint(s))}">${esc(s.label)}</button>`).join('')+'</div>'):'')
+   +`<div class=ftags>${tags.length?('<span class=ftagsl>当前条件</span>'+tags.join('')):(`<span class=ftagsl>${esc(fb.spec.emptyHint||'未设置筛选：同一字段多选为「或」，不同字段为「且」')}</span>`)}</div>`
+   +(fb.open&&!moreOpen&&fields.some(f=>f.key===fb.open)?fields.filter(f=>f.key===fb.open).map(f=>this.pop(fb,f)).join(''):'')
+   +'<div class=fsheet><div class=fsheetbox><div class=fsheethead><b>筛选</b><button type=button class=fpopx data-fsheet=1 title="关闭">✕</button></div>'
+   +fields.map(f=>`<section class=fsheetfield><h4>${esc(f.label)}${f.multi===false?'<small>（单选）</small>':'<small>（多选=或）</small>'}</h4><div class=foptwrap>`
+     +(f.values||[]).map(o=>`<label class=fopt><input type=checkbox data-f="${esc(f.key)}" data-v="${esc(o.v)}" ${FS.has(fb.fs,f.key,o.v)?'checked':''}><span>${esc(o.label!=null?o.label:o.v)}</span><b>${o.count!=null?o.count:''}</b></label>`).join('')
+     +`</div></section>`).join('')
+   +`<div class=fsheetfoot><button type=button class=fclear data-clear ${n?'':'disabled'}>清空筛选</button><button type=button class=fsheetok data-fsheet=1>应用</button></div></div></div>`
+ },
+ shortcutHint(s){const parts=[];for(const k in (s.conds||{}))parts.push(k+'='+(s.conds[k]||[]).join('|'));return (s.label||'')+(parts.length?'（'+parts.join(' & ')+'）':'')},
+ render(fb){const host=document.getElementById(fb.id);if(host)host.innerHTML=this.markup(fb)},
+ refresh(fb){this.render(fb)},
+ apply(fb,keepFocus){
+  const active=document.activeElement;
+  this.render(fb);
+  if(keepFocus&&active&&active.classList&&active.classList.contains('fq')){const el=document.getElementById(fb.spec.inputId||('fq-'+fb.id));if(el&&el.focus)el.focus()}
+  if(fb.spec.onChange)fb.spec.onChange(fb.fs);
+ },
+ onClick(fb,e){
+  const t=e.target;if(!t||!t.closest)return;
+  const fbBtn=t.closest('button[data-f]');
+  if(fbBtn){const k=fbBtn.dataset.f;fb.open=(fb.open===k)?null:k;this.render(fb);return}
+  if(t.closest('button[data-clear]')){FS.clear(fb.fs);fb.open=null;this.apply(fb);return}
+  if(t.closest('button[data-popclose]')){fb.open=null;this.render(fb);return}
+  const tg=t.closest('button[data-tag]');
+  if(tg){if(tg.dataset.tag==='__q')fb.fs.q='';else FS.toggle(fb.fs,tg.dataset.tag,tg.dataset.val);this.apply(fb);return}
+  const sc=t.closest('button[data-sc]');
+  if(sc){const s=(fb.spec.shortcuts||[])[+sc.dataset.sc];if(!s)return;FS.clear(fb.fs);for(const k in (s.conds||{}))FS.set(fb.fs,k,(s.conds[k]||[]).slice());if(s.q)fb.fs.q=s.q;this.apply(fb);return}
+  if(t.closest('button[data-fsheet]')){const sheet=document.querySelector?document.querySelector('.fsheet'):null;if(sheet&&sheet.classList)sheet.classList.toggle('show');return}
+  if(!t.closest('.fpop')){if(fb.open){fb.open=null;this.render(fb)}}
+ },
+ onChange(fb,e){
+  const cb=e.target;
+  if(cb&&cb.dataset&&cb.dataset.f!==undefined&&cb.dataset.v!==undefined){
+   FS.toggle(fb.fs,cb.dataset.f,cb.dataset.v);
+   // 单选字段：勾一个即清掉同字段其它值
+   const f=this.fields(fb).filter(x=>x.key===cb.dataset.f)[0];
+   if(f&&f.multi===false)FS.set(fb.fs,f.key,[cb.dataset.v]);
+   this.apply(fb)
+  }
+ },
+ onInput(fb,e){
+  const t=e.target;
+  if(!t||!t.classList||!t.classList.contains('fq'))return;
+  const v=t.value;clearTimeout(fb.qT);
+  fb.qT=setTimeout(()=>{fb.fs.q=String(v||'').trim();this.apply(fb,true)},300)
+ }
+};
+
+let fleet=[],sites=[],versions=[],sshHint={},targetVer='',refreshInterval=15;
 let collectDur={enabled:false,map:{}};
 let webfix={map:{},cands:{}};
+/* ---- F4：设备总览筛选（统一模型 ovFs；站点/版本 chips 多选；状态/型号在筛选条内） ---- */
+let ovFs=FS.empty(),ovBar=null;
+function hwValues(){
+ const m=new Map();
+ for(const f of fleet){const v=f.hw_model||f.hardware||'未知';m.set(v,(m.get(v)||0)+1)}
+ return [...m.entries()].sort((a,b)=>b[1]-a[1]).map(x=>({v:x[0],label:x[0],count:x[1]}))
+}
+function ovFields(){
+ return [
+  {key:'online',label:'状态',values:[
+    {v:'1',label:'在线',count:fleet.filter(f=>f.online).length},
+    {v:'0',label:'未上线',count:fleet.filter(f=>!f.online).length}]},
+  {key:'pending',label:'待升级',more:true,values:[
+    {v:'1',label:'版本 ≠ 升级目标（'+esc(targetVer||'—')+'）',count:fleet.filter(f=>!f.retired&&(f.version||'未获取')!==targetVer).length}]},
+  {key:'hw',label:'型号',more:true,values:hwValues()}
+ ]
+}
+const OV_SHORTCUTS=[
+ {label:'待升级',conds:{pending:['1']}},
+ {label:'未上线',conds:{online:['0']}},
+ {label:'在线',conds:{online:['1']}}
+];
+/* 行 → 字段取值（数组表示一行可命中多个值，任一命中即算） */
+function ovRow(f){return k=>{
+ if(k==='site')return f.site||'未登记';
+ if(k==='ver')return f.version||'未获取';
+ if(k==='online')return f.online?'1':'0';
+ if(k==='pending')return (!f.retired&&(f.version||'未获取')!==targetVer)?'1':'0';
+ if(k==='hw')return f.hw_model||f.hardware||'未知';
+ return ''
+}}
 function matches(f){
-  if(siteFilter&&(f.site||'未登记')!==siteFilter)return false;
-  if(verFilter&&(f.version||'未获取')!==verFilter)return false;
-  if(pendingOnly&&(f.version||'未获取')===targetVer)return false;
-  if(q){const n=q.toLowerCase();if(!f.hostname.includes(n)&&!String(f.device_id||'').toLowerCase().includes(n)&&!String(f.device_name||'').toLowerCase().includes(n)&&!String(f.ip||'').includes(n)&&!String(f.hw_model||'').toLowerCase().includes(n))return false}
-  if(statusFilter==='online'&&!f.online)return false;
-  if(statusFilter==='offline'&&f.online)return false;
-  return true;
+ if(!FS.match(ovFs,ovRow(f)))return false;
+ if(ovFs.q){const n=ovFs.q.toLowerCase();
+  if(!String(f.hostname||'').toLowerCase().includes(n)&&!String(f.device_id||'').toLowerCase().includes(n)&&!String(f.device_name||'').toLowerCase().includes(n)&&!String(f.ip||'').includes(n)&&!String(f.hw_model||'').toLowerCase().includes(n))return false}
+ return true
 }
 function filtered(){return fleet.filter(matches)}
+function ovSyncUrl(){URLState.write({q:ovFs.q||null,f:FS.encode(ovFs)||null})}
+function ovApply(){renderSites();renderVers();renderGrid()}
+function ovRefreshBar(){if(!ovBar)return;const a=document.activeElement;if(a&&a.classList&&a.classList.contains('fq'))return;FilterBar.refresh(ovBar)}
+function mountOverviewFilter(){
+ ovBar=FilterBar.mount('ovFilter',{
+  fs:ovFs,inputId:'q',placeholder:'搜索 hostname / device_id / 设备名 / IP / 型号',
+  fields:ovFields,shortcuts:OV_SHORTCUTS,
+  emptyHint:'未设置筛选：同一字段多选为「或」，不同字段为「且」',
+  resultText:()=>`显示 ${filtered().length} / ${fleet.length} 台`,
+  onChange:fs=>{ovFs=fs;ovSyncUrl();ovApply()}
+ })
+}
 function renderSites(){
-  const el=$('#sites');let h=`<button class="chip${siteFilter===''?' on':''}" data-site="">全部 ${fleet.length}</button>`;
-  for(const s of sites){h+=`<button class="chip${siteFilter===s.site?' on':''}" data-site="${esc(s.site)}" style="--c:${siteColor(s.site)}">${esc(s.site)} <b>${s.online}/${s.expected}</b></button>`}
-  const un=fleet.filter(f=>!f.site).length;
-  if(un)h+=`<button class="chip${siteFilter==='未登记'?' on':''}" data-site="未登记" style="--c:var(--c-muted-2)">未登记 <b>${un}</b></button>`;
-  el.innerHTML=h;
-  el.querySelectorAll('.chip').forEach(b=>b.onclick=()=>{siteFilter=b.dataset.site===siteFilter?'':b.dataset.site;if(siteFilter&&statusFilter==='online'){statusFilter='all';$('#statusFilter').value='all'}renderSites();renderGrid()});
-  $('#sitesN').textContent=sites.length;
-  $('#missingN').textContent=fleet.filter(f=>!f.online).length;
+ const el=$('#sites');if(!el)return;
+ const sel=FS.get(ovFs,'site');
+ let h=`<button class="chip${sel.length?'':' on'}" data-site="" title="清除站点筛选">全部站点</button>`;
+ for(const s of sites){
+  const on=sel.indexOf(s.site)>=0;
+  h+=`<button class="chip${on?' on':''}" data-site="${esc(s.site)}" style="--c:${siteColor(s.site)}" title="点击多选：同字段内为「或」">${esc(s.site)} <b>${s.online}/${s.expected}</b></button>`
+ }
+ const un=fleet.filter(f=>!f.site).length;
+ if(un)h+=`<button class="chip${sel.indexOf('未登记')>=0?' on':''}" data-site="未登记" style="--c:var(--c-muted-2)">未登记 <b>${un}</b></button>`;
+ el.innerHTML=h;
+ el.querySelectorAll('.chip').forEach(b=>b.onclick=()=>{
+  const v=b.dataset.site;
+  if(!v)FS.set(ovFs,'site',[]);else FS.toggle(ovFs,'site',v);
+  ovSyncUrl();ovApply();ovRefreshBar()
+ });
+ $('#sitesN').textContent=sites.length;
+ $('#missingN').textContent=fleet.filter(f=>!f.online).length;
 }
 function updateDrift(){
-  const pend=fleet.filter(f=>!f.retired&&(f.version||'未获取')!==targetVer);
-  $('#pendingN').textContent=pend.length;
-  $('#targetLbl').textContent=targetVer?`待升级（≠ ${targetVer}）`:'待升级';
+ const pend=fleet.filter(f=>!f.retired&&(f.version||'未获取')!==targetVer);
+ $('#pendingN').textContent=pend.length;
+ $('#targetLbl').textContent=targetVer?`待升级（≠ ${targetVer}）`:'待升级';
 }
 function renderVers(){
-  const el=$('#vers');if(!el)return;
-  let h=`<button class="chip${verFilter===''&&!pendingOnly?' on':''}" data-v="">全部 ${fleet.length}</button>`;
-  for(const v of versions){
-    const c=v.version==='未获取'?'var(--c-muted-2)':'var(--c-test-strong)';
-    const t=v.online!==v.count?`${v.online}/${v.count}`:String(v.count);
-    h+=`<button class="chip${verFilter===v.version?' on':''}" data-v="${esc(v.version)}" style="--c:${c}">${esc(v.version)} <b>${t}</b></button>`;
-  }
-  if(targetVer){
-    const pend=fleet.filter(f=>!f.retired&&(f.version||'未获取')!==targetVer).length;
-    h+=`<button class="chip${pendingOnly?' on':''}" data-pending=1 style="--c:var(--c-warn-strong)" title="只看待升级设备（≠ 目标版本）">≠ ${esc(targetVer)} <b>${pend}</b></button>`;
-  }
-  el.innerHTML=h;
-  el.querySelectorAll('.chip').forEach(b=>b.onclick=()=>{
-    if(b.dataset.pending){pendingOnly=!pendingOnly;if(pendingOnly)verFilter=''}
-    else{verFilter=b.dataset.v===verFilter?'':b.dataset.v;pendingOnly=false}
-    renderVers();renderGrid();
-  });
-  updateDrift();
+ const el=$('#vers');if(!el)return;
+ const sel=FS.get(ovFs,'ver'),pend=FS.has(ovFs,'pending','1');
+ let h=`<button class="chip${sel.length||pend?'':' on'}" data-v="" title="清除版本筛选">全部版本</button>`;
+ for(const v of versions){
+  const c=v.version==='未获取'?'var(--c-muted-2)':'var(--c-test-strong)';
+  const t=v.online!==v.count?`${v.online}/${v.count}`:String(v.count);
+  h+=`<button class="chip${sel.indexOf(v.version)>=0?' on':''}" data-v="${esc(v.version)}" style="--c:${c}" title="点击多选：同字段内为「或」">${esc(v.version)} <b>${t}</b></button>`
+ }
+ if(targetVer){
+  const p=fleet.filter(f=>!f.retired&&(f.version||'未获取')!==targetVer).length;
+  h+=`<button class="chip${pend?' on':''}" data-pending=1 style="--c:var(--c-warn)" title="只看待升级设备（版本 ≠ 目标版本）">≠ ${esc(targetVer)} <b>${p}</b></button>`
+ }
+ el.innerHTML=h;
+ el.querySelectorAll('.chip').forEach(b=>b.onclick=()=>{
+  if(b.dataset.pending)FS.toggle(ovFs,'pending','1');
+  else{const v=b.dataset.v;if(!v)FS.set(ovFs,'ver',[]);else FS.toggle(ovFs,'ver',v)}
+  ovSyncUrl();ovApply();ovRefreshBar()
+ });
+ updateDrift();
 }
 function renderTargetSel(){
   const sel=$('#targetSel');if(!sel)return;
@@ -2082,8 +2641,27 @@ function card(f){
 }
 function renderGrid(){
   const list=fleet.filter(matches);
-  $('#grid').innerHTML=list.length?list.map(card).join(''):'<div class="empty">没有匹配的设备</div>';
+  $('#grid').innerHTML=list.length
+    ?list.map(card).join('')
+    :`<div class="empty"><p style="margin:0 0 8px">没有匹配的设备</p><p class="uhint" style="margin:0">当前条件：${esc(ovCondText())} · 点筛选条上的「清空」恢复全部</p></div>`;
   document.querySelectorAll('.card').forEach(c=>c.onclick=()=>openDevice(c.dataset.h));
+  ovRefreshBar();
+  syncCopyLabels();
+}
+/* R2：三个复制按钮的条数 = 当前筛选结果数（作用域写在按钮上，不用点完看 toast） */
+function syncCopyLabels(){
+ const list=filtered(),pend=list.filter(f=>!f.retired),cmds=list.filter(f=>!f.retired&&f.ssh_port);
+ const set=(id,txt)=>{const b=document.getElementById(id);if(b)b.textContent=txt};
+ set('copyPending','复制待升级清单 ('+pend.length+')');
+ set('copyCmds','复制跳板命令 ('+cmds.length+')');
+ set('copyList','复制编号 ('+list.length+')');
+}
+/* S7：空结果态写明当前条件，不让人猜 */
+function ovCondText(){
+ const parts=[];
+ if(ovFs.q)parts.push('关键词「'+ovFs.q+'」');
+ for(const k in (ovFs.conds||{})){const labels={site:'站点',ver:'版本',online:'状态',pending:'待升级',hw:'型号'};parts.push((labels[k]||k)+' '+(ovFs.conds[k]||[]).join('/'))}
+ return parts.length?parts.join('，'):'无';
 }
 async function load(force){
   try{
@@ -2163,9 +2741,7 @@ async function openDevice(h){
   }catch(e){$('#modalBody').innerHTML='<p class="eempty">'+esc(String(e))+'</p>'}
 }
 $('#refresh').onclick=()=>load(true);
-$('#q').oninput=e=>{q=e.target.value.trim().toLowerCase();renderGrid()};
-$('#statusFilter').onchange=e=>{statusFilter=e.target.value;renderGrid()};
-$('#targetSel').onchange=e=>{targetVer=e.target.value;renderVers();renderGrid()};
+$('#targetSel').onchange=e=>{targetVer=e.target.value;renderVers();renderGrid();ovRefreshBar()};
 async function copyBtn(btn,text,label,okLabel){
   if(!text){btn.textContent='无匹配设备';setTimeout(()=>btn.textContent=label,1200);return}
   if(await copyText(text)){btn.textContent=okLabel}else{alert(text)}
@@ -2175,23 +2751,27 @@ $('#copyPending').onclick=async()=>{
   const rows=filtered().filter(f=>!f.retired);
   const head=['设备号','站点','IP','SSH端口','device_id','当前版本','硬件'];
   const text=[head.join('\\t')].concat(rows.map(f=>[f.hostname.toUpperCase(),f.site||'未登记',f.ip||'',f.ssh_port||'',f.device_id||'',f.version||'未获取',[f.hardware,f.hw_model].filter(Boolean).join(' ')||''].join('\\t'))).join('\\n');
-  await copyBtn($('#copyPending'),rows.length?text:'','复制待升级清单',`已复制 ${rows.length} 台 ✓`);
+  await copyBtn($('#copyPending'),rows.length?text:'','复制待升级清单',`已复制 ${rows.length} 台 ✓`);syncCopyLabels();
 };
 $('#copyCmds').onclick=async()=>{
   const hint=sshHint||{},jump=hint.jump||'ubuntu@124.222.147.63',user=hint.user||'orangepi';
   const rows=filtered().filter(f=>!f.retired&&f.ssh_port);
   const text=rows.map(f=>`ssh -J ${jump} -p ${f.ssh_port} ${f.ssh_user||user}@127.0.0.1  # ${f.hostname.toUpperCase()}${f.site?' ('+f.site+')':''}`).join('\\n');
-  await copyBtn($('#copyCmds'),rows.length?text:'','复制跳板命令',`已复制 ${rows.length} 台 ✓`);
+  await copyBtn($('#copyCmds'),rows.length?text:'','复制跳板命令',`已复制 ${rows.length} 台 ✓`);syncCopyLabels();
 };
 $('#copyList').onclick=async()=>{
   const list=filtered().map(f=>f.hostname.toUpperCase());
   const btn=$('#copyList');
   if(!list.length){btn.textContent='无匹配设备';setTimeout(()=>btn.textContent='复制编号',1200);return}
   if(await copyText(list.join('\\n'))){btn.textContent=`已复制 ${list.length} 台 ✓`}else{alert(list.join('\\n'))}
-  setTimeout(()=>btn.textContent='复制编号',1800);
+  setTimeout(()=>{btn.textContent='复制编号';syncCopyLabels()},1800);
 };
 $('#modal').onclick=e=>{if(e.target.id==='modal')closeModal()};
 document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal()});
+/* 默认口径：仅在线（与改造前一致），但不再隐式——它会作为「状态 在线」条件标签显示，
+   点站点/版本 chip 也不会再把它偷偷改成全部。URL 带条件时以 URL 为准。 */
+if(!URLState.params().get('f')&&!URLState.params().get('q'))ovFs.conds.online=['1'];
+mountOverviewFilter();
 load();setInterval(()=>load(false),15000);
 async function loadEvents(){const el=document.querySelector('#eventsBody');if(!el)return;try{const r=await fetch('/api/events?hours=24&limit=60',{cache:'no-store'});const d=await r.json();if(!d.enabled){el.innerHTML='<p class=eempty>历史持久化未启用（数据库不可用）</p>';return}el.innerHTML=d.events.length?d.events.map(e=>`<div class=erow><span class="etag ${esc(e.event_type)}">${ETAGS[e.event_type]||esc(e.event_type)}</span><b>${esc(e.hostname)}</b><span class=edetail>${esc(e.new_value||e.detail||'')}${e.old_value&&e.new_value?' ← '+esc(e.old_value):''}</span><time>${esc(e.ts)}</time></div>`).join(''):'<p class=eempty>24 小时内暂无事件</p>'}catch(err){el.innerHTML='<p class=eempty>事件读取失败</p>'}}
 loadEvents();setInterval(loadEvents,60000);
@@ -3476,12 +4056,10 @@ renderDetail(o,degraded){
 jumpDevice(did){
  if(!did)return;
  Upg.setView('overview');
- const qi=document.getElementById('q');
- if(qi)qi.value=did;
- q=String(did).toLowerCase();          // 设备总览全局搜索（matches() 消费）
- siteFilter='';verFilter='';pendingOnly=false;statusFilter='all';
- const sf=document.getElementById('statusFilter');if(sf)sf.value='all';
- renderSites();renderVers();renderGrid();
+ // F4：跳转 = 清空总览全部条件 + 关键词搜索设备编号（不再有隐式状态筛选）
+ FS.clear(ovFs);ovFs.q=String(did).toLowerCase();
+ const qi=document.getElementById('q');if(qi)qi.value=did;
+ ovSyncUrl();ovApply();ovRefreshBar();
  if(qi)qi.scrollIntoView({behavior:'smooth',block:'center'});
 },
 init(){
