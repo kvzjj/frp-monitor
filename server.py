@@ -250,7 +250,8 @@ INDEX = """<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=
 <section class=summary><div><b id=repActive>—</b><span>未完结维修</span></div><div><b id=repTotal>—</b><span>维修记录</span></div><div><b id=repDoneN>—</b><span>已完结</span></div><div><b id=repSync>—</b><span>最后同步</span></div></section>
 <div id=repBanner class=rbanner hidden></div>
 <nav id=repStageStats class=sitesbar></nav>
-<div class=toolbar><input id=repQ placeholder="搜索设备编号 / 问题描述" spellcheck=false autocomplete=off><select id=repStageF title="按流转阶段筛选（仅列表视图）"><option value=all>全部阶段</option></select><select id=repTypeF><option value=all>全部类型</option></select><select id=repUnitF><option value=all>全部单位</option></select><select id=repOwnerF><option value=all>全部负责人</option></select><button id=repReload class=listbtn title="重新拉取维修列表与统计（后端默认每 5 分钟从飞书表同步一次）">重新加载</button><span class=rvswitch><button type=button id=repVKanban class=on>看板</button><button type=button id=repVList>列表</button></span></div>
+<section id=repFilter></section>
+<div class="toolbar tbarbtns"><span id=repMeta class=uhint></span><button id=repReload class=listbtn title="重新拉取维修列表与统计（后端默认每 5 分钟从飞书表同步一次）">重新加载</button><span class=rvswitch><button type=button id=repVKanban class=on>看板</button><button type=button id=repVList>列表</button></span></div>
 <div id=repKanban class=rkan><p class="uempty rkanhint">加载中…</p></div>
 <div id=repListWrap hidden>
 <div class=twrap><table class=rtable><thead><tr><th>设备编号</th><th>类型</th><th>阶段</th><th>所属单位</th><th>问题描述</th><th>负责人</th><th>最后跟进</th><th>台账</th></tr></thead><tbody id=repTbody></tbody></table></div>
@@ -1673,11 +1674,12 @@ small {
 }
 .rkan {
   display:grid;
-  grid-template-columns:repeat(7,minmax(160px,1fr));
-  gap:8px;
+  grid-auto-flow:column;
+  grid-auto-columns:minmax(260px,1fr);
+  gap:var(--sp-3);
   align-items:start;
   overflow-x:auto;
-  padding-bottom:6px;
+  padding-bottom:var(--sp-2);
 }
 .rkanhint {
   grid-column:1/-1;
@@ -2332,6 +2334,48 @@ small {
   display:flex;
   gap:var(--sp-2);
   flex-wrap:wrap;
+}
+/* ---- F6 维修看板：阶段单入口（列头点选）+ 非选中列淡化 + 横向滚动渐隐 ---- */
+.rkhead {
+  cursor:pointer;
+  border-radius:var(--sp-2);
+  padding:var(--sp-1) var(--sp-1);
+  transition:background .1s;
+}
+.rkhead:hover {
+  background:var(--c-surface-3);
+}
+.rkhead.on {
+  background:var(--c-info-bg);
+  outline:2px solid var(--c-brand);
+  outline-offset:-1px;
+}
+.rkcol.rdim {
+  opacity:.35;
+  transition:opacity .12s;
+}
+.rkcol.rdim .rcard {
+  pointer-events:none;
+}
+.rchip.on {
+  background:var(--c-brand);
+  border-color:var(--c-brand);
+  color:var(--c-surface);
+}
+.rchip.on b {
+  color:var(--c-surface);
+}
+.rkan {
+  scroll-snap-type:x proximity;
+}
+.rkan .rkcol {
+  scroll-snap-align:start;
+}
+/* 仅在会横向溢出时提示「右侧还有列」（>=1280 时 5 列可见，不再淡出） */
+@media (max-width:1279px) {
+  .rkan {
+    mask-image:linear-gradient(90deg,#000 0,#000 calc(100% - 20px),transparent 100%);
+  }
 }
 @keyframes skshine {
   0% {
@@ -3953,7 +3997,14 @@ KEYS:{
  device_online:['device_online','online']
 },
 view:'kanban',loading:false,rows:[],all:[],stats:null,statsErr:'',listErr:'',
-q:'',stageF:'',typeF:'',unitF:'',ownerF:'',doneOpen:false,qT:null,
+fs:FS.empty(),filterBar:null,doneOpen:false,qT:null,
+/* 兼容访问器：老代码/测试用 q、stageF… 单值属性；内部读写 fs 的 conds（同一套模型） */
+get q(){return this.fs.q||''},set q(v){this.fs.q=String(v||'')},
+get stageF(){return (this.fs.conds.stage||[])[0]||''},set stageF(v){FS.set(this.fs,'stage',v?[v]:[])},
+get typeF(){return (this.fs.conds.type||[])[0]||''},set typeF(v){FS.set(this.fs,'type',v?[v]:[])},
+get unitF(){return (this.fs.conds.unit||[])[0]||''},set unitF(v){FS.set(this.fs,'unit',v?[v]:[])},
+get ownerF(){return (this.fs.conds.owner||[])[0]||''},set ownerF(v){FS.set(this.fs,'owner',v?[v]:[])},
+
 gid(i){return document.getElementById(i)},
 pick(r,ks){for(const k of ks){const v=r?r[k]:undefined;if(v!==undefined&&v!==null&&v!=='')return v}return null},
 parseTs(v){if(v==null)return null;if(typeof v==='number')return v<1e12?v*1000:v;const t=Date.parse(String(v).replace(' ','T'));return isNaN(t)?null:t},
@@ -3983,15 +4034,63 @@ norm(r){
  return o;
 },
 normList(d){const l=Array.isArray(d)?d:(d&&(d.repairs||d.items||d.records||d.list));return Array.isArray(l)?l:[]},
-hasFilter(){return !!(this.q||this.stageF||this.typeF||this.unitF||this.ownerF)},
+hasFilter(){return !FS.isEmpty(this.fs)},
+/* 阶段条件只在列表视图下发给后端（看板要看全部列，靠淡化表达）；其余字段发第一个值，
+ 多选的完整 OR 语义由 filteredRows() 本地收口。q 不下发：后端 q 只认编号/问题描述，
+ 本次要求扩到负责人且「后端零改动」，故 q 在前端按 设备编号/问题描述/负责人 三字段匹配。 */
 params(){
  const p=new URLSearchParams();
+ const first=k=>{const v=FS.get(this.fs,k);return v.length?v[0]:''};
  if(this.view==='list'&&this.stageF)p.set('stage',this.stageF);
- if(this.typeF)p.set('type',this.typeF);
- if(this.unitF)p.set('unit',this.unitF);
- if(this.ownerF)p.set('owner',this.ownerF);
- if(this.q)p.set('q',this.q);
+ const t=first('type'),u=first('unit'),o=first('owner');
+ if(t)p.set('type',t);if(u)p.set('unit',u);if(o)p.set('owner',o);
  const s=p.toString();return s?'?'+s:'';
+},
+isOverdue(r){return !r.done&&r.followMs&&(Date.now()-r.followMs)>7*864e5},
+repRow(r){return k=>{
+ if(k==='stage')return r.stage||'';
+ if(k==='type')return r.device_type||'';
+ if(k==='unit')return r.unit||'';
+ if(k==='owner')return r.owner||'';
+ if(k==='online')return r.online===true?'1':(r.online===false?'0':'?');
+ if(k==='overdue')return this.isOverdue(r)?'1':'0';
+ return ''
+}},
+filteredRows(){
+ const fs=this.fs;
+ return this.rows.filter(r=>{
+  if(!FS.match(fs,this.repRow(r)))return false;
+  if(fs.q){const q=fs.q.toLowerCase();
+   const hay=((r.device_id||'')+' '+(r.problem||'')+' '+(r.owner||'')).toLowerCase();
+   if(hay.indexOf(q)<0)return false}
+  return true
+ })
+},
+repFields(){
+ const cnt=key=>{const m=new Map();for(const r of (this.all||[])){const v=r[key];if(v)m.set(v,(m.get(v)||0)+1)}
+  return [...m.entries()].sort((a,b)=>String(a[0]).localeCompare(String(b[0]),'zh')).map(x=>({v:x[0],label:x[0],count:x[1]}))};
+ const all=this.all||[];
+ return [
+  {key:'stage',label:'阶段',multi:false,values:this.STAGES.map(st=>({v:st,label:st,count:all.filter(r=>r.stage===st).length}))},
+  {key:'type',label:'类型',values:cnt('device_type')},
+  {key:'unit',label:'单位',values:cnt('unit')},
+  {key:'owner',label:'负责人',values:cnt('owner')},
+  {key:'online',label:'台账在线',more:true,values:[{v:'1',label:'在线',count:all.filter(r=>r.online===true).length},{v:'0',label:'离线',count:all.filter(r=>r.online===false).length}]},
+  {key:'overdue',label:'跟进',more:true,values:[{v:'1',label:'超 7 天未跟进（未完结）',count:all.filter(r=>this.isOverdue(r)).length}]}
+ ]
+},
+mountFilter(){
+ this.filterBar=FilterBar.mount('repFilter',{
+  fs:this.fs,inputId:'repQ',placeholder:'搜索设备编号 / 问题描述 / 负责人',
+  fields:()=>this.repFields(),
+  shortcuts:[{label:'超 7 天未跟进',conds:{overdue:['1']}},{label:'只看在线',conds:{online:['1']}}],
+  emptyHint:'阶段在看板列头点选、在列表用「阶段」下拉，读写同一个条件',
+  resultText:()=>`显示 ${this.filteredRows().length} / ${this.rows.length} 条`,
+  onChange:fs=>{this.fs=fs;this.writeFilterUrl();this.loadList()}
+ });
+},
+writeFilterUrl(){
+ URLState.write({view:'assets',atab:'repairs',q:this.fs.q||null,f:FS.encode(this.fs)||null});
 },
 async loadStats(){
  try{
@@ -4012,17 +4111,23 @@ async loadList(){
   const d=await r.json().catch(()=>({}));
   if(!r.ok)throw Error(this.apiErr(r,d));
   this.rows=this.normList(d).map(x=>this.norm(x));
-  if(!this.params()){this.all=this.rows;this.buildOptions()}
+  if(!this.params()){this.all=this.rows}
   this.listErr='';
  }catch(e){this.listErr='维修数据加载失败：'+((e&&e.message)?e.message:String(e));this.rows=[]}
  this.loading=false;this.render();
 },
 load(){this.loadStats();this.loadList()},
 enter(pend){
- if(pend){this.q=pend;const qi=this.gid('repQ');if(qi)qi.value=pend}   // 台账未完结徽章跳转/深链携带的设备编号筛入搜索
+ if(pend){this.q=pend;const qi=this.gid('repQ');if(qi)qi.value=pend;if(this.filterBar){this.filterBar.fs=this.fs;FilterBar.render(this.filterBar)}}   // 台账未完结徽章跳转/深链携带的设备编号筛入搜索
  this.setView(this.view);this.load()
 },
-render(){this.renderBanner();if(this.view==='kanban')this.renderKanban();else this.renderList()},
+render(){this.renderBanner();if(this.view==='kanban')this.renderKanban();else this.renderList();this.renderMeta()},
+renderMeta(){
+ const meta=this.gid('repMeta');
+ if(meta)meta.textContent='显示 '+this.filteredRows().length+' / '+this.rows.length+' 条';
+ const fb=this.filterBar;
+ if(fb){const a=(typeof document!=='undefined')?document.activeElement:null;if(!(a&&a.classList&&a.classList.contains('fq'))){fb.fs=this.fs;FilterBar.render(fb)}}
+},
 renderStats(){
  const s=this.stats,by=s?s.byStage:null;
  const num=v=>(v==null||v===''||isNaN(Number(v)))?null:Number(v);
@@ -4039,10 +4144,12 @@ renderStats(){
  let h='';
  for(const st of this.STAGES){const n=by?num(by[st]):null;h+='<span class="chip rchip" data-stage="'+esc(st)+'" style="--c:'+(this.SC[st]||'var(--c-muted-2)')+'">'+esc(st)+' <b>'+(n!=null?n:'—')+'</b></span>'}
  this.gid('repStageStats').innerHTML=h;
- this.gid('repStageStats').querySelectorAll('.rchip').forEach(c=>c.onclick=()=>{
-  const st=c.dataset.stage;
-  if(this.view==='list'){const sel=this.gid('repStageF');sel.value=(this.stageF===st)?'all':st;this.stageF=sel.value==='all'?'':sel.value;this.loadList()}
-  else{let target=null;this.gid('repKanban').querySelectorAll('.rkcol').forEach(x=>{if(x.dataset.col===st)target=x});if(target)target.scrollIntoView({behavior:'smooth',block:'nearest',inline:'start'})}
+ this.gid('repStageStats').querySelectorAll('.rchip').forEach(c=>{
+  c.classList.toggle('on',this.stageF===c.dataset.stage);
+  c.onclick=()=>{   // 与看板列头、列表下拉写同一个 stage 条件（F6：阶段单入口）
+   this.stageF=(this.stageF===c.dataset.stage)?'':c.dataset.stage;
+   this.writeFilterUrl();this.loadList();
+  };
  });
 },
 renderBanner(){
@@ -4058,19 +4165,23 @@ renderBanner(){
 renderKanban(){
  const el=this.gid('repKanban');
  if(this.listErr){el.innerHTML='<p class="uempty">维修数据不可用，详见上方提示</p>';return}
+ const rows=this.filteredRows();
  const cols=this.STAGES.slice();
  const seen=new Set(this.STAGES);
- for(const r of this.rows){const st=r.stage||'未填写阶段';if(!seen.has(st)){seen.add(st);cols.push(st)}}
+ for(const r of rows){const st=r.stage||'未填写阶段';if(!seen.has(st)){seen.add(st);cols.push(st)}}
  const groups=new Map();for(const st of cols)groups.set(st,[]);
- for(const r of this.rows)groups.get(r.stage||'未填写阶段').push(r);
+ for(const r of rows)groups.get(r.stage||'未填写阶段').push(r);
+ const picked=this.stageF;   // F6：阶段条件在看板下的表达 = 其余列淡化（保留上下文），不隐藏
  let h='';
  if(this.loading&&!this.rows.length)h+='<p class="uempty rkanhint">加载中…</p>';
- else if(!this.rows.length&&this.hasFilter())h+='<p class="uempty rkanhint">没有匹配的维修记录——调整筛选或搜索词，或点「重新加载」</p>';
- else if(!this.rows.length)h+='<p class="uempty rkanhint">暂无维修记录——飞书维修表同步到数据后此处展示</p>';
+ else if(!rows.length&&this.hasFilter())h+='<p class="uempty rkanhint">没有匹配的维修记录——调整筛选或搜索词，或点「重新加载」</p>';
+ else if(!rows.length)h+='<p class="uempty rkanhint">暂无维修记录——飞书维修表同步到数据后此处展示</p>';
  for(const st of cols){
   const list=groups.get(st).slice().sort((a,b)=>(b.followMs||0)-(a.followMs||0));
   const c=this.SC[st]||'var(--c-muted-2)';
-  h+='<div class="rkcol" data-col="'+esc(st)+'"><h3><span class="rkt" style="--c:'+c+'">'+esc(st)+'</span><span class="rkn">'+list.length+'</span></h3>'+(list.length?list.map(r=>this.cardHtml(r)).join(''):'<div class="rkempty">暂无</div>')+'</div>';
+  const dim=(picked&&picked!==st)?' rdim':'';
+  const on=(picked===st)?' on':'';
+  h+='<div class="rkcol'+dim+'" data-col="'+esc(st)+'"><h3 class="rkhead'+on+'" data-stage="'+esc(st)+'" title="点击按该阶段筛选（再点取消）"><span class="rkt" style="--c:'+c+'">'+esc(st)+'</span><span class="rkn">'+list.length+'</span></h3>'+(list.length?list.map(r=>this.cardHtml(r)).join(''):'<div class="rkempty">'+(dim?'已按阶段筛选':'暂无')+'</div>')+'</div>';
  }
  el.innerHTML=h;
 },
@@ -4090,13 +4201,14 @@ onlineBadge(r){
  return '<span class="ron na" title="设备编号未匹配到设备台账">台账 —</span>';
 },
 renderList(){
- const act=this.rows.filter(r=>!r.done),dn=this.rows.filter(r=>r.done);
+ const rows=this.filteredRows();
+ const act=rows.filter(r=>!r.done),dn=rows.filter(r=>r.done);
  act.sort((a,b)=>(a.stageIdx-b.stageIdx)||((b.followMs||0)-(a.followMs||0)));
  dn.sort((a,b)=>(b.followMs||0)-(a.followMs||0));
  const tb=this.gid('repTbody');
  let msg='';
  if(this.listErr)msg='维修数据不可用，详见上方提示';
- else if(!this.rows.length)msg=this.hasFilter()?'没有匹配的维修记录——调整筛选或搜索词试试':'暂无维修记录——飞书维修表同步到数据后此处展示';
+ else if(!rows.length)msg=this.hasFilter()?'没有匹配的维修记录——调整筛选或搜索词试试':'暂无维修记录——飞书维修表同步到数据后此处展示';
  else if(!act.length)msg='匹配记录均为已完结，见下方折叠区';
  tb.innerHTML=msg?'<tr><td colspan="8" class="rempty">'+esc(msg)+'</td></tr>':act.map(r=>this.rowHtml(r)).join('');
  this.gid('repDoneWrap').hidden=!dn.length;
@@ -4129,7 +4241,6 @@ setView(v){
  this.view=v==='list'?'list':'kanban';
  this.gid('repKanban').hidden=this.view!=='kanban';
  this.gid('repListWrap').hidden=this.view!=='list';
- this.gid('repStageF').hidden=this.view!=='list';   // 看板本身按阶段分列，阶段筛选仅列表视图生效
  this.gid('repVKanban').classList.toggle('on',this.view==='kanban');
  this.gid('repVList').classList.toggle('on',this.view==='list');
  this.render();
@@ -4217,15 +4328,11 @@ init(){
  this.gid('repVList').onclick=()=>this.setView('list');
  this.gid('repReload').onclick=()=>this.load();
  this.gid('repDoneToggle').onclick=()=>{this.doneOpen=!this.doneOpen;this.renderList()};
- const qi=this.gid('repQ');
- qi.addEventListener('input',()=>{clearTimeout(this.qT);this.qT=setTimeout(()=>{this.q=qi.value.trim();this.loadList()},350)});
- for(const id of['repStageF','repTypeF','repUnitF','repOwnerF']){
-  this.gid(id).addEventListener('change',()=>{
-   const g=i=>{const v=this.gid(i).value;return v==='all'?'':v};
-   this.stageF=g('repStageF');this.typeF=g('repTypeF');this.unitF=g('repUnitF');this.ownerF=g('repOwnerF');
-   this.loadList();
-  });
- }
+ this.mountFilter();
+ this.gid('repKanban').addEventListener('click',e=>{
+  const hd=e.target.closest('.rkhead');
+  if(hd&&!e.target.closest('.rcard')){this.stageF=(this.stageF===hd.dataset.stage)?'':hd.dataset.stage;this.writeFilterUrl();this.loadList();return}
+ });
  const m=this.gid('repModal');
  m.addEventListener('click',e=>{if(e.target===m)this.closeDetail()});
  document.addEventListener('keydown',e=>{if(e.key==='Escape')this.closeDetail()});

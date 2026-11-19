@@ -154,16 +154,25 @@ const lastFetch = () => fetchLog[fetchLog.length - 1];
   R.doneOpen = false; R.renderList();
   ok('列表：行内阶段标签配色（走 --c-danger token）+ 编号等宽样式', tb.includes('style="--c:var(--c-danger)"') && tb.includes('class="rdev"'));
   // ---- 筛选与搜索传参（查询参数走 API，与后端筛选一致） ----
+  // F6：q 不再下发（后端 q 只认编号/问题描述，且本次后端零改动）；改为前端按 编号/问题/负责人 三字段匹配
   R.q = 'EP-000101'; await R.loadList();
-  ok('搜索：?q= 精确传参', lastFetch() === '/api/repairs?q=EP-000101');
+  ok('搜索：q 本地三字段匹配（编号）+ 不下发后端', R.filteredRows().length === 1 && R.filteredRows()[0].device_id === 'EP-000101' && lastFetch() === '/api/repairs');
+  R.q = '刘希源'; await R.loadList();
+  ok('搜索：q 可匹配负责人（后端 q 不支持，本次在前端补）', R.filteredRows().length > 0 && R.filteredRows().every(r => (r.owner || '').includes('刘希源')));
+  R.q = '相机模块无画面'; await R.loadList();
+  ok('搜索：q 可匹配问题描述', R.filteredRows().length > 0);
   R.q = ''; R.stageF = '待接收'; await R.loadList();
   ok('阶段筛选：?stage= 传参（仅列表视图）', lastFetch() === '/api/repairs?stage=' + encodeURIComponent('待接收'));
   R.typeF = '单目'; R.unitF = '上海办公室'; R.ownerF = '刘希源'; await R.loadList();
   ok('类型/单位/负责人筛选同时传参', lastFetch() === '/api/repairs?stage=' + encodeURIComponent('待接收') + '&type=' + encodeURIComponent('单目') + '&unit=' + encodeURIComponent('上海办公室') + '&owner=' + encodeURIComponent('刘希源'));
   R.stageF = ''; R.typeF = ''; R.unitF = ''; R.ownerF = ''; R.setView('kanban'); await R.loadList();
   ok('看板视图不携带 stage 参数', lastFetch() === '/api/repairs');
-  ok('下拉选项：单位/负责人带计数（上海 8（1 条无单位）/ 刘希源 14）', el('repUnitF').innerHTML.includes('上海办公室（8）') && el('repOwnerF').innerHTML.includes('刘希源（14）'));
-  ok('下拉选项：类型 单目/双目/其他', el('repTypeF').innerHTML.includes('单目（9）') && el('repTypeF').innerHTML.includes('双目（9）') && el('repTypeF').innerHTML.includes('其他（0）'));
+  // F6：原 4 个 <select> 合并进 FilterBar 多选下拉（每项带计数）
+  const fbh = el('repFilter').innerHTML;
+  ok('筛选条：阶段/类型/单位/负责人/在线/超 7 天未跟进 六组字段齐全', ['阶段', '类型', '单位', '负责人', '台账在线', '跟进'].every(k => fbh.includes(k)));
+  ok('筛选条：选项带全局 facet 计数（上海办公室 / 刘希源 / 单目 / 双目）', fbh.includes('上海办公室') && fbh.includes('刘希源') && fbh.includes('单目') && fbh.includes('双目'));
+  ok('筛选条：快捷视图「超 7 天未跟进」+「只看在线」', fbh.includes('超 7 天未跟进') && fbh.includes('只看在线'));
+  ok('筛选条：结果计数文案（显示 N / M 条）', fbh.includes('显示') && fbh.includes('条'));
   // ---- 详情弹层 ----
   await R.openDetail('rec001');
   const mb = el('repModalBody').innerHTML;
