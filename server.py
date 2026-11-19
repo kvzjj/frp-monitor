@@ -1599,6 +1599,15 @@ small {
   color:var(--c-text-2);
   margin:2px 4px 2px 0;
 }
+.uconfirmlist {
+  max-height:240px;
+  overflow:auto;
+  border:1px solid var(--c-border);
+  border-radius:var(--sp-2);
+  background:var(--c-surface-2);
+  padding:var(--sp-2);
+  margin:var(--sp-1) 0 var(--sp-3);
+}
 .acards3 {
   display:flex;
   gap:12px;
@@ -2265,7 +2274,14 @@ init(){
   if(el.dataset.h!==undefined&&el.type==='checkbox'){this.selTouched=true;if(el.checked)this.selected.add(el.dataset.h);else this.selected.delete(el.dataset.h);this.renderDevs();this.updateSelBar();this.updateActions()}
   else if(el.dataset.grp!==undefined){this.selTouched=true;const rows=this.devRows().filter(r=>r.ver===el.dataset.grp&&r.online);for(const r of rows){if(el.checked)this.selected.add(r.h);else this.selected.delete(r.h)}this.renderDevs();this.updateSelBar();this.updateActions()}});
  dg.addEventListener('click',e=>{const b=e.target.closest('button[data-grpup]');if(!b)return;const k=b.dataset.grpup;this.selTouched=true;const rows=this.devRows().filter(r=>r.ver===k&&r.online);this.selected=new Set(rows.map(r=>r.h));this.renderDevs();this.updateSelBar();this.updateActions();this.setActHint('已选择 '+k+' 全组 '+rows.length+' 台，确认无误后在下方发起',false);this.gid('upgActPanel').scrollIntoView({behavior:'smooth',block:'center'})});
- this.gid('upgSelBar').addEventListener('click',e=>{if(e.target.closest('button[data-clr]')){this.selected.clear();this.selTouched=true;this.renderDevs();this.updateSelBar();this.updateActions()}});
+ this.gid('upgSelBar').addEventListener('click',e=>{
+  if(e.target.closest('button[data-clr]')){this.selected.clear();this.selTouched=true;this.renderDevs();this.updateSelBar();this.updateActions();return}
+  if(e.target.closest('button[data-all]')){
+   const hs=this.selectable();this.selected=new Set(hs);this.selTouched=true;
+   this.renderDevs();this.updateSelBar();this.updateActions();
+   this.setActHint('已选中当前筛选范围内的在线设备 '+hs.length+' 台，确认无误后在下方发起',false);
+  }
+ });
  this.gid('upgRunAll').onclick=()=>{if(this.canLaunch())this.showConfirm()};
  document.querySelectorAll('.stagebtn[data-kind]').forEach(b=>b.onclick=()=>{if(this.canLaunch())this.launch(b.dataset.kind)});
  const grid=this.gid('upgTaskGrid');
@@ -2453,8 +2469,8 @@ async loadFleet(){
   if(!r.ok)throw Error('HTTP '+r.status);
   this.fleet=d.fleet||[];
   const online=this.fleet.filter(f=>!f.retired&&f.online).map(f=>f.hostname);
-  if(!this.selTouched)this.selected=new Set(online);
-  else{const live=new Set(online);for(const h of [...this.selected])if(!live.has(h))this.selected.delete(h)}
+  // F2b：进入页面不预选任何设备（原实现默认全选全部在线设备，配合「全流程升级」是最高风险交互）
+  {const live=new Set(online);for(const h of [...this.selected])if(!live.has(h))this.selected.delete(h)}
   this.renderDevs();this.updateSelBar();this.updateActions();
  }catch(e){if(!this.fleet.length){const el=this.gid('upgDevGroups');if(el)el.innerHTML='<p class=uempty>设备数据加载失败（/api/hosts 不可用），稍后自动重试</p>'};this.updateSelBar();this.updateActions()}
 },
@@ -2483,8 +2499,17 @@ updateSelBar(){
  const vers=new Set();
  for(const h of this.selected){const f=this.fleet.find(x=>x.hostname===h);vers.add(((f&&f.version)||'').trim()||'未获取')}
  const cur=n?(vers.size===1?[...vers][0]:'多版本'):'—';
- el.innerHTML=`已选 <b>${n}</b> 台 · 当前版本 ${esc(cur)} → 目标版本 <b>${esc(this.targetVersion||'—')}</b>${n?' <button type=button class=minibtn data-clr>清空选择</button>':''}`;
+ const onN=this.selectable().length;   // 「选中当前筛选」只勾在线设备（离线恒不可选）
+ el.innerHTML=`已选 <b>${n}</b> 台 · 当前版本 ${esc(cur)} → 目标版本 <b>${esc(this.targetVersion||'—')}</b>`
+  +` <button type=button class=minibtn data-all title="只勾选当前筛选条件下的在线设备（离线设备恒不可选）">选中当前筛选（${onN}）</button>`
+  +(n?' <button type=button class=minibtn data-clr>清空选择</button>':'')
+  +(n?'':' <span class=uhint style="margin:0">进入页面不预选——请先勾选设备，或点「选中当前筛选」</span>');
  this.renderExpiry();
+},
+/* F2b：当前筛选下可被选中的设备（在线）。F7 接入筛选条后自动只在筛选结果内生效 */
+selectable(){
+ const inFilter=r=>!this.upgFilter||this.upgFilter(r);
+ return this.devRows().filter(r=>r.online&&inFilter(r)).map(r=>r.h)
 },
 canLaunch(){return !this.active()&&this.param.ok&&!!this.param.version&&this.selected.size>0},
 updateActions(){
@@ -2502,7 +2527,7 @@ updateActions(){
  else if(expired)hint='OSS 链接已过期，请重新生成签名 URL 后粘贴';
  else if(noUrl)hint='请先在「① 升级参数」粘贴 OSS 签名 URL（自动识别版本/机型）';
  else if(noVer)hint='URL 中未识别出版本号（文件名需形如 ego-portal-v0.4.6-rk3588-arm64.tar.gz）',warn=true;
- else if(noSel)hint='请至少勾选一台在线设备（默认已勾选全部在线设备，离线设备不可选）';
+ else if(noSel)hint='请至少勾选一台在线设备（进入页面不预选；可点「选中当前筛选」批量勾选在线设备，离线设备不可选）';
  else if(mism)hint='⚠ 所选设备中 '+mism+' 台机型与目标包（'+this.param.arch+'）不符，下载/安装类操作不可发起；请改选相符机型设备，或更换对应机型的包链接',warn=true;
  else if(noSha)hint='⚠ 尚无 sha256 基准：下载/安装类操作不可发起（注册表未命中时请手填或点「服务端计算」）；仅预检/验证/清理可发起',warn=true;
  else if(lowTime)hint='⚠ 链接剩余有效期低于预估批量时长（'+this.fmtRemain(this.estMs())+'），批量中途可能过期，建议重新生成更长时效链接',warn=true;
@@ -2521,17 +2546,18 @@ showConfirm(){
  for(const h of this.selected){const f=this.fleet.find(x=>x.hostname===h);const a=(f&&this.archOf(f))||'未知机型';if(this.param.arch&&a!=='未知机型'&&a!==this.param.arch){mism++;archSplit['机型不符']=(archSplit['机型不符']||0)+1}else archSplit[a]=(archSplit[a]||0)+1}
  const archTxt=Object.entries(archSplit).map(([a,c])=>esc(a)+' × '+c).join('、');
  const list=[...this.selected].sort((a,b)=>a.localeCompare(b,undefined,{numeric:true}));
- const preview=esc(list.length>12?list.slice(0,12).join('、')+' 等 '+n+' 台':list.join('、'));
+ // F2b：清单完整列出（原实现截断为前 12 台，46 台全选时核对不全）
+ const listHtml='<div class=uconfirmlist id=upgConfirmList>'+list.map(h=>'<span class=chip2>'+esc(h)+'</span>').join('')+'</div>';
  const remTxt=this.param.expiresAt==null?'未识别（请自行确认链接时效）':((this.param.expiresAt-Date.now()>0?'约剩 ':'')+this.fmtRemain(this.param.expiresAt-Date.now())+(this.param.expiresAt-Date.now()>0?'（至 '+new Date(this.param.expiresAt).toLocaleString('zh-CN',{hour12:false})+'）':''));
  const m=this.gid('upgModalBody');
  m.innerHTML=`<header><div><span class=name>确认发起全流程升级</span></div><button type=button class="x" id=upgConfirmClose>✕</button></header>
  <div class=mgrid>
   <span>目标版本</span><b>${esc(vs)}（${esc(this.param.arch||'机型未识别')} · ${esc(this.param.filename||'文件名未识别')}）</b>
   <span>设备数量</span><b>${n} 台（${archTxt}${mism?'，其中 '+mism+' 台机型不符':''}）</b>
-  <span>设备清单</span><b>${preview}</b>
+  <span>设备清单</span><b>共 ${n} 台，全部列出（可滚动核对）</b>
   <span>链接有效期</span><b>${esc(remTxt)}</b>
   <span>执行流程</span><b>预检 → 下载 → 准备 → 安装 → 验证 → 清理（设备直连 OSS 下载，sha256 基准校验）</b>
- </div>
+ </div>${listHtml}
  <p class=uwarn>⚠ 升级将覆盖设备上的程序，过程不可逆；单台失败不影响其他设备，安装器失败时会自动回滚兜底。请确认目标版本、机型与设备清单无误后再发起。</p>
  <div class=ubtns style="justify-content:flex-end;margin-top:16px"><button type=button class=stagebtn id=upgConfirmNo>取消</button><button type=button id=upgConfirmYes>确认发起升级</button></div>`;
  this.gid('upgModal').classList.add('show');
