@@ -4408,7 +4408,8 @@ enter(pend){
 render(){this.renderBanner();if(this.view==='kanban')this.renderKanban();else this.renderList();this.renderMeta()},
 renderMeta(){
  const meta=this.gid('repMeta');
- if(meta)meta.textContent='显示 '+this.filteredRows().length+' / '+this.rows.length+' 条';
+ const dn=this.filteredRows().filter(r=>r.done).length;
+ if(meta)meta.textContent=dn?('已完结 '+dn+' 条在列表视图下方折叠'):'';   // 结果计数在筛选条上，这里不重复
  const fb=this.filterBar;
  if(fb){const a=(typeof document!=='undefined')?document.activeElement:null;if(!(a&&a.classList&&a.classList.contains('fq'))){fb.fs=this.fs;FilterBar.render(fb)}}
 },

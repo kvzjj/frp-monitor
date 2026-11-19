@@ -156,3 +156,28 @@ active_repairs 与既有 API 交叉一致；日报状态端点/手动推送文�
   **机器人若开启「签名校验」需同配 `FRP_MONITOR_FEISHU_WEBHOOK_SECRET`
   （签名密钥）**；`POST /api/assets/report/run` 可立即验推一次；时刻用
   `FRP_MONITOR_REPORT_TIMES` 调整（默认 09:00）。
+
+## 面板筛选与 UI（KVWO-115）
+
+前端在 KVWO-115 做了筛选重构与 UI token 化，**接口契约未变**，只影响浏览器侧：
+
+- **统一筛选模型**：`{ q, conds:{ field:[值…] } }`，同一字段多选 = 或（OR），
+  不同字段之间 = 且（AND）。四个视图（设备总览 / 硬件台账 / 维修看板 / 升级）
+  共用同一个筛选条组件与同一套条件语义。
+- **状态入 URL**：`#view=…&atab=…&q=…&f=字段:值,值;字段:值&sort=key:dir&density=dense`。
+  值走 `encodeURIComponent`，可直接手改与转发；用 `history.replaceState` 写入（不塞历史）。
+- **台账筛选走接口**：`status`/`type`/`unit` 每次取*第一个*选中值下发给 `/api/assets`
+  （后端契约单值），多选的完整 OR 语义在前端按同一套规则收口；
+  `GET /api/assets?include_archived=1` 一次取回在册 + 归档，前端按 `archived` 标记拆分。
+  原实现额外请求 `?archived=1`，但该参数后端不识别（只认 `include_archived`），
+  会拿回全部在册设备 —— 本次一并修正。
+- **有意行为变更**：台账 `q` 只匹配**设备编号 / 去向备注**，不再匹配单位
+  （单位请用 `unit` 筛选）；此前「q 也匹配单位」是纯前端内存过滤的副作用。
+- **升级页**：进入不再预选全部在线设备（默认 0 选中，离线设备恒不可选）；
+  「选中当前筛选」只勾当前筛选范围内的在线设备；二次确认清单全量列出，不再截断前 12 台。
+- **UI**：色值/间距/字号全部走 `:root` token（`server.py` 内联六位色值 < 20），
+  容器 1280px、表格行高 40/32 两档密度、台账默认 8 列（详细列 12 列）、每页 50 条、
+  表头 sticky；窄屏（<=768）筛选折叠为「搜索 + 筛选(N)」、表格转卡片列表。
+
+自动化断言：`node verify_filters_ui.js`（筛选模型/URL/升级页/窄屏规则）、
+`node verify_assets_ui.js`、`node verify_repairs_ui.js`（含 S1/S2/S4/S9/S10/U8）。
