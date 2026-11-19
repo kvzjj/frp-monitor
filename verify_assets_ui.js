@@ -207,9 +207,12 @@ const ok = (name, cond) => { if (!cond) { console.error('FAIL: ' + name); proces
   await A.applyLedger();
   const lastFetch = () => fetchLog[fetchLog.length - 1];
   // P1（返修）：多选 OR 不能先被后端单值参数截断 —— 走真实 applyLedger() 路径断言
+  const assetsReq = () => fetchLog.filter(p => p.startsWith('/api/assets?')).length;
+  const reqBefore = assetsReq();
   FSx2.set(A.fs, 'status', ['维修中', '待维修']);
   await A.applyLedger();
-  ok('P1 台账：多选状态不下发 status 参数（否则后端先按第一个值裁掉）', !lastFetch().includes('status='));
+  ok('P1 台账：多选状态下不发筛选请求（无单值字段可下发，直接用已加载全量本地 OR）', assetsReq() === reqBefore);
+  ok('P1 台账：多选状态不带 status 参数（否则后端先按第一个值裁掉）', !lastFetch().includes('status='));
   ok('P1 台账：多选状态 OR = 13 台（维修中 10 + 待维修 3）', A.ledgerRows().length === 13 && ['维修中', '待维修'].every(st => A.ledgerRows().some(d => d.status === st)));
   FSx2.set(A.fs, 'status', ['维修中']);
   await A.applyLedger();
