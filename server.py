@@ -2377,6 +2377,235 @@ small {
     mask-image:linear-gradient(90deg,#000 0,#000 calc(100% - 20px),transparent 100%);
   }
 }
+/* ---- F8 窄屏最小集（<=768）：筛选折叠为「搜索 + 筛选(N)」、表格转卡片、无横向滚动 ---- */
+@media (max-width:768px) {
+  main {
+    padding:var(--sp-4) var(--sp-3);
+  }
+  header {
+    margin-bottom:var(--sp-3);
+    gap:var(--sp-2);
+  }
+  h1 {
+    font-size:20px;
+  }
+  header p {
+    font-size:var(--fs-mini);
+  }
+  .summary {
+    display:grid;
+    grid-template-columns:repeat(3,1fr);
+    gap:var(--sp-2);
+    margin-bottom:var(--sp-3);
+  }
+  .summary div {
+    min-width:0;
+    padding:var(--sp-2);
+  }
+  .summary b {
+    font-size:18px;
+  }
+  .summary span {
+    font-size:var(--fs-mini);
+  }
+  .vtabs {
+    flex-wrap:nowrap;
+    overflow-x:auto;
+    margin:0 0 var(--sp-3);
+    padding-bottom:2px;
+  }
+  .vtabs button {
+    padding:var(--sp-1) var(--sp-3);
+    font-size:var(--fs-mini);
+    white-space:nowrap;
+  }
+  .fbar {
+    padding-top:var(--sp-1);
+  }
+  .fbar .fbtn,.fbar .fmore,.fbar .fpop {
+    display:none;
+  }
+  .frow {
+    gap:var(--sp-2);
+  }
+  .fsearch {
+    min-width:0;
+    flex:1 1 100%;
+  }
+  .fsheetbtn {
+    display:inline-flex;
+    align-items:center;
+    height:36px;
+    padding:0 var(--sp-3);
+    background:var(--c-surface);
+    border:1px solid var(--c-border-strong);
+    color:var(--c-text-2);
+    border-radius:var(--sp-2);
+    font-size:var(--fs-body);
+  }
+  .fres {
+    order:9;
+    flex:1 1 100%;
+    margin:0;
+  }
+  .fsc,.ftags {
+    flex-wrap:nowrap;
+    overflow-x:auto;
+    white-space:nowrap;
+    padding-bottom:2px;
+    margin-top:var(--sp-1);
+  }
+  .fscbtn,.ftag {
+    flex:none;
+  }
+  .sitesbar {
+    flex-wrap:nowrap;
+    overflow-x:auto;
+    margin-bottom:var(--sp-2);
+    padding-bottom:2px;
+  }
+  .sitesbar .chip {
+    flex:none;
+  }
+  .parambar {
+    gap:var(--sp-1) var(--sp-2);
+  }
+  .parambar .uhint {
+    display:none;
+  }
+  .parambar .pbtns {
+    margin-left:0;
+    flex:1 1 100%;
+  }
+  .parambar .pbtns button {
+    flex:1;
+    font-size:var(--fs-mini);
+    padding:var(--sp-2) var(--sp-2);
+  }
+  .grid {
+    grid-template-columns:1fr;
+    gap:var(--sp-2);
+  }
+  .card {
+    padding:var(--sp-3);
+  }
+  .card .row>span:first-child {
+    width:52px;
+  }
+  /* 台账：表格转卡片列表（.astable + data-label） */
+  #atabHardware .twrap,#atabRepairs .twrap {
+    overflow:visible;
+    border:0;
+    max-height:none;
+  }
+  .astable,.astable tbody {
+    display:block;
+    width:100%;
+  }
+  .astable thead {
+    display:none;
+  }
+  .astable tr {
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:2px var(--sp-2);
+    background:var(--c-surface);
+    border:1px solid var(--c-border);
+    border-radius:var(--radius);
+    margin-bottom:var(--sp-2);
+    padding:var(--sp-2) var(--sp-3);
+    box-shadow:var(--c-shadow) 0 2px 8px;
+  }
+  .astable td {
+    display:flex;
+    gap:var(--sp-1);
+    border:0;
+    padding:1px 0;
+    max-width:none;
+    white-space:normal;
+    height:auto;
+    align-items:baseline;
+  }
+  .astable td::before {
+    content:attr(data-label);
+    color:var(--c-text-3);
+    font-size:var(--fs-mini);
+    flex:none;
+    min-width:52px;
+  }
+  .astable td:first-child {
+    grid-column:1/-1;
+    font-weight:700;
+  }
+  .astable td:first-child::before {
+    display:none;
+  }
+  /* 维修列表同款卡片化 */
+  .rtable,.rtable tbody {
+    display:block;
+    width:100%;
+    min-width:0;
+  }
+  .rtable thead {
+    display:none;
+  }
+  .rtable tr {
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:2px var(--sp-2);
+    background:var(--c-surface);
+    border:1px solid var(--c-border);
+    border-radius:var(--radius);
+    margin-bottom:var(--sp-2);
+    padding:var(--sp-2) var(--sp-3);
+  }
+  .rtable td {
+    border:0;
+    padding:1px 0;
+    white-space:normal;
+    max-width:none;
+  }
+  .rtable td:first-child {
+    grid-column:1/-1;
+    font-weight:700;
+  }
+  .pager {
+    margin-top:var(--sp-2);
+  }
+  /* 工具条在窄屏保持一行（原 @media(<=640) 的 .toolbar{flex-direction:column} 会把按钮竖排占满首屏） */
+  .tbarbtns {
+    flex-direction:row;
+    justify-content:flex-start;
+    gap:var(--sp-2);
+  }
+  .tbarbtns .uhint {
+    flex:1 1 100%;
+    margin:0;
+    font-size:var(--fs-mini);
+  }
+  .tbarbtns button {
+    flex:none;
+    padding:var(--sp-1) var(--sp-3);
+    font-size:var(--fs-mini);
+  }
+  .rvswitch button {
+    padding:var(--sp-1) var(--sp-2);
+    font-size:var(--fs-mini);
+  }
+  .rkan {
+    grid-auto-columns:minmax(240px,86vw);
+  }
+  .uconfirmlist {
+    max-height:180px;
+  }
+  .uparam .prow label {
+    width:auto;
+    text-align:left;
+  }
+  .pmeta {
+    margin-left:0;
+  }
+}
 @keyframes skshine {
   0% {
     background-position:100% 0;
