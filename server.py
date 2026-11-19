@@ -271,7 +271,7 @@ INDEX = """<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=
 <div class=pmeta id=upgExpiry></div>
 <div id=upgParamSummary class=psummary></div>
 </div></section>
-<section class=upanel><div class=uhead><h2>② 选择目标设备</h2><div class=uselbar id=upgSelBar>已选 0 台</div></div><div id=upgDevGroups><p class=uempty>加载中…</p></div></section>
+<section class=upanel><div class=uhead><h2>② 选择目标设备</h2><div class=uselbar id=upgSelBar>已选 0 台</div></div><section id=upgFilter></section><div id=upgDevGroups><p class=uempty>加载中…</p></div></section>
 <section class=upanel id=upgActPanel><div class=uhead><h2>③ 发起升级</h2></div><div class=ubtns><button type=button id=upgRunAll>▶ 全流程升级所选</button><button type=button class=stagebtn data-kind=precheck>仅预检</button><button type=button class=stagebtn data-kind=download>仅下载</button><button type=button class=stagebtn data-kind=install>仅安装</button><button type=button class=stagebtn data-kind=verify>仅验证</button><button type=button class=stagebtn data-kind=cleanup>仅清理</button></div><p class=uhint id=upgActHint></p></section>
 <section class=upanel><div class=uhead><h2>④ 任务与进度</h2><span id=upgConn class=connchip>未连接</span></div><div id=upgJobSummary><p class=uempty>暂无升级任务</p></div><div id=upgTaskGrid></div></section>
 </section>
@@ -2466,7 +2466,8 @@ const FilterBar={
   for(const f of fields)for(const v of FS.get(fb.fs,f.key)){
    const o=(f.values||[]).filter(x=>String(x.v)===String(v))[0];
    const lbl=o?(o.label!=null?o.label:o.v):v;
-   tags.push(`<span class=ftag>${esc(f.label)} ${esc(lbl)}<button type=button data-tag="${esc(f.key)}" data-val="${esc(v)}" title="移除该条件">✕</button></span>`);
+   const txt=(String(f.label)===String(lbl))?String(lbl):(f.label+' '+lbl);
+   tags.push(`<span class=ftag>${esc(txt)}<button type=button data-tag="${esc(f.key)}" data-val="${esc(v)}" title="移除该条件">✕</button></span>`);
   }
   const moreOpen=fb.open&&more.some(f=>f.key===fb.open);
   return '<div class=frow>'
@@ -2867,6 +2868,7 @@ STAGE_LBL:{precheck:'预检',download:'下载',prepare:'准备',install:'安装'
 KIND_LBL:{upgrade:'全流程升级',precheck:'仅预检',download:'仅下载',prepare:'仅准备',install:'仅安装',verify:'仅验证',cleanup:'仅清理'},
 STAT_LBL:{running:'进行中',success:'成功',failed:'失败',blocked:'已阻断',pending:'等待中'},
 fleet:[],selected:new Set(),selTouched:false,targetVersion:'',reg:[],regFail:false,
+upgFs:FS.empty(),upgBar:null,
 param:{url:'',ok:false,filename:'',version:'',arch:'',expiresAt:null,sha256:'',shaSrc:'',size:null},
 shaComputing:false,shaPollT:null,shaPollN:0,urlTimer:null,
 job:null,tasks:[],logs:{},logOff:{},follow:{},expanded:null,fromSnap:{},
@@ -2916,6 +2918,8 @@ init(){
   const c=e.target.closest('.ucard');if(c)this.toggleLog(c.dataset.h)});
  const um=this.gid('upgModal');um.addEventListener('click',e=>{if(e.target===um)this.closeConfirm()});
  document.addEventListener('keydown',e=>{if(e.key==='Escape')this.closeConfirm()});
+ this.upgFs=URLState.readFs();
+ this.mountFilter();
  this.route();
  setInterval(()=>{if(this.view==='upgrade')this.loadFleet()},15000);
 },
@@ -2928,8 +2932,10 @@ setView(v,skipHash){
  this.gid('viewAssets').hidden=v!=='assets';
  document.querySelectorAll('#viewTabs button').forEach(b=>b.classList.toggle('on',b.dataset.view===v));
  if(!skipHash){const p=new URLSearchParams(location.hash.slice(1));if(v!=='overview'){p.set('view',v);if(rep)p.set('atab','repairs')}else p.delete('view');const s=p.toString();history.replaceState(null,'',location.pathname+location.search+(s?'#'+s:''))}
- if(v==='upgrade')this.enter();
- if(v==='assets'&&typeof Assets!=='undefined')Assets.enter();   // 资产区域（KVWO-84）懒加载，见文件尾 Assets.*（声明先于本行求值）
+ if(v==='upgrade'){this.enter();if(this.upgBar){this.upgBar.fs=this.upgFs;FilterBar.render(this.upgBar)}this.writeUpgUrl()}
+ if(v==='assets'&&typeof Assets!=='undefined'){Assets.enter()}   // 资产区域（KVWO-84）懒加载，见文件尾 Assets.*（声明先于本行求值）
+ if(v==='overview'&&typeof ovBar!=='undefined'&&ovBar){FilterBar.render(ovBar);ovSyncUrl()}
+ if(v!=='upgrade'&&typeof Assets!=='undefined'&&v==='assets'){/* 资产子页签自己写 URL */}
 },
 route(){const h=new URLSearchParams(location.hash.slice(1)).get('view');const v=h==='upgrade'?'upgrade':(h==='assets'||h==='repairs')?'assets':'overview';this.setView(v,true)},
 enter(){this.loadRegistry();this.loadFleet();this.loadJobs();this.renderParam();this.updateSelBar();this.updateActions()},
@@ -3097,13 +3103,15 @@ async loadFleet(){
   const online=this.fleet.filter(f=>!f.retired&&f.online).map(f=>f.hostname);
   // F2b：进入页面不预选任何设备（原实现默认全选全部在线设备，配合「全流程升级」是最高风险交互）
   {const live=new Set(online);for(const h of [...this.selected])if(!live.has(h))this.selected.delete(h)}
-  this.renderDevs();this.updateSelBar();this.updateActions();
+  this.renderDevs();this.updateSelBar();this.updateActions();this.refreshBar();
  }catch(e){if(!this.fleet.length){const el=this.gid('upgDevGroups');if(el)el.innerHTML='<p class=uempty>设备数据加载失败（/api/hosts 不可用），稍后自动重试</p>'};this.updateSelBar();this.updateActions()}
 },
 renderDevs(){
  const wrap=this.gid('upgDevGroups');
- const rows=this.devRows();
- if(!rows.length){wrap.innerHTML='<p class=uempty>暂无设备数据——设备总览接口不可用或未登记设备</p>';return}
+ const all=this.devRows();
+ const rows=all.filter(r=>this.matchesUpg(r));
+ if(!all.length){wrap.innerHTML='<p class=uempty>暂无设备数据——设备总览接口不可用或未登记设备</p>';return}
+ if(!rows.length){wrap.innerHTML='<p class=uempty>没有匹配的设备——调整筛选条件，或点筛选条的「清空」恢复</p>';return}
  const groups={};
  for(const r of rows)(groups[r.ver]=groups[r.ver]||[]).push(r);
  const keys=Object.keys(groups).sort((a,b)=>a==='未获取'?1:b==='未获取'?-1:this.verCmp(b,a));
@@ -3133,9 +3141,56 @@ updateSelBar(){
  this.renderExpiry();
 },
 /* F2b：当前筛选下可被选中的设备（在线）。F7 接入筛选条后自动只在筛选结果内生效 */
+/* F7：与总览/台账/维修同一套模型；离线恒不可选，online 条件只用于「只看离线待处理」排查 */
+upgRow(r){return k=>{
+ if(k==='site')return r.site||'未登记';
+ if(k==='ver')return r.ver||'未获取';
+ if(k==='arch')return r.arch||'未知机型';
+ if(k==='online')return r.online?'1':'0';
+ return ''
+}},
+matchesUpg(r){
+ if(!FS.match(this.upgFs,this.upgRow(r)))return false;
+ if(this.upgFs.q){const q=this.upgFs.q.toLowerCase();if(String(r.h||'').toLowerCase().indexOf(q)<0)return false}
+ return true
+},
 selectable(){
- const inFilter=r=>!this.upgFilter||this.upgFilter(r);
- return this.devRows().filter(r=>r.online&&inFilter(r)).map(r=>r.h)
+ return this.devRows().filter(r=>r.online&&this.matchesUpg(r)).map(r=>r.h)
+},
+defaultUpgFs(){
+ if(!Object.keys(this.upgFs.conds||{}).length&&!this.upgFs.q){this.upgFs.conds.online=['1']}   // 默认只看在线
+},
+refreshBar(){
+ if(!this.upgBar)return;
+ const a=(typeof document!=='undefined')?document.activeElement:null;
+ if(a&&a.classList&&a.classList.contains('fq'))return;
+ this.upgBar.fs=this.upgFs;
+ FilterBar.render(this.upgBar);
+},
+upgFields(){
+ const rows=this.devRows();
+ const cnt=f=>{const m=new Map();for(const r of rows){const v=f(r);if(v)m.set(v,(m.get(v)||0)+1)}
+  return [...m.entries()].sort((a,b)=>String(a[0]).localeCompare(String(b[0]),'zh')).map(x=>({v:x[0],label:x[0],count:x[1]}))};
+ return [
+  {key:'site',label:'站点',values:cnt(r=>r.site||'未登记')},
+  {key:'ver',label:'版本',values:cnt(r=>r.ver||'未获取')},
+  {key:'arch',label:'机型',values:cnt(r=>r.arch||'未知机型')},
+  {key:'online',label:'状态',more:true,values:[{v:'1',label:'在线',count:rows.filter(r=>r.online).length},{v:'0',label:'离线（不可选，排查用）',count:rows.filter(r=>!r.online).length}]}
+ ]
+},
+mountFilter(){
+ this.defaultUpgFs();
+ const fb=this.upgBar=FilterBar.mount('upgFilter',{
+  fs:this.upgFs,inputId:'upgQ',placeholder:'搜索 hostname',
+  fields:()=>this.upgFields(),
+  emptyHint:'默认只看在线设备；离线设备恒不可选，需要排查时在「更多 → 在线」里选离线',
+  resultText:()=>`显示 ${this.devRows().filter(r=>this.matchesUpg(r)).length} / ${this.devRows().length} 台 · 可选中 ${this.selectable().length} 台`,
+  onChange:fs=>{this.upgFs=fs;this.writeUpgUrl();this.renderDevs();this.updateSelBar();this.updateActions()}
+ });
+ this.upgFs=fb.fs;
+},
+writeUpgUrl(){
+ URLState.write({view:'upgrade',q:this.upgFs.q||null,f:FS.encode(this.upgFs)||null});
 },
 canLaunch(){return !this.active()&&this.param.ok&&!!this.param.version&&this.selected.size>0},
 updateActions(){
