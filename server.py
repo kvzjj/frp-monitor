@@ -3776,6 +3776,12 @@ mountFilter(){
   fs:this.fs,inputId:'asQ',
   placeholder:'搜索设备编号 / 去向备注（单位请用「单位」筛选）',
   fields:()=>this.ledgerFields(),
+  shortcuts:[
+   {label:'维修中 / 待维修',conds:{status:['维修中','待维修']}},
+   {label:'闲置',conds:{idle:['1']}},
+   {label:'在线',conds:{online:['1']}},
+   {label:'未上线',conds:{online:['0']}}
+  ],
   emptyHint:'默认只看在册设备；归档（已拆解）在「更多 → 归档」里',
   resultText:()=>{const n=this.ledgerRows().length;return `显示 ${n} / ${this.devices.length+this.archived.length} 台`},
   onChange:fs=>{this.fs=fs;this.hw.page=1;this.writeLedgerUrl();this.applyLedger()}

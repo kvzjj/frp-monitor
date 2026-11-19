@@ -219,6 +219,7 @@ const ok = (name, cond) => { if (!cond) { console.error('FAIL: ' + name); proces
   const bars = ['ovFilter', 'asFilter', 'repFilter', 'upgFilter'].map(id => el(id).innerHTML);
   ok('S1 筛选条：四个视图同一套结构（搜索框 + 条件行（有/无筛选两种文案）+ 显示 N）',
     bars.every(h => h.includes('class=fsearch') && (h.includes('当前条件') || h.includes('未设置筛选')) && h.includes('显示')));
+  ok('S6 台账：内置快捷视图（维修中/待维修、闲置、在线、未上线）', ['维修中 / 待维修', '闲置', '在线', '未上线'].every(k => el('asFilter').innerHTML.includes(k)) && el('asFilter').innerHTML.includes('data-sc'));
   ok('S1 筛选条：生效条件独立成标签行（可逐条移除）', el('asFilter').innerHTML.includes('class=ftag') && el('asFilter').innerHTML.includes('data-tag="status"'));
   // S4：清空一次清掉全部条件（含搜索）并同步 URL
   FSx2.set(A.fs, 'status', ['维修中']); A.fs.q = 'ep-0000'; A.writeLedgerUrl();
