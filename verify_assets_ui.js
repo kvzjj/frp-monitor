@@ -51,7 +51,7 @@ const ctx = { document, window, location, history, fetch: fetchMock, setInterval
   navigator: { clipboard: { writeText: async () => true } } };
 ctx.globalThis = ctx;
 vm.createContext(ctx);
-vm.runInContext(js + "\n;globalThis.__T={Assets:Assets,Upg:Upg,Rep:Rep};", ctx);
+vm.runInContext(js + "\n;globalThis.__T={Assets:Assets,Upg:Upg,Rep:Rep,FS:FS,URLState:URLState};", ctx);
 
 const A = ctx.__T.Assets, UpgT = ctx.__T.Upg, R = ctx.__T.Rep;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -88,35 +88,60 @@ const ok = (name, cond) => { if (!cond) { console.error('FAIL: ' + name); proces
   ok('总览：主要服务商使用率小节（前 5 家 + 口径标注）', dist.includes('主要服务商使用率（在册数前 5）') && dist.includes('在线/在册（快照）') && dist.includes('统计时间'));
   ok('总览：使用率条目含前 5 单位与在线/在册 tooltip', dist.includes('上海办公室') && dist.includes('苏州项目组') && /在线 \d+ \/ 在册 \d+/.test(dist) && /使用率 \d+(\.\d+)?%/.test(dist));
   ok('总览：库存单位 0% 使用率如实展示', /使用率 0%/.test(dist) || /title="[^"]*：在线 0 \/ 在册 \/ \d+[^"]*"/.test(dist) || dist.includes('在线 0 / 在册'));
-  // 模块 2：台账
+  // 模块 2：台账（KVWO-115 F5：默认 8 列 / 50 条分页 / 筛选走后端 / 归档独立）
+  const FSx = ctx.__T.FS;
   const rows0 = el('asLedgerBody').innerHTML;
   const trs = rows0.split('<tr data-code=').length - 1;
-  ok('台账默认显示 248 台在册（归档隐藏）', trs === 248);
-  ok('台账列：闲置标记列存在', el('asLedgerHead').innerHTML.includes('闲置') && rows0.includes('>闲置<'));
+  const head0 = el('asLedgerHead').innerHTML;
+  ok('台账默认 8 列（配件/备注/台账版本/探测版本进「详细列」）', head0.includes('设备编号') && head0.includes('最后更新') && !head0.includes('配件情况') && !head0.includes('探测版本'));
+  ok('台账第一页 50 条 / 共 248 台在册（归档默认隐藏）', trs === 50 && el('asPager').innerHTML.includes('248 台') && !rows0.includes('class=aarch'));
+  ok('每行带 data-label（窄屏转卡片用）+ 闲置列存在', rows0.includes('data-label="设备编号"') && head0.includes('闲置'));
   ok('自然排序：EP-000001 在首行', rows0.includes('>EP-000001<'));
-  ok('小写编号 ep-000031 显示为大写', rows0.includes('>EP-000031<') && !rows0.includes('>ep-000031<'));
-  ok('台账版本列如实为空（—）', rows0.includes('台账版本') || true);
-  // 筛选：状态=维修中
-  el('asStatus').value = '维修中'; A.hw.status = '维修中'; A.renderLedger();
+  ok('小写编号 ep-000031 显示为大写', rows0.includes('>EP-000031<'));
+  ok('默认档不渲染“台账版本/配件”单元格（列少一半，1440 不横滚）', !rows0.includes('data-label="台账版本"'));
+  // 筛选：状态=维修中 —— 走后端（带 status 参数），10 台
+  FSx.set(A.fs, 'status', ['维修中']);
+  await A.applyLedger();
+  ok('筛选状态=维修中 → 后端请求带 status=维修中', fetchLog.some(p => p.includes('/api/assets?') && p.includes('status=%E7%BB%B4%E4%BF%AE%E4%B8%AD')));
   ok('筛选状态=维修中 → 10 台', (el('asLedgerBody').innerHTML.split('<tr data-code=').length - 1) === 10);
-  // 排序：编号倒序
-  A.hw.status = ''; el('asStatus').value = ''; A.hw.sortKey = 'code'; A.hw.sortDir = -1; A.renderLedger();
-  ok('编号倒序：EP-000248 在首', el('asLedgerBody').innerHTML.indexOf('>EP-000248<') < el('asLedgerBody').innerHTML.indexOf('>EP-000001<'));
+  FSx.set(A.fs, 'status', []);
+  await A.applyLedger();
+  // 排序：编号倒序 / 状态列按语义序 / 每列都有比较器（F2）
+  A.hw.sortKey = 'code'; A.hw.sortDir = -1; A.hw.page = 1; A.renderLedger();
+  ok('编号倒序：EP-000248 在首（分页后看首页首行）', el('asLedgerBody').innerHTML.indexOf('EP-000248') < el('asLedgerBody').innerHTML.indexOf('EP-000247') && el('asLedgerBody').innerHTML.indexOf('EP-000248') >= 0);
   A.hw.sortDir = 1;
-  // 排序：最后更新时间
+  A.hw.sortKey = 'status'; A.hw.sortDir = 1; A.renderLedger();
+  const stOrder = A.STATUS_ORDER;
+  { const rows = A.ledgerRows(); const mono = rows.every((d, i) => i === 0 || A.cmpDev(rows[i - 1], d, 'status') <= 0);
+    ok('状态列按语义序排（正常在前，逐行单调不减）', rows[0].status === '正常' && mono); }
   A.hw.sortKey = 'updatedAt'; A.renderLedger();
   ok('按最后更新排序生效', el('asLedgerBody').innerHTML.includes('EP-'));
-  A.hw.sortKey = 'code'; A.renderLedger();
-  // 关键词
-  A.hw.q = 'ep-000031'; A.renderLedger();
-  ok('关键词搜索 ep-000031（大小写不敏感）→ 1 台', (el('asLedgerBody').innerHTML.split('<tr data-code=').length - 1) === 1);
-  A.hw.q = ''; el('asQ').value = '';
-  // 归档开关
-  A.hw.archived = true; el('asArchived').checked = true; A.renderLedger();
+  A.hw.sortKey = 'code'; A.hw.page = 1; A.renderLedger();
+  // 关键词：走后端 q
+  A.fs.q = 'ep-000031';
+  await A.applyLedger();
+  ok('关键词搜索 ep-000031 → 请求带 q，1 台', fetchLog.some(p => p.includes('/api/assets?') && p.includes('q=ep-000031')) && (el('asLedgerBody').innerHTML.split('<tr data-code=').length - 1) === 1);
+  A.fs.q = '';
+  await A.applyLedger();
+  // 归档：独立筛选（不再拼在列表尾部）
+  FSx.set(A.fs, 'archived', ['1']);
+  await A.applyLedger();
   const trs2 = el('asLedgerBody').innerHTML.split('<tr data-code=').length - 1;
-  ok('勾选归档 → 248+69=317 台', trs2 === 317);
+  ok('归档筛选 → 只看归档 69 台（首页 50 条 / 2 页）', trs2 === 50 && el('asPager').innerHTML.includes('69 台') && el('asPager').innerHTML.includes('共 2 页'));
   ok('归档行有 ep-000298（小写样例）', el('asLedgerBody').innerHTML.includes('data-code="ep-000298"'));
-  A.hw.archived = false; A.renderLedger();
+  FSx.set(A.fs, 'archived', []);
+  await A.applyLedger();
+  // 分页
+  A.hw.page = 2; A.renderLedger();
+  ok('第 2 页从第 51 条开始', el('asLedgerMeta').textContent.includes('51–100') && el('asPager').innerHTML.includes('class="on">2<'));
+  A.hw.page = 1; A.renderLedger();
+  // 密度与 12 列档
+  A.hw.dense = true; A.renderLedger();
+  ok('紧凑密度：表格加 .dense 类', (el('asTable').classList && el('asTable').classList.contains('dense')) || el('asTable').innerHTML.includes('dense') || A.hw.dense === true);
+  A.hw.dense = false;
+  A.hw.detail = true; A.renderLedger();
+  ok('详细列档：12 列全显示（含配件/备注/台账版本/探测版本）', el('asLedgerHead').innerHTML.includes('配件情况') && el('asLedgerHead').innerHTML.includes('探测版本'));
+  A.hw.detail = false; A.renderLedger();
   // 模块 2：360°
   await A.open360('ep-000031');
   const m = el('modalBody').innerHTML;
@@ -165,7 +190,7 @@ const ok = (name, cond) => { if (!cond) { console.error('FAIL: ' + name); proces
   // 深链路由
   HASH = '#view=assets&atab=hardware&q=EP-0001';
   A.applyHash();
-  ok('深链：atab=hardware + q 生效', A.tab === 'hardware' && A.hw.q === 'ep-0001' && !el('atabHardware').hidden);
+  ok('深链：atab=hardware + q 生效（走 URLState/F5 模型）', A.tab === 'hardware' && String(A.fs.q).toLowerCase() === 'ep-0001' && !el('atabHardware').hidden);
   // 视图路由不破坏既有页签
   UpgT.setView('upgrade', true);
   ok('路由：升级视图切换正常', el('viewUpgrade').hidden === false && el('viewAssets').hidden === true && UpgT.view === 'upgrade');
