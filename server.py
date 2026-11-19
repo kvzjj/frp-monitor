@@ -1952,7 +1952,7 @@ small {
 JS = """const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
 const ETAGS={online:'上线',offline:'掉线',version_change:'版本变更',first_seen:'新设备'};
-const SITE_COLORS=['var(--c-brand)','var(--c-ok-alt)','#d97706','#7c3aed','var(--c-accent-pink)','#0891b2'];
+const SITE_COLORS=['var(--c-brand)','var(--c-ok-alt)','var(--c-warn)','var(--c-idle)','var(--c-accent-pink)','var(--c-test)'];
 function siteColor(s){let i=0;for(const c of String(s))i=(i*31+c.charCodeAt(0))%997;return SITE_COLORS[i%SITE_COLORS.length]}
 function fmtTime(u){return new Date(u*1000).toLocaleString('zh-CN',{hour12:false})}
 async function copyText(text){
@@ -2733,8 +2733,8 @@ mock:false,err:'',lastGoodAt:0,loaded:false,tab:'dashboard',drillUnit:'',
 stats:null,units:null,versions:null,devices:[],archived:[],_mockCache:null,
 hw:{q:'',status:'',type:'',unit:'',archived:false,sortKey:'code',sortDir:1},
 STATUS_ORDER:['正常','异常','维修中','待维修','待标定','测试中','已拆解'],
-ST_COLOR:{'正常':'var(--c-ok)','异常':'var(--c-danger)','维修中':'#ea580c','待维修':'#d97706','待标定':'var(--c-brand)','测试中':'#0891b2','已拆解':'var(--c-muted-2)'},
-TYPE_COLOR:{'EgoPortal-Stereo-V0':'var(--c-brand)','EgoPortal-Stereo-V1':'#7c3aed','EgoPortal-Lite':'#0891b2'},
+ST_COLOR:{'正常':'var(--c-ok)','异常':'var(--c-danger)','维修中':'var(--c-repair)','待维修':'var(--c-warn)','待标定':'var(--c-brand)','测试中':'var(--c-test)','已拆解':'var(--c-muted-2)'},
+TYPE_COLOR:{'EgoPortal-Stereo-V0':'var(--c-brand)','EgoPortal-Stereo-V1':'var(--c-idle)','EgoPortal-Lite':'var(--c-test)'},
 init(){
  const tabs=document.getElementById('assetTabs');
  tabs.addEventListener('click',e=>{const b=e.target.closest('button[data-atab]');if(b)this.go(b.dataset.atab)});
@@ -2890,9 +2890,9 @@ renderMetrics(){
   {v:s.archived,l:'归档（已拆解）',sub:'口径：设备归档数据表，不参与在册指标'},
   {v:s.invTotal,l:'库存',sub:'口径：'+this.invLabel()+(s.invB!=null?'；参考：备注含「未使用」'+s.invB+' 台':''),c:'var(--c-test-strong)'},
   {v:s.deployed,l:'一线部署',sub:'口径：在册 − 库存（库存单位持有不计部署）'},
-  {v:pctv(s.repairRate),l:'维修率',rate:1,c:'#ea580c',sub:'计算式：(维修中 '+n('维修中')+' + 待维修 '+n('待维修')+') / 在册 '+s.total},
+  {v:pctv(s.repairRate),l:'维修率',rate:1,c:'var(--c-repair)',sub:'计算式：(维修中 '+n('维修中')+' + 待维修 '+n('待维修')+') / 在册 '+s.total},
   {v:pctv(s.damageRate),l:'损坏率',rate:1,c:'var(--c-danger)',sub:'计算式：(异常 '+n('异常')+' + 维修中 '+n('维修中')+' + 待维修 '+n('待维修')+') / 在册 '+s.total},
-  {v:s.idleTotal,l:'闲置',sub:'口径：库存外·超 '+this.idleDays()+' 天未上线（含从未上线）；fleet 库未启用时不可计算',c:'#7c3aed'},
+  {v:s.idleTotal,l:'闲置',sub:'口径：库存外·超 '+this.idleDays()+' 天未上线（含从未上线）；fleet 库未启用时不可计算',c:'var(--c-idle)'},
  ];
  el.innerHTML=cards.map(m=>'<div class="amcard'+(m.rate?' rate':'')+'" style="--c:'+(m.c||'')+'" title="'+esc(m.sub)+'\\n'+esc(st)+'"><b>'+esc(m.v==null?'—':m.v)+'</b><span class=albl>'+esc(m.l)+'</span><div class=asub2>'+esc(m.sub)+'<br>'+esc(st)+'</div></div>').join('');
 },
@@ -2908,7 +2908,7 @@ renderDists(){
  const uTop=(this.units||[]).slice().sort((a,b)=>(b.total||0)-(a.total||0)||String(a.unit).localeCompare(String(b.unit),'zh')).slice(0,5);
  const uHtml=uTop.length?uTop.map(u=>{
   const use=u.usageRate==null?null:Math.round(u.usageRate*1000)/10;
-  return '<div class=abar title="'+esc(u.unit)+'：在线 '+(u.online!=null?u.online:'—')+' / 在册 '+(u.total!=null?u.total:'—')+' · 使用率 '+(use==null?'—（不可计算）':use+'%')+'（在线/在册（快照））"><span class=albl2>'+esc(u.unit)+'</span><div class=atrack><i style="width:'+(use==null?0:Math.min(use,100))+'%;--c:#0891b2"></i></div><span class=an>'+(use==null?'—':use+'%')+'</span></div>'
+  return '<div class=abar title="'+esc(u.unit)+'：在线 '+(u.online!=null?u.online:'—')+' / 在册 '+(u.total!=null?u.total:'—')+' · 使用率 '+(use==null?'—（不可计算）':use+'%')+'（在线/在册（快照））"><span class=albl2>'+esc(u.unit)+'</span><div class=atrack><i style="width:'+(use==null?0:Math.min(use,100))+'%;--c:var(--c-test)"></i></div><span class=an>'+(use==null?'—':use+'%')+'</span></div>'
  }).join(''):'<p class=eempty>暂无单位数据</p>';
  el.innerHTML='<div class=adists>'+
   '<div class=apanel><h3>状态分布（在册 '+(s.total!=null?s.total:'—')+' 台）</h3>'+(stE.length?bars(stE,k=>this.ST_COLOR[k]||'var(--c-muted-2)'):'<p class=eempty>暂无数据</p>')+'</div>'+
@@ -2930,10 +2930,23 @@ renderFilters(){
 sortDevs(list){
  const hw=this.hw;
  return list.slice().sort((x,y)=>{
-  if(hw.sortKey==='code')return this.natCmp(x.code,y.code)*hw.sortDir;
-  return (this.tsOf(x.updatedAt)-this.tsOf(y.updatedAt))*hw.sortDir||this.natCmp(x.code,y.code)
+  const c=this.cmpDev(x,y,hw.sortKey);
+  return c*hw.sortDir||this.natCmp(x.code,y.code)
  })
 },
+/* F2：12 列每列都有真实比较器（原实现只有 code 真排，其余全部落到按 updatedAt） */
+cmpDev(x,y,key){
+ if(key==='status')return this.STATUS_ORDER.indexOf(x.status)-this.STATUS_ORDER.indexOf(y.status);
+ if(key==='online')return this.boolRank(x.online)-this.boolRank(y.online);
+ if(key==='idle')return this.boolRank(x.idle)-this.boolRank(y.idle);
+ if(key==='openRepairs')return (x.openRepairs||0)-(y.openRepairs||0);
+ if(key==='updatedAt')return this.tsOf(x.updatedAt)-this.tsOf(y.updatedAt);
+  const sx=x[key]==null?'':String(x[key]),sy=y[key]==null?'':String(y[key]);
+  if(key==='type')return this.natCmp(this.shortType(sx),this.shortType(sy));
+  return this.natCmp(sx,sy)
+},
+/* 布尔列排序：真 → 假 → 未知（—） */
+boolRank(v){return v===true?0:v===false?1:2},
 ledgerRows(){
  const hw=this.hw,q=hw.q;
  const match=d=>{
@@ -2955,7 +2968,7 @@ ledgerRowHtml(d){
  const c=this.ST_COLOR[d.status]||'var(--c-muted-2)';
  const on=d.online===true?'<span class=aon title=在线>●</span>':d.online===false?'<span class=aoff title=离线>○</span>':'<span class=anull title=未匹配>—</span>';
  const rep=d.openRepairs>0?'<button class=abadge data-gorep="'+esc(d.code)+'" title="点击查看维修看板">'+d.openRepairs+'</button>':'<span class=anull>0</span>';
- const idl=d.idle===true?'<span class=stag style="--c:#7c3aed" title="库存外·超 '+this.idleDays()+' 天未上线">闲置</span>':'<span class=anull title="不在闲置口径或不可判定">—</span>';
+ const idl=d.idle===true?'<span class=stag style="--c:var(--c-idle)" title="库存外·超 '+this.idleDays()+' 天未上线">闲置</span>':'<span class=anull title="不在闲置口径或不可判定">—</span>';
  return '<tr data-code="'+esc(d.code)+'"'+(d.archived?' class=aarch':'')+'><td class=mono>'+esc(d.code.toUpperCase())+'</td><td>'+esc(this.shortType(d.type)||'—')+'</td><td><span class=stag style="--c:'+c+'">'+esc(d.status||'—')+'</span></td><td>'+esc(d.unit||'—')+'</td><td class=wrap title="'+esc(d.parts||'')+'">'+esc(d.parts||'—')+'</td><td class=wrap title="'+esc(d.remark||'')+'">'+esc(d.remark||'—')+'</td><td>'+esc(d.ledgerVer||'—')+'</td><td>'+esc(d.detVer||'—')+'</td><td>'+on+'</td><td>'+idl+'</td><td>'+rep+'</td><td class=mut>'+esc(this.fmtTs(d.updatedAt)||'—')+'</td></tr>'
 },
 renderLedger(){
@@ -2991,7 +3004,7 @@ async open360(code){
   '<span>探测版本</span><b>'+v(dev.detVer)+'</b>'+
   '<span>在线状态</span><b>'+(dev.online===true?'<span style="color:var(--c-ok)">● 在线</span>':dev.online===false?'<span style="color:var(--c-danger)">○ 离线</span>':'—（未匹配）')+'</b>'+
   '<span>最后在线</span><b>'+(dev.lastSeen?esc(this.fmtTs(dev.lastSeen)):'—（从未上线或 fleet 未启用）')+'</b>'+
-  '<span>闲置</span><b>'+(dev.idle===true?'<span style="color:#7c3aed">是（超 '+this.idleDays()+' 天未上线）</span>':dev.idle===false?'否':'—（不可判定）')+'</b>'+
+  '<span>闲置</span><b>'+(dev.idle===true?'<span style="color:var(--c-idle)">是（超 '+this.idleDays()+' 天未上线）</span>':dev.idle===false?'否':'—（不可判定）')+'</b>'+
   '<span>未完结维修</span><b>'+(dev.openRepairs||0)+' 条</b>'+
   '<span>最后更新</span><b>'+v(this.fmtTs(dev.updatedAt))+'</b>'+
   '<span>修改人</span><b>'+v(dev.modifier)+'</b>'+
@@ -3022,7 +3035,7 @@ renderUnits(){
   return '<div class=aunit data-unit="'+esc(u.unit)+'" title="点击下钻该单位设备列表">'+
    '<div class=auhead><b>'+esc(u.unit)+'</b><span>'+(u.total!=null?u.total:'—')+' 台</span></div>'+
    '<div class=abarate><div class=atrack><i style="width:'+(rate==null?0:Math.min(rate,100))+'%;--c:var(--c-ok)"></i></div><span>'+(rate==null?'—':rate+'%')+' 正常</span></div>'+
-   '<div class="abarate aurate" title="使用率 = frps 在线快照 / 在册（在线 '+(u.online!=null?u.online:'—')+' / '+(u.total!=null?u.total:'—')+'，快照口径；fleet 未启用或无法计算时为 —）"><div class=atrack><i style="width:'+(use==null?0:Math.min(use,100))+'%;--c:#0891b2"></i></div><span>'+(use==null?'—':use+'%')+' 使用率</span></div>'+
+   '<div class="abarate aurate" title="使用率 = frps 在线快照 / 在册（在线 '+(u.online!=null?u.online:'—')+' / '+(u.total!=null?u.total:'—')+'，快照口径；fleet 未启用或无法计算时为 —）"><div class=atrack><i style="width:'+(use==null?0:Math.min(use,100))+'%;--c:var(--c-test)"></i></div><span>'+(use==null?'—':use+'%')+' 使用率</span></div>'+
    '<div class=aurow>'+this.stagN('维修中',u.repairing)+this.stagN('异常',u.abnormal)+'</div>'+
    (isInv?'<div class=auinv>公司库存单位'+(icnt!=null?' '+icnt+' 台':'')+'（不计一线部署）'+(u.unit==='上海办公室'&&inv?' · 备注细分：未使用 '+inv.unused+' · 新组装 '+inv.newBuild:'')+'</div>':'')+
    '<div class=aumut>最近更新：'+esc(this.fmtTs(u.lastUpdated)||'—')+'</div></div>'
@@ -3170,7 +3183,7 @@ mockDetail(dev){
  不渲染陈旧数据冒充实时；空态有引导文案；字段缺失一律显示「—」。 */
 const Rep={
 STAGES:['待接收','损坏原因确认中','维修中','待发出确认','待发出','已发出','已完结'],
-SC:{'待接收':'var(--c-danger)','损坏原因确认中':'#d97706','维修中':'#ea580c','待发出确认':'#7c3aed','待发出':'var(--c-info-alt)','已发出':'#0891b2','已完结':'var(--c-muted-2)'},
+SC:{'待接收':'var(--c-danger)','损坏原因确认中':'var(--c-warn)','维修中':'var(--c-repair)','待发出确认':'var(--c-idle)','待发出':'var(--c-info-alt)','已发出':'var(--c-test)','已完结':'var(--c-muted-2)'},
 KEYS:{
  device_id:['device_id','device_no','device_code'],
  device_type:['device_type','type'],
