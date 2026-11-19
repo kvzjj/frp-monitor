@@ -51,7 +51,7 @@ const ctx = { document, window, location, history, fetch: fetchMock, setInterval
   navigator: { clipboard: { writeText: async () => true } } };
 ctx.globalThis = ctx;
 vm.createContext(ctx);
-vm.runInContext(js + "\n;globalThis.__T={Assets:Assets,Upg:Upg,Rep:Rep,FS:FS,URLState:URLState};", ctx);
+vm.runInContext(js + "\n;globalThis.__T={Assets:Assets,Upg:Upg,Rep:Rep,FS:FS,URLState:URLState,ovFs:()=>ovFs,filtered:()=>filtered(),fleet:()=>fleet,FilterBar:FilterBar};", ctx);
 
 const A = ctx.__T.Assets, UpgT = ctx.__T.Upg, R = ctx.__T.Rep;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -198,6 +198,47 @@ const ok = (name, cond) => { if (!cond) { console.error('FAIL: ' + name); proces
   ok('路由：设备总览切换正常', el('viewOverview').hidden === false);
   UpgT.setView('assets', true);
   ok('路由：资产视图切换正常', el('viewAssets').hidden === false);
+  // ================= F9（KVWO-115）自动化断言：S1 / S2 / S4 / S9 / U8 =================
+  const FSx2 = ctx.__T.FS;
+  const panelCss = () => require('child_process').execFileSync('python3', ['-c', 'import server;print(server.CSS)'],
+    { cwd: __dirname, stdio: ['pipe', 'pipe', 'ignore'] }).toString();
+  // 复位到台账干净态（前面的深链把 q 带进来了）
+  A.setTab('hardware'); A.fs.q = ''; FSx2.clear(A.fs); A.hw.page = 1;
+  await A.applyLedger();
+  // S2：同一字段多选 = 或，不同字段之间 = 且（硬件台账，248 台真实 mock 数据）
+  FSx2.set(A.fs, 'status', ['维修中', '待维修']);
+  const bothStatus = A.ledgerRows();
+  const expectBoth = A.devices.filter(d => d.status === '维修中').length + A.devices.filter(d => d.status === '待维修').length;
+  ok('S2 台账：状态多选=或（维修中 + 待维修 = 两者之和）', bothStatus.length === expectBoth && bothStatus.every(d => d.status === '维修中' || d.status === '待维修'));
+  FSx2.set(A.fs, 'unit', ['上海办公室']);
+  const andRows = A.ledgerRows();
+  ok('S2 台账：字段之间=且（状态 2 个 ∧ 单位）', andRows.every(d => d.unit === '上海办公室') && andRows.length > 0 && andRows.length < bothStatus.length);
+  // S1：四个视图共用同一套筛选条结构（搜索 + 当前条件行 + 显示 N）
+  // 让台账筛选条追上状态（测试直接改了 A.fs，真实 UI 会经 FilterBar.onChange 同步两边）
+  A.filterBar.fs = A.fs; ctx.__T.FilterBar.render(A.filterBar);
+  const bars = ['ovFilter', 'asFilter', 'repFilter', 'upgFilter'].map(id => el(id).innerHTML);
+  ok('S1 筛选条：四个视图同一套结构（搜索框 + 条件行（有/无筛选两种文案）+ 显示 N）',
+    bars.every(h => h.includes('class=fsearch') && (h.includes('当前条件') || h.includes('未设置筛选')) && h.includes('显示')));
+  ok('S1 筛选条：生效条件独立成标签行（可逐条移除）', el('asFilter').innerHTML.includes('class=ftag') && el('asFilter').innerHTML.includes('data-tag="status"'));
+  // S4：清空一次清掉全部条件（含搜索）并同步 URL
+  FSx2.set(A.fs, 'status', ['维修中']); A.fs.q = 'ep-0000'; A.writeLedgerUrl();
+  FSx2.clear(A.fs); A.hw.page = 1; A.writeLedgerUrl(); A.renderLedger();
+  ok('S4 清空：条件与搜索词清空 + URL 的 q/f 被移除', Object.keys(A.fs.conds).length === 0 && !A.fs.q && !location.hash.includes('f=') && !location.hash.includes('q='));
+  // S9：[hidden] 兜底 + 看板/列表真的互斥
+  ok('S9 [hidden] 兜底（CSS display:none!important）——修 .rkan{display:grid} 盖掉 hidden', /\[hidden\][^{]*\{[^}]*display:none!important/.test(panelCss()));
+  R.setView('list');
+  ok('S9 列表态：看板 hidden=true（真正不可见，不靠视觉遮住）', el('repKanban').hidden === true && el('repListWrap').hidden === false);
+  R.setView('kanban');
+  ok('S9 看板态：列表 hidden=true / 看板 hidden=false', el('repListWrap').hidden === true && el('repKanban').hidden === false);
+  // U8：点哪列箭头在哪列，排序结果与箭头方向一致
+  A.setTab('hardware'); A.hw.page = 1;
+  A.hw.sortKey = 'status'; A.hw.sortDir = -1; A.renderLedger();
+  const headDesc = el('asLedgerHead').innerHTML;
+  ok('U8 排序：状态列箭头向下（▼）+ aria-sort=descending', headDesc.includes('data-sk="status"') && headDesc.includes('▼') && headDesc.includes('aria-sort="descending"'));
+  const descRows = A.ledgerRows();
+  ok('U8 排序：状态列倒序结果与箭头一致（语义序单调递减）', descRows.every((d, i) => i === 0 || A.cmpDev(descRows[i - 1], d, 'status') >= 0));
+  A.hw.sortKey = 'code'; A.hw.sortDir = 1; A.renderLedger();
+  ok('U8 排序：换列后箭头只出现在当前列', (el('asLedgerHead').innerHTML.match(/▲|▼/g) || []).length === 1);
   console.log('\nfetch 序列（前 6）：', fetchLog.slice(0, 6).join(', '));
   if (!process.exitCode) console.log('\nALL PASS');
 })();

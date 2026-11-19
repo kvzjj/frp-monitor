@@ -73,6 +73,7 @@ delete RECORDS[2].device_online; delete RECORDS[2].last_followup_note; delete RE
 RECORDS[3] = Object.assign({}, RECORDS[3], { device_id: undefined, problem: undefined, device_online: 'true', device_no: 'EP-000104', description: '候选键：电源故障' });
 RECORDS[4].device_online = 'false';
 for (let i = 6; i <= 10; i++) RECORDS.push(mk(i, '维修中'));
+RECORDS[5].last_followup_at = iso(T0 - 10 * 86400e3);   // 一条超 7 天未跟进（F9/S6 断言用）
 RECORDS.push(mk(11, '待发出', { problem: '相机<x>模块异常' }));   // XSS 转义样例
 for (let i = 12; i <= 27; i++) RECORDS.push(mk(i, '已完结'));
 const STATS_OK = { total: 27, active_count: 11,
@@ -224,6 +225,38 @@ const lastFetch = () => fetchLog[fetchLog.length - 1];
   A.setTab('repairs'); for (const fn of intervals) fn(); await sleep(80);
   const cnt2 = fetchLog.filter(p => p.startsWith('/api/repairs/stats')).length;
   ok('60s 自动刷新仅子页签可见时拉数（隐藏不拉/可见拉）', cnt1 === cnt0 && cnt2 === cnt0 + 1);
+  // ================= F9（KVWO-115）自动化断言：S2 / S6 / S7 / S10 =================
+  const FSx = ctx.__T.FS;
+  // S10：阶段条件在看板与列表共享（同一份 state，两种表达）
+  R.view = 'kanban'; R.setView('list');
+  FSx.clear(R.fs); FSx.set(R.fs, 'stage', ['维修中']);
+  await R.loadList();
+  ok('S10 列表态：阶段条件写入后端请求（?stage=维修中）', lastFetch().includes('stage=' + encodeURIComponent('维修中')));
+  R.setView('kanban'); await R.loadList();
+  const kan2 = el('repKanban').innerHTML;
+  ok('S10 看板态：选中列高亮（rkhead on）', kan2.includes('rkhead on" data-stage="维修中"'));
+  ok('S10 看板态：其余列淡化（rdim）但仍渲染，不隐藏', (kan2.match(/rkcol rdim/g) || []).length >= 5 && kan2.includes('data-col="待接收"'));
+  ok('S10 看板态：阶段条件切回列表仍在', R.stageF === '维修中');
+  ok('S10 看板态：不向后端传 stage（要看全部列）', !lastFetch().includes('stage='));
+  R.setView('list');
+  // S2：同字段多选=或（负责人两个值）
+  FSx.clear(R.fs); FSx.set(R.fs, 'owner', ['刘希源', '张伟']);
+  await R.loadList();
+  const owners = R.filteredRows();
+  ok('S2 维修：负责人多选=或（结果 ⊆ 两人且都命中）', owners.length > 0 && owners.every(r => r.owner === '刘希源' || r.owner === '张伟'));
+  FSx.set(R.fs, 'owner', ['刘希源']);
+  const onlyLiu = R.filteredRows();
+  ok('S2 维修：收窄到单人后结果变少', onlyLiu.length <= owners.length && onlyLiu.every(r => r.owner === '刘希源'));
+  // S6：内置快捷视图（超 7 天未跟进）
+  FSx.clear(R.fs); FSx.set(R.fs, 'overdue', ['1']);
+  const od = R.filteredRows();
+  ok('S6 快捷视图：超 7 天未跟进 = 未完结 ∧ 最后跟进 > 7 天', od.length > 0 && od.every(r => !r.done && (Date.now() - r.followMs) > 7 * 864e5));
+  ok('S6 快捷视图：筛选条上有快捷视图按钮', el('repFilter').innerHTML.includes('超 7 天未跟进') && el('repFilter').innerHTML.includes('data-sc'));
+  // S7：空结果态写明条件与恢复方式
+  FSx.clear(R.fs); R.fs.q = '不存在的编号ZZZ'; R.render();
+  ok('S7 空结果：列表空态提示调整条件/清空', el('repTbody').innerHTML.includes('没有匹配的维修记录'));
+  ok('S7 空结果：看板空态提示 + 条件标签行仍在', (R.setView('kanban'), el('repKanban').innerHTML.includes('没有匹配的维修记录')) && el('repFilter').innerHTML.includes('不存在的编号ZZZ'));
+  R.fs.q = ''; FSx.clear(R.fs); R.setView('kanban'); await R.loadList();
   console.log('\nfetch 序列（前 8）：', fetchLog.slice(0, 8).join(', '));
   if (!process.exitCode) console.log('\nALL PASS');
 })();
