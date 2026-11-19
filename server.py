@@ -3912,7 +3912,7 @@ renderDists(){
   '<div class=apanel><h3>状态分布（在册 '+(s.total!=null?s.total:'—')+' 台）</h3>'+(stE.length?bars(stE,k=>this.ST_COLOR[k]||'var(--c-muted-2)'):'<p class=eempty>暂无数据</p>')+'</div>'+
   '<div class=apanel><h3>设备类型分布</h3>'+(tyE.length?bars(tyE,k=>this.TYPE_COLOR[k]||'var(--c-brand)',k=>this.shortType(k)):'<p class=eempty>暂无数据</p>')+'</div>'+
   '<div class=apanel><h3>所属单位 TOP 分布</h3>'+(unE.length?bars(unE,null):'<p class=eempty>暂无数据</p>')+'</div>'+
-  '<div class=apanel><h3>主要服务商使用率（在册数前 5）</h3><p class=uhint style="margin:0 0 10px">口径：在线/在册（快照） · 统计时间：'+esc(this.fmtTs(s.lastSync)||'—')+'</p>'+uHtml+'</div>'+
+  '<div class=apanel><h3>主要服务商使用率（在册数前 5）</h3><p class=uhint style="margin:0 0 var(--sp-2)">口径：在线/在册（快照） · 统计时间：'+esc(this.fmtTs(s.lastSync)||'—')+'</p>'+uHtml+'</div>'+
  '</div>';
 },
 /* ---------- 模块 2：硬件台账（筛选/自然排序/360°） ---------- */
@@ -4144,7 +4144,7 @@ renderVersions(){
   '<div class=apanel><h3>台账 × 探测对照</h3><div class=acards3><div><b>'+esc(v.matched!=null?v.matched:'—')+'</b>版本匹配</div><div><b>'+only.length+'</b>在线但台账未登记</div><div><b>'+miss.length+'</b>台账有但探测不到</div></div>'+
   '<h4>detected_only · 在线但台账未登记</h4>'+(only.length?only.map(chip).join(''):'<p class=eempty>无</p>')+
   '<h4>ledger_missing · 台账有但探测不到（离线 / 未部署）</h4>'+(miss.length?'<p class=uhint>共 '+miss.length+' 台</p><details><summary style="cursor:pointer;font-size:12px;color:var(--c-brand)">展开设备列表</summary><div style="margin-top:8px">'+miss.map(chip).join('')+'</div></details>':'<p class=eempty>无</p>')+
-  '<p style="margin-top:14px"><button class=listbtn id=asGoUpg>▶ 前往升级视图（版本批量升级入口）</button></p></div></div>'+provHtml;
+  '<p style="margin-top:var(--sp-4)"><button class=listbtn id=asGoUpg>▶ 前往升级视图（版本批量升级入口）</button></p></div></div>'+provHtml;
  const b=document.getElementById('asGoUpg');if(b)b.onclick=()=>{location.hash='view=upgrade'};
 },
 /* ---------- 维修看板子页签：KVWO-80 Rep.* 看板实装（槽位填充，KVWO-88；全站唯一维修入口） ---------- */
@@ -4546,7 +4546,7 @@ async openDetail(rid){
   this.renderDetail(this.norm((raw&&typeof raw==='object')?raw:{}),false);
  }catch(e){
   if(cached)this.renderDetail(cached,true);
-  else{body.innerHTML='<p class="eempty">详情加载失败：'+esc((e&&e.message)?e.message:String(e))+'</p><button type="button" class="x" id="repClose" style="margin-top:10px">关闭</button>';this.bindClose()}
+  else{body.innerHTML='<p class="eempty">详情加载失败：'+esc((e&&e.message)?e.message:String(e))+'</p><button type="button" class="x" id="repClose" style="margin-top:var(--sp-2)">关闭</button>';this.bindClose()}
  }
 },
 bindClose(){const b=this.gid('repClose');if(b)b.onclick=()=>this.closeDetail()},
